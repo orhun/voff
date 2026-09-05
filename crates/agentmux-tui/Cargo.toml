@@ -1,0 +1,17 @@
+[package]
+name="agentmux-tui"
+version.workspace=true
+edition.workspace=true
+rust-version.workspace=true
+[dependencies]
+agentmux-core.workspace=true
+agentmux-engine.workspace=true
+agentmux-provider.workspace=true
+agentmux-providers.workspace=true
+agentmux-storage.workspace=true
+crossterm="0.28"
+ratatui="0.29"
+thiserror.workspace=true
+tokio.workspace=true
+[lints]
+workspace=true

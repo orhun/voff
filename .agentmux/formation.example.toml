@@ -1,0 +1,52 @@
+config_version = 1
+
+[workspace]
+root = "."
+state_file = ".agentmux/agentmux.db"
+
+[runtime]
+default_timeout_seconds = 1800
+event_channel_capacity = 128
+
+[provider]
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen3:4b"
+
+# Legacy single-agent fallback remains required in config version 1.
+[agent]
+name = "Solo Agent"
+role = "software_developer"
+system_prompt = "Follow repository rules and return verifiable results."
+tools = ["file.read", "search.text", "file.patch", "process.test"]
+
+[formation]
+name = "Lead and Workers"
+entry_agent = "lead"
+max_parallel_tasks = 2
+
+[[agents]]
+id = "lead"
+name = "Team Lead"
+role = "technical_lead"
+system_prompt = "Split work into bounded tasks and review evidence."
+tools = ["file.read", "search.text", "task.delegate", "review.request"]
+
+[agents.delegation]
+allowed_targets = ["implementer", "reviewer"]
+max_depth = 2
+max_children = 5
+
+[[agents]]
+id = "implementer"
+name = "Implementer"
+role = "software_developer"
+system_prompt = "Implement scoped changes and provide verifiable evidence."
+tools = ["file.read", "search.text", "file.patch", "process.test"]
+
+[[agents]]
+id = "reviewer"
+name = "Reviewer"
+role = "code_reviewer"
+system_prompt = "Review artifacts against acceptance criteria."
+tools = ["file.read", "search.text", "review.request"]

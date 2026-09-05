@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[workspace.dependencies]
+agentmux-core = { path = "crates/agentmux-core" }
+agentmux-provider = { path = "crates/agentmux-provider" }
+agentmux-providers = { path = "crates/agentmux-providers" }
+agentmux-storage = { path = "crates/agentmux-storage" }
+agentmux-engine = { path = "crates/agentmux-engine" }
+agentmux-tui = { path = "crates/agentmux-tui" }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

@@ -1,0 +1,11 @@
+[package]
+name="agentmux-config"
+version.workspace=true
+edition.workspace=true
+rust-version.workspace=true
+[dependencies]
+serde.workspace=true
+thiserror.workspace=true
+toml="0.8"
+[lints]
+workspace=true
