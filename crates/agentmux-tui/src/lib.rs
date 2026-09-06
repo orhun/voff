@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use std::{io, panic, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -40,6 +40,10 @@ pub enum Action {
     Cancel,
     Approve,
     Deny,
+    ToggleEvents,
+    PageUp,
+    PageDown,
+    Escape,
     Quit,
     None,
 }
@@ -63,6 +67,8 @@ pub struct AppModel {
     pub output_cost_per_million: Option<f64>,
     pub cost_currency: String,
     pub estimated_cost: Option<f64>,
+    pub event_viewer: bool,
+    pub event_scroll: u16,
     streaming_text: bool,
 }
 impl AppModel {
@@ -87,16 +93,36 @@ impl AppModel {
             output_cost_per_million: None,
             cost_currency: "USD".into(),
             estimated_cost: None,
+            event_viewer: false,
+            event_scroll: 0,
             streaming_text: false,
         }
     }
     pub fn reduce(&mut self, action: Action) {
         match action {
-            Action::Up => self.selected = self.selected.saturating_sub(1),
+            Action::Up => {
+                if self.event_viewer || self.panel == Panel::Events {
+                    self.event_scroll = self.event_scroll.saturating_sub(1);
+                } else {
+                    self.selected = self.selected.saturating_sub(1);
+                }
+            }
             Action::Down => {
-                if self.selected + 1 < self.tasks.len() {
+                if self.event_viewer || self.panel == Panel::Events {
+                    self.event_scroll = self
+                        .event_scroll
+                        .saturating_add(1)
+                        .min(self.event_scroll_limit());
+                } else if self.selected + 1 < self.tasks.len() {
                     self.selected += 1
                 }
+            }
+            Action::PageUp => self.event_scroll = self.event_scroll.saturating_sub(10),
+            Action::PageDown => {
+                self.event_scroll = self
+                    .event_scroll
+                    .saturating_add(10)
+                    .min(self.event_scroll_limit());
             }
             Action::NextPanel => {
                 self.panel = match self.panel {
@@ -107,6 +133,20 @@ impl AppModel {
                 }
             }
             Action::ToggleHelp => self.help = !self.help,
+            Action::ToggleEvents => {
+                self.event_viewer = !self.event_viewer;
+                self.panel = Panel::Events;
+                self.event_scroll = 0;
+            }
+            Action::Escape => {
+                if self.event_viewer {
+                    self.event_viewer = false;
+                } else if self.help {
+                    self.help = false;
+                } else {
+                    self.quit = true;
+                }
+            }
             Action::Quit => self.quit = true,
             Action::StartMock | Action::Cancel | Action::Approve | Action::Deny | Action::None => {}
         }
@@ -179,6 +219,13 @@ impl AppModel {
     pub fn selected_task(&self) -> Option<&Task> {
         self.tasks.get(self.selected)
     }
+    fn event_scroll_limit(&self) -> u16 {
+        self.events
+            .iter()
+            .map(|event| event.chars().count().div_ceil(40).saturating_add(2))
+            .sum::<usize>()
+            .min(usize::from(u16::MAX)) as u16
+    }
 }
 #[must_use]
 pub const fn action_for_key(code: KeyCode) -> Action {
@@ -191,7 +238,11 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('c') => Action::Cancel,
         KeyCode::Char('y') => Action::Approve,
         KeyCode::Char('n') => Action::Deny,
-        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+        KeyCode::Char('e') | KeyCode::Enter => Action::ToggleEvents,
+        KeyCode::PageUp => Action::PageUp,
+        KeyCode::PageDown => Action::PageDown,
+        KeyCode::Esc => Action::Escape,
+        KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
     }
 }
@@ -241,22 +292,32 @@ fn sanitize(value: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect();
-    clean
-        .split_whitespace()
-        .map(|word| {
-            let upper = word.to_ascii_uppercase();
-            if upper.contains("API_KEY=")
-                || upper.contains("TOKEN=")
-                || upper.contains("PASSWORD=")
-                || word.starts_with("sk-")
-            {
-                "[REDACTED]"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut output = String::with_capacity(clean.len());
+    let mut token = String::new();
+    for character in clean.chars() {
+        if character.is_whitespace() {
+            redact_token(&mut output, &token);
+            token.clear();
+            output.push(character);
+        } else {
+            token.push(character);
+        }
+    }
+    redact_token(&mut output, &token);
+    output
+}
+
+fn redact_token(output: &mut String, token: &str) {
+    let upper = token.to_ascii_uppercase();
+    if upper.contains("API_KEY=")
+        || upper.contains("TOKEN=")
+        || upper.contains("PASSWORD=")
+        || token.starts_with("sk-")
+    {
+        output.push_str("[REDACTED]");
+    } else {
+        output.push_str(token);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -511,13 +572,47 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
         .map(|x| Line::from(x.as_str()))
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(logs).block(panel("Events", app.panel == Panel::Events)),
+        Paragraph::new(logs)
+            .wrap(Wrap { trim: false })
+            .block(panel("Events (e: expand)", app.panel == Panel::Events)),
         right[1],
     );
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k select | Tab panel | ? help | r run | c cancel | q quit"),
+        Paragraph::new(
+            "↑/↓ or j/k navigate | Tab panel | e events | ? help | r run | c cancel | q quit",
+        ),
         rows[2],
     );
+    if app.event_viewer {
+        let area = frame.area();
+        let popup = ratatui::layout::Rect {
+            x: area.width / 12,
+            y: area.height / 12,
+            width: area.width * 5 / 6,
+            height: area.height * 5 / 6,
+        };
+        let text = app
+            .events
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, event)| format!("[{}] {}", index + 1, event))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.event_scroll, 0))
+                .block(
+                    Block::default()
+                        .title("Events — newest first | ↑/↓, PgUp/PgDn scroll | e/Esc close")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+            popup,
+        );
+    }
     if app.help {
         let area = frame.area();
         let popup = ratatui::layout::Rect {
@@ -526,8 +621,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             width: area.width / 2,
             height: area.height / 2,
         };
-        frame.render_widget(ratatui::widgets::Clear, popup);
-        frame.render_widget(Paragraph::new("AgentMux Help\n\nr  Start configured task\nc  Cancel selected active task\nTab  Change panel\nq/Esc  Safe exit\n?  Close help").block(Block::default().title("Help").borders(Borders::ALL)),popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Paragraph::new("AgentMux Help\n\nr  Start configured task\nc  Cancel selected active task\ne/Enter  Open full-screen events\n↑/↓, PgUp/PgDn  Scroll events\nTab  Change panel\nq  Safe exit\nEsc  Close popup / exit\n?  Close help").wrap(Wrap { trim: false }).block(Block::default().title("Help").borders(Borders::ALL)),popup);
     }
     if let Some(approval) = app.pending_approval() {
         let area = frame.area();
@@ -537,7 +632,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             width: area.width * 3 / 5,
             height: area.height / 2,
         };
-        frame.render_widget(ratatui::widgets::Clear, popup);
+        frame.render_widget(Clear, popup);
         let preview = app
             .artifacts
             .iter()
@@ -599,12 +694,31 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('n')), Action::Deny)
     }
     #[test]
+    fn full_screen_events_open_and_scroll_without_moving_task_selection() {
+        let mut app = AppModel::new(SessionId::new());
+        app.events = vec!["a sufficiently long event message for scrolling".into(); 20];
+        app.reduce(Action::ToggleEvents);
+        assert!(app.event_viewer);
+        assert_eq!(app.panel, Panel::Events);
+        app.reduce(Action::PageDown);
+        assert_eq!(app.event_scroll, 10);
+        assert_eq!(app.selected, 0);
+        app.reduce(Action::Escape);
+        assert!(!app.event_viewer);
+        assert!(!app.quit);
+    }
+    #[test]
     fn terminal_controls_are_sanitized() {
         assert_eq!(sanitize("ok\u{1b}[31m"), "ok[31m");
         assert_eq!(
             sanitize("API_KEY=secret TOKEN=abc sk-live"),
             "[REDACTED] [REDACTED] [REDACTED]"
         );
+        assert_eq!(
+            sanitize("Başlık\n\n- ilk madde\n  devam"),
+            "Başlık\n\n- ilk madde\n  devam"
+        );
+        assert_eq!(sanitize(" birleştirilen parça"), " birleştirilen parça");
     }
     #[test]
     fn streaming_deltas_are_coalesced() {
@@ -614,5 +728,13 @@ mod tests {
         assert_eq!(app.events, vec!["Merhaba"]);
         app.push_event(&CanonicalEventKind::ProviderCompleted);
         assert_eq!(app.events.len(), 2);
+    }
+    #[test]
+    fn streaming_preserves_spaces_and_markdown_lines() {
+        let mut app = AppModel::new(SessionId::new());
+        app.push_event(&CanonicalEventKind::TextDelta("Repo küçük,".into()));
+        app.push_event(&CanonicalEventKind::TextDelta(" iyi ayrılmış.\n\n".into()));
+        app.push_event(&CanonicalEventKind::TextDelta("- İlk öneri".into()));
+        assert_eq!(app.events, vec!["Repo küçük, iyi ayrılmış.\n\n- İlk öneri"]);
     }
 }
