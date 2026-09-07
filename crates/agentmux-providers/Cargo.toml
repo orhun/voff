@@ -3,6 +3,7 @@ name="agentmux-providers"
 version.workspace=true
 edition.workspace=true
 rust-version.workspace=true
+license.workspace=true
 [dependencies]
 agentmux-core.workspace=true
 agentmux-provider.workspace=true
@@ -15,3 +16,5 @@ tokio.workspace=true
 tokio-util.workspace=true
 [lints]
 workspace=true
+[dev-dependencies]
+agentmux-provider={workspace=true,features=["test-support"]}

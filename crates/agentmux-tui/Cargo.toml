@@ -3,6 +3,7 @@ name="agentmux-tui"
 version.workspace=true
 edition.workspace=true
 rust-version.workspace=true
+license.workspace=true
 [dependencies]
 agentmux-core.workspace=true
 agentmux-engine.workspace=true

@@ -2,13 +2,17 @@
 all-features = true
 [advisories]
 yanked = "deny"
+# Transitive unmaintained notices remain visible, while only workspace/direct
+# occurrences fail the gate. Ratatui 0.29 currently carries `paste` transitively.
+unmaintained = "workspace"
 [licenses]
 confidence-threshold = 0.8
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib"]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib", "CDLA-Permissive-2.0"]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal unpublished workspace crates intentionally use path-only links.
+allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-

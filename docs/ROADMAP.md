@@ -62,3 +62,59 @@ Phase 3 exit gate is complete: a lead can dispatch bounded structured work to in
 - The TUI projects live circuit state, retry/failure counters and the last provider error without blocking input handling.
 
 Phase 4 exit gate is complete: the same configured agent runtime can select Ollama or OpenAI without engine changes, provider faults are bounded by retry/circuit policies, health remains visible, and no fault path blocks the TUI event loop.
+
+## Phase 4.5 evidence
+
+- Backward-compatible named provider registry and agent route/model validation: `agentmux-config`, `.agentmux/heterogeneous.example.toml`.
+- Task-owner routing without provider-specific engine branches: `Engine::with_provider_registry`, ADR 0012.
+- CLI builds one independently resilient adapter per named route and persists route/model identity in every agent profile.
+- The TUI lists each formation agent with its selected provider and model.
+- Acceptance tests run two agent-owned tasks through distinct routes in one bounded wave and prove that one provider failure does not cancel its sibling route.
+
+Phase 4.5 exit gate is complete: a single formation can route concurrent agents to independently configured Ollama and OpenAI adapters while retaining the same task graph, permission boundary and persistence model.
+
+## Phase 4.5 orchestration hardening
+
+- Approved implementation and review proposals form dependency-ordered waves;
+  review receives completed prerequisite summaries and evidence references.
+- Delegating parents remain active until all direct children finish and aggregate
+  their normalized results only on success.
+- Failed, blocked, or cancelled prerequisites fail queued dependants and prevent
+  successful parent completion.
+- Engine acceptance tests cover heterogeneous implementation/review handoff and
+  child-failure propagation (ADR 0013).
+
+## Phase 5 progress
+
+- Root README now provides local and heterogeneous-team onboarding, secure
+  credential setup, TUI controls, and contributor quality commands.
+- `agentmux init` interactively creates a validated solo Ollama or OpenAI
+  configuration, supports non-interactive arguments, keeps credentials
+  environment-only, and refuses accidental overwrite.
+- CI enforces the checked-in `cargo-deny` dependency policy.
+- Tag-triggered release CI builds locked Linux x86-64 and macOS Intel/Apple
+  Silicon archives, generates SHA-256 checksums, and publishes them only for
+  version tags. The maintainer procedure is documented in `docs/RELEASING.md`.
+- `agentmux run` creates a clean session by default; `--resume` explicitly
+  reopens the newest session. Initial TUI projections and interruption recovery
+  are scoped to the selected session, preventing unrelated historical tasks
+  from being mixed into a new run.
+- `agentmux export` writes a session-scoped diagnostic JSON bundle, redacts the
+  configured credential value and common secret forms, and refuses accidental
+  overwrite.
+- Root security and conduct policies define private reporting, supported beta
+  revisions, coordinated disclosure, community expectations, confidential
+  enforcement, and appeals without inventing an unverified contact address.
+- Project and contribution metadata use the standard `MIT OR Apache-2.0`
+  dual-license expression, with both complete license texts included.
+- Provider contributors have a boundary/security guide and reusable contract
+  test support for canonical requests, bounded event collection, descriptors,
+  completion ordering, and usage consistency.
+- Provider contracts also validate canonical failures, retryability,
+  cancellation, and structured tool-call JSON.
+- Generated task graph/state invariants, malformed provider/redaction corpora,
+  and a reproducible 10,000-event SQLite benchmark cover Phase 5 robustness.
+- Beta metadata is `0.1.0-beta.1`; changelog, release checklist, and release-CI
+  archive self-verification are checked in.
+- Onboarding selects solo or lead/implementer/reviewer templates, while
+  `sessions` and `run --session` make stored runs discoverable and selectable.

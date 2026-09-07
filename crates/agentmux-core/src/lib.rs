@@ -25,6 +25,17 @@ macro_rules! typed_id {
                 write!(f, concat!($prefix, "_{}"), self.0.simple())
             }
         }
+        impl std::str::FromStr for $name {
+            type Err = String;
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                let raw = value
+                    .strip_prefix(concat!($prefix, "_"))
+                    .ok_or_else(|| format!("expected {}_ prefixed identifier", $prefix))?;
+                Uuid::parse_str(raw)
+                    .map(Self)
+                    .map_err(|error| format!("invalid {} identifier: {error}", $prefix))
+            }
+        }
     };
 }
 typed_id!(SessionId, "ses");
@@ -176,7 +187,7 @@ impl Task {
             (self.status, to),
             (
                 TaskStatus::Queued,
-                TaskStatus::Ready | TaskStatus::Cancelled
+                TaskStatus::Ready | TaskStatus::Failed | TaskStatus::Cancelled
             ) | (
                 TaskStatus::Ready,
                 TaskStatus::Running | TaskStatus::Cancelled
@@ -189,7 +200,7 @@ impl Task {
                     | TaskStatus::Cancelled
             ) | (
                 TaskStatus::WaitingApproval,
-                TaskStatus::Running | TaskStatus::Blocked
+                TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Failed
             ) | (TaskStatus::Blocked, TaskStatus::Ready)
         );
         if !valid {
@@ -464,5 +475,75 @@ mod tests {
             g.add_child(b, AgentId::new(), "c", vec![]),
             Err(DomainError::DepthLimit)
         );
+    }
+
+    #[test]
+    fn typed_ids_round_trip_and_reject_wrong_prefix() {
+        let id = SessionId::new();
+        assert_eq!(id.to_string().parse::<SessionId>().unwrap(), id);
+        assert!(id.to_string().parse::<TaskId>().is_err());
+    }
+
+    #[test]
+    fn generated_dags_never_accept_a_back_edge() {
+        for width in 2..=32 {
+            let mut graph = TaskGraph::default();
+            let root = Task::root(
+                AgentId::new(),
+                "root",
+                vec![],
+                TaskLimits {
+                    max_delegation_depth: 1,
+                    max_children: width,
+                    max_duration_seconds: 1,
+                },
+            );
+            let root_id = root.id;
+            graph.add_root(root);
+            let nodes = (0..width)
+                .map(|index| {
+                    graph
+                        .add_child(root_id, AgentId::new(), format!("node {index}"), vec![])
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for pair in nodes.windows(2) {
+                graph.add_dependency(pair[1], pair[0]).unwrap();
+                assert_eq!(
+                    graph.add_dependency(pair[0], pair[1]),
+                    Err(DomainError::Cycle)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_transition_sequences_preserve_terminal_states() {
+        let terminal = [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ];
+        for final_status in terminal {
+            let mut task = Task::root(AgentId::new(), "property", vec![], TaskLimits::default());
+            if final_status != TaskStatus::Cancelled {
+                task.transition(TaskStatus::Ready).unwrap();
+                task.transition(TaskStatus::Running).unwrap();
+            }
+            task.transition(final_status).unwrap();
+            for candidate in [
+                TaskStatus::Queued,
+                TaskStatus::Ready,
+                TaskStatus::Running,
+                TaskStatus::WaitingApproval,
+                TaskStatus::Blocked,
+                TaskStatus::Completed,
+                TaskStatus::Failed,
+                TaskStatus::Cancelled,
+            ] {
+                assert!(task.transition(candidate).is_err());
+                assert_eq!(task.status, final_status);
+            }
+        }
     }
 }

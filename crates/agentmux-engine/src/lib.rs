@@ -33,6 +33,8 @@ pub enum EngineError {
     InvalidToolArguments(#[from] serde_json::Error),
     #[error("safe workflow is not configured")]
     WorkflowNotConfigured,
+    #[error("provider route is not configured: {0}")]
+    ProviderRouteNotFound(String),
 }
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
@@ -44,11 +46,12 @@ pub enum EngineEvent {
 }
 pub struct Engine<R: Repository> {
     repo: Arc<R>,
-    provider: Arc<dyn ModelProvider>,
+    providers: HashMap<String, Arc<dyn ModelProvider>>,
+    default_provider: String,
     session: SessionId,
     events: mpsc::Sender<EngineEvent>,
     cancellations: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
-    model: String,
+    default_model: String,
     system_prompt: String,
     workspace_context: Option<String>,
     workspace: Option<ScopedWorkspace>,
@@ -78,13 +81,18 @@ impl<R: Repository + 'static> Engine<R> {
         session: SessionId,
         events: mpsc::Sender<EngineEvent>,
     ) -> Self {
+        let provider_id = provider.descriptor().id;
+        let mut providers = HashMap::new();
+        providers.insert(provider_id.clone(), Arc::clone(&provider));
+        providers.insert("default".into(), provider);
         Self {
             repo,
-            provider,
+            providers,
+            default_provider: provider_id,
             session,
             events,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
-            model: "mock-v1".into(),
+            default_model: "mock-v1".into(),
             system_prompt: String::new(),
             workspace_context: None,
             workspace: None,
@@ -102,8 +110,18 @@ impl<R: Repository + 'static> Engine<R> {
         model: impl Into<String>,
         system_prompt: impl Into<String>,
     ) -> Self {
-        self.model = model.into();
+        self.default_model = model.into();
         self.system_prompt = system_prompt.into();
+        self
+    }
+    #[must_use]
+    pub fn with_provider_registry(
+        mut self,
+        providers: HashMap<String, Arc<dyn ModelProvider>>,
+        default_provider: impl Into<String>,
+    ) -> Self {
+        self.providers = providers;
+        self.default_provider = default_provider.into();
         self
     }
     #[must_use]
@@ -234,24 +252,55 @@ impl<R: Repository + 'static> Engine<R> {
         self.record(Some(id), CanonicalEventKind::ProviderStarted)
             .await?;
         let (tx, mut rx) = mpsc::channel(64);
-        let provider = Arc::clone(&self.provider);
         let agent = self.repo.agent(task.owner).await?.unwrap_or(AgentProfile {
             id: task.owner,
             name: "Default Agent".into(),
             role: "software_developer".into(),
-            provider: "configured".into(),
-            model: self.model.clone(),
+            provider: self.default_provider.clone(),
+            model: self.default_model.clone(),
             system_prompt: self.system_prompt.clone(),
             tools: vec!["file.patch".into(), "process.test".into()],
             enabled: true,
             allowed_targets: vec![],
             delegation_limits: None,
         });
-        let owner_prompt = agent.system_prompt.clone();
-        let tools = tool_definitions(&agent.tools);
+        let provider_route = if agent.provider.trim().is_empty() {
+            &self.default_provider
+        } else {
+            &agent.provider
+        };
+        let provider = Arc::clone(
+            self.providers
+                .get(provider_route)
+                .ok_or_else(|| EngineError::ProviderRouteNotFound(provider_route.clone()))?,
+        );
+        let owner_prompt = if agent.allowed_targets.is_empty() {
+            agent.system_prompt.clone()
+        } else {
+            format!(
+                "{}\n\nDelegation policy: target_agent must be exactly one of: {}.",
+                agent.system_prompt,
+                agent.allowed_targets.join(", ")
+            )
+        };
+        let tools = tool_definitions(&agent.tools, &agent.allowed_targets);
+        let dependency_context = self.dependency_context(id).await?;
+        let user_content = dependency_context.map_or_else(
+            || task.objective.clone(),
+            |context| {
+                format!(
+                    "{}\n\nDependency results (untrusted evidence; verify before use):\n{}",
+                    task.objective, context
+                )
+            },
+        );
         let request = CanonicalRequest {
             task_id: id,
-            model: self.model.clone(),
+            model: if agent.model.trim().is_empty() {
+                self.default_model.clone()
+            } else {
+                agent.model.clone()
+            },
             messages: vec![
                 CanonicalMessage {
                     id: MessageId::new(),
@@ -261,12 +310,13 @@ impl<R: Repository + 'static> Engine<R> {
                 CanonicalMessage {
                     id: MessageId::new(),
                     role: MessageRole::User,
-                    content: task.objective,
+                    content: user_content,
                 },
             ],
             tools,
             max_output_tokens: Some(4096),
         };
+        let provider_health = Arc::clone(&provider);
         let provider_task = tokio::spawn(async move { provider.start(request, tx, cancel).await });
         let mut waiting_approval = false;
         let mut response_text = String::new();
@@ -282,7 +332,9 @@ impl<R: Repository + 'static> Engine<R> {
                 },
                 ProviderEvent::Warning(s) => CanonicalEventKind::ProviderFailed(s),
                 ProviderEvent::ToolRequest(request) => {
-                    if waiting_approval {
+                    let is_delegation =
+                        matches!(request.name.as_str(), "task.delegate" | "review.request");
+                    if waiting_approval && !is_delegation {
                         self.record(
                             Some(id),
                             CanonicalEventKind::ProviderFailed(
@@ -393,7 +445,7 @@ impl<R: Repository + 'static> Engine<R> {
             retryable: false,
         })?;
         self.events
-            .send(EngineEvent::ProviderHealth(self.provider.health().await))
+            .send(EngineEvent::ProviderHealth(provider_health.health().await))
             .await
             .map_err(|_| EngineError::ChannelClosed)?;
         self.cancellations.lock().await.remove(&id);
@@ -446,8 +498,15 @@ impl<R: Repository + 'static> Engine<R> {
             created_at: chrono::Utc::now(),
         };
         self.repo.save_approval(approval.clone()).await?;
-        self.transition(task_id, TaskStatus::WaitingApproval)
-            .await?;
+        if self
+            .repo
+            .task(task_id)
+            .await?
+            .is_some_and(|task| task.status == TaskStatus::Running)
+        {
+            self.transition(task_id, TaskStatus::WaitingApproval)
+                .await?;
+        }
         self.record(
             Some(task_id),
             CanonicalEventKind::ApprovalRequested {
@@ -498,22 +557,37 @@ impl<R: Repository + 'static> Engine<R> {
             let outcome = self.dispatch_approved(&approval).await;
             match outcome {
                 Ok(()) => {
-                    self.transition(approval.task_id, TaskStatus::Running)
-                        .await?;
-                    let evidence = self
-                        .repo
-                        .artifacts()
-                        .await?
-                        .into_iter()
-                        .filter(|a| a.producer == approval.task_id)
-                        .map(|a| a.id)
-                        .collect();
-                    self.finish_task(
-                        approval.task_id,
-                        format!("Approved {} completed", approval.action),
-                        evidence,
-                    )
-                    .await?;
+                    let has_pending =
+                        self.repo
+                            .approvals(self.session)
+                            .await?
+                            .into_iter()
+                            .any(|candidate| {
+                                candidate.task_id == approval.task_id
+                                    && candidate.decision == ApprovalDecision::Pending
+                            });
+                    if !has_pending {
+                        self.transition(approval.task_id, TaskStatus::Running)
+                            .await?;
+                        if matches!(approval.action.as_str(), "task.delegate" | "review.request") {
+                            self.finalize_parent_tasks().await?;
+                        } else {
+                            let evidence = self
+                                .repo
+                                .artifacts()
+                                .await?
+                                .into_iter()
+                                .filter(|artifact| artifact.producer == approval.task_id)
+                                .map(|artifact| artifact.id)
+                                .collect();
+                            self.finish_task(
+                                approval.task_id,
+                                format!("Approved {} completed", approval.action),
+                                evidence,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 Err(EngineError::Tool(ToolError::PatchConflict)) => {
                     if let Some(artifact) = self
@@ -629,13 +703,27 @@ impl<R: Repository + 'static> Engine<R> {
                     .into_iter()
                     .find(|a| a.enabled && a.name == args.target_agent)
                     .ok_or(EngineError::TaskNotFound)?;
-                self.delegate_task(
-                    approval.task_id,
-                    target.id,
-                    args.objective,
-                    args.acceptance_criteria,
-                )
-                .await?;
+                let child = self
+                    .delegate_task(
+                        approval.task_id,
+                        target.id,
+                        args.objective,
+                        args.acceptance_criteria,
+                    )
+                    .await?;
+                if approval.action == "review.request" {
+                    let prerequisites = self
+                        .repo
+                        .tasks()
+                        .await?
+                        .into_iter()
+                        .filter(|task| task.parent == Some(approval.task_id) && task.id != child.id)
+                        .map(|task| task.id)
+                        .collect::<Vec<_>>();
+                    for prerequisite in prerequisites {
+                        self.add_dependency(child.id, prerequisite).await?;
+                    }
+                }
                 Ok(())
             }
             _ => Err(ExecutorError::Denied.into()),
@@ -674,6 +762,116 @@ impl<R: Repository + 'static> Engine<R> {
             .filter_map(|t| t.result)
             .collect())
     }
+    async fn dependency_context(&self, task: TaskId) -> Result<Option<String>, EngineError> {
+        let dependency_ids = self
+            .repo
+            .dependencies()
+            .await?
+            .into_iter()
+            .filter(|dependency| dependency.task_id == task)
+            .map(|dependency| dependency.depends_on)
+            .collect::<Vec<_>>();
+        if dependency_ids.is_empty() {
+            return Ok(None);
+        }
+        let mut lines = Vec::new();
+        for dependency in self.repo.tasks().await?.into_iter().filter(|candidate| {
+            dependency_ids.contains(&candidate.id) && candidate.status == TaskStatus::Completed
+        }) {
+            if let Some(result) = dependency.result {
+                lines.push(format!(
+                    "- task {}: {} (evidence: {})",
+                    dependency.id,
+                    result.summary,
+                    result
+                        .evidence
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        Ok((!lines.is_empty()).then(|| lines.join("\n")))
+    }
+
+    async fn reconcile_dependency_failures(&self) -> Result<(), EngineError> {
+        let tasks = self.repo.tasks().await?;
+        let by_id = tasks
+            .iter()
+            .map(|task| (task.id, task.status))
+            .collect::<HashMap<_, _>>();
+        for dependency in self.repo.dependencies().await? {
+            if by_id.get(&dependency.task_id) == Some(&TaskStatus::Queued)
+                && matches!(
+                    by_id.get(&dependency.depends_on),
+                    Some(TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked)
+                )
+            {
+                self.record(
+                    Some(dependency.task_id),
+                    CanonicalEventKind::ProviderFailed(format!(
+                        "dependency {} did not complete successfully",
+                        dependency.depends_on
+                    )),
+                )
+                .await?;
+                self.transition(dependency.task_id, TaskStatus::Failed)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn finalize_parent_tasks(&self) -> Result<(), EngineError> {
+        let tasks = self.repo.tasks().await?;
+        let parents = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Running)
+            .filter(|parent| tasks.iter().any(|task| task.parent == Some(parent.id)))
+            .cloned()
+            .collect::<Vec<_>>();
+        for parent in parents {
+            let children = tasks
+                .iter()
+                .filter(|task| task.parent == Some(parent.id))
+                .collect::<Vec<_>>();
+            if children.iter().any(|child| {
+                matches!(
+                    child.status,
+                    TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+                )
+            }) {
+                self.record(
+                    Some(parent.id),
+                    CanonicalEventKind::ProviderFailed(
+                        "one or more delegated tasks did not complete successfully".into(),
+                    ),
+                )
+                .await?;
+                self.transition(parent.id, TaskStatus::Failed).await?;
+            } else if children
+                .iter()
+                .all(|child| child.status == TaskStatus::Completed)
+            {
+                let results = children
+                    .iter()
+                    .filter_map(|child| child.result.as_ref())
+                    .collect::<Vec<_>>();
+                let summary = results
+                    .iter()
+                    .map(|result| result.summary.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let evidence = results
+                    .iter()
+                    .flat_map(|result| result.evidence.iter().copied())
+                    .collect();
+                self.finish_task(parent.id, summary, evidence).await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn run_ready_bounded(
         self: &Arc<Self>,
         max_parallel: usize,
@@ -689,11 +887,18 @@ impl<R: Repository + 'static> Engine<R> {
             set.spawn(async move { engine.run_task(task.id).await });
         }
         while let Some(result) = set.join_next().await {
-            result.map_err(|e| ProviderError {
-                kind: ProviderErrorKind::Internal,
-                message: e.to_string(),
-                retryable: false,
-            })??;
+            match result {
+                Ok(Ok(())) | Ok(Err(EngineError::Provider(_))) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    return Err(ProviderError {
+                        kind: ProviderErrorKind::Internal,
+                        message: error.to_string(),
+                        retryable: false,
+                    }
+                    .into());
+                }
+            }
         }
         Ok(ids)
     }
@@ -704,6 +909,8 @@ impl<R: Repository + 'static> Engine<R> {
         let mut all = Vec::new();
         loop {
             let wave = self.run_ready_bounded(max_parallel).await?;
+            self.reconcile_dependency_failures().await?;
+            self.finalize_parent_tasks().await?;
             if wave.is_empty() {
                 break;
             }
@@ -806,14 +1013,35 @@ fn command_spec(command: &str, cwd: &Path) -> Result<CommandSpec, EngineError> {
         output_limit: 256 * 1024,
     })
 }
-fn tool_definitions(names: &[String]) -> Vec<ToolDefinition> {
+fn tool_definitions(names: &[String], allowed_targets: &[String]) -> Vec<ToolDefinition> {
     names.iter().filter_map(|name| match name.as_str() {
         "file.patch" => Some(ToolDefinition { name: name.clone(), description: "Propose replacing one existing workspace text file; user approval and base-digest validation are mandatory.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
         "process.test" => Some(ToolDefinition { name: name.clone(), description: "Propose a scoped Cargo verification command; user approval is mandatory.".into(), input_schema: r#"{"type":"object","properties":{"command":{"type":"string","enum":["cargo test","cargo check","cargo clippy","cargo fmt --check"]}},"required":["command"]}"#.into() }),
-        "task.delegate" => Some(ToolDefinition { name: name.clone(), description: "Propose one bounded child task for an enabled target agent; user approval is mandatory.".into(), input_schema: r#"{"type":"object","properties":{"target_agent":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}}},"required":["target_agent","objective"]}"#.into() }),
-        "review.request" => Some(ToolDefinition { name: name.clone(), description: "Request review by delegating a bounded evidence review task.".into(), input_schema: r#"{"type":"object","properties":{"target_agent":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}}},"required":["target_agent","objective"]}"#.into() }),
+        "task.delegate" => Some(delegation_tool(name, "Propose one bounded child task for an enabled target agent; user approval is mandatory.", allowed_targets)),
+        "review.request" => Some(delegation_tool(name, "Request review by delegating a bounded evidence review task.", allowed_targets)),
         _ => None,
     }).collect()
+}
+
+fn delegation_tool(name: &str, description: &str, allowed_targets: &[String]) -> ToolDefinition {
+    ToolDefinition {
+        name: name.into(),
+        description: format!(
+            "{} Use an exact target_agent value from: {}.",
+            description,
+            allowed_targets.join(", ")
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target_agent": {"type": "string", "enum": allowed_targets},
+                "objective": {"type": "string"},
+                "acceptance_criteria": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["target_agent", "objective"]
+        })
+        .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -822,6 +1050,19 @@ mod tests {
     use agentmux_providers::{MockProvider, MockStep};
     use agentmux_storage::InMemoryRepository;
     use std::time::Duration;
+    #[test]
+    fn delegation_schema_exposes_only_exact_allowed_agent_names() {
+        let tools = tool_definitions(
+            &["task.delegate".into()],
+            &["Local Implementer".into(), "Cloud Reviewer".into()],
+        );
+        let schema: serde_json::Value = serde_json::from_str(&tools[0].input_schema).unwrap();
+        assert_eq!(
+            schema["properties"]["target_agent"]["enum"],
+            serde_json::json!(["Local Implementer", "Cloud Reviewer"])
+        );
+        assert!(tools[0].description.contains("Local Implementer"));
+    }
     #[tokio::test]
     async fn records_provider_events() {
         let repo = Arc::new(InMemoryRepository::default());
@@ -1117,5 +1358,295 @@ mod tests {
             .unwrap();
         assert_eq!(child.owner, worker.id);
         assert_eq!(child.objective, "bounded child");
+    }
+
+    #[tokio::test]
+    async fn routes_parallel_tasks_to_each_agents_provider() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let local = AgentProfile {
+            id: AgentId::new(),
+            name: "Local Worker".into(),
+            role: "developer".into(),
+            provider: "local".into(),
+            model: "qwen-test".into(),
+            system_prompt: "local".into(),
+            tools: vec![],
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        let cloud = AgentProfile {
+            id: AgentId::new(),
+            name: "Cloud Reviewer".into(),
+            role: "reviewer".into(),
+            provider: "cloud".into(),
+            model: "gpt-test".into(),
+            system_prompt: "cloud".into(),
+            tools: vec![],
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        repo.save_agent(local.clone()).await.unwrap();
+        repo.save_agent(cloud.clone()).await.unwrap();
+        let local_provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::success("local result"));
+        let cloud_provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::success("cloud result"));
+        let providers = HashMap::from([
+            ("local".into(), Arc::clone(&local_provider)),
+            ("cloud".into(), cloud_provider),
+        ]);
+        let (tx, _rx) = mpsc::channel(256);
+        let engine = Arc::new(
+            Engine::new(repo.clone(), local_provider, SessionId::new(), tx)
+                .with_provider_registry(providers, "local"),
+        );
+        let local_task = engine.create_task(local.id, "local", vec![]).await.unwrap();
+        let cloud_task = engine.create_task(cloud.id, "cloud", vec![]).await.unwrap();
+        engine.run_until_idle_bounded(2).await.unwrap();
+        assert_eq!(
+            repo.task(local_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap()
+                .summary,
+            "local result"
+        );
+        assert_eq!(
+            repo.task(cloud_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap()
+                .summary,
+            "cloud result"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_implementation_then_review_hands_results_to_parent() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let lead = AgentProfile {
+            id: AgentId::new(),
+            name: "Lead".into(),
+            role: "lead".into(),
+            provider: "lead".into(),
+            model: "mock-v1".into(),
+            system_prompt: "delegate".into(),
+            tools: vec!["task.delegate".into(), "review.request".into()],
+            enabled: true,
+            allowed_targets: vec!["Worker One".into(), "Worker Two".into()],
+            delegation_limits: Some(TaskLimits::default()),
+        };
+        repo.save_agent(lead.clone()).await.unwrap();
+        for (name, provider) in [("Worker One", "worker"), ("Worker Two", "reviewer")] {
+            repo.save_agent(AgentProfile {
+                id: AgentId::new(),
+                name: name.into(),
+                role: "worker".into(),
+                provider: provider.into(),
+                model: "mock-v1".into(),
+                system_prompt: "work".into(),
+                tools: vec![],
+                enabled: true,
+                allowed_targets: vec![],
+                delegation_limits: None,
+            })
+            .await
+            .unwrap();
+        }
+        let lead_provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "task.delegate".into(),
+                arguments_json:
+                    r#"{"target_agent":"Worker One","objective":"first","acceptance_criteria":[]}"#
+                        .into(),
+            })),
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "review.request".into(),
+                arguments_json:
+                    r#"{"target_agent":"Worker Two","objective":"second","acceptance_criteria":[]}"#
+                        .into(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]));
+        let providers = HashMap::from([
+            ("lead".into(), Arc::clone(&lead_provider)),
+            (
+                "worker".into(),
+                Arc::new(MockProvider::success("implementation result")) as Arc<dyn ModelProvider>,
+            ),
+            (
+                "reviewer".into(),
+                Arc::new(MockProvider::success("review result")) as Arc<dyn ModelProvider>,
+            ),
+        ]);
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(256);
+        let engine = Arc::new(
+            Engine::new(repo.clone(), lead_provider, session, tx)
+                .with_provider_registry(providers, "lead"),
+        );
+        let parent = engine.create_task(lead.id, "split", vec![]).await.unwrap();
+        engine.mark_ready(parent.id).await.unwrap();
+        engine.run_task(parent.id).await.unwrap();
+        let mut approvals = repo.approvals(session).await.unwrap();
+        approvals.sort_by_key(|approval| approval.created_at);
+        assert_eq!(approvals.len(), 2);
+        engine
+            .decide_approval(approvals[0].id, ApprovalDecision::ApprovedOnce)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::WaitingApproval
+        );
+        engine
+            .decide_approval(approvals[1].id, ApprovalDecision::ApprovedOnce)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.tasks()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|task| task.parent == Some(parent.id))
+                .count(),
+            2
+        );
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        let children = repo
+            .tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.parent == Some(parent.id))
+            .collect::<Vec<_>>();
+        let implementation = children
+            .iter()
+            .find(|task| task.objective == "first")
+            .unwrap();
+        let review = children
+            .iter()
+            .find(|task| task.objective == "second")
+            .unwrap();
+        assert!(
+            repo.dependencies()
+                .await
+                .unwrap()
+                .contains(&TaskDependency {
+                    task_id: review.id,
+                    depends_on: implementation.id,
+                })
+        );
+        let scheduled = engine.run_until_idle_bounded(2).await.unwrap();
+        assert_eq!(scheduled, vec![implementation.id, review.id]);
+        let parent = repo.task(parent.id).await.unwrap().unwrap();
+        assert_eq!(parent.status, TaskStatus::Completed);
+        let summary = parent.result.unwrap().summary;
+        assert!(summary.contains("implementation result"));
+        assert!(summary.contains("review result"));
+    }
+
+    #[tokio::test]
+    async fn one_provider_failure_does_not_cancel_other_route() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let local_id = AgentId::new();
+        let cloud_id = AgentId::new();
+        for (id, name, provider) in [(local_id, "Local", "local"), (cloud_id, "Cloud", "cloud")] {
+            repo.save_agent(AgentProfile {
+                id,
+                name: name.into(),
+                role: "worker".into(),
+                provider: provider.into(),
+                model: "test".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                enabled: true,
+                allowed_targets: vec![],
+                delegation_limits: None,
+            })
+            .await
+            .unwrap();
+        }
+        let local: Arc<dyn ModelProvider> = Arc::new(MockProvider::success("survived"));
+        let cloud: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![MockStep::Fail(
+            "isolated failure".into(),
+        )]));
+        let providers = HashMap::from([
+            ("local".into(), Arc::clone(&local)),
+            ("cloud".into(), cloud),
+        ]);
+        let (tx, _rx) = mpsc::channel(256);
+        let engine = Arc::new(
+            Engine::new(repo.clone(), local, SessionId::new(), tx)
+                .with_provider_registry(providers, "local"),
+        );
+        let local_task = engine.create_task(local_id, "local", vec![]).await.unwrap();
+        let cloud_task = engine.create_task(cloud_id, "cloud", vec![]).await.unwrap();
+        engine.run_until_idle_bounded(2).await.unwrap();
+        assert_eq!(
+            repo.task(local_task.id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            repo.task(cloud_task.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_child_fails_dependent_review_and_parent() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(256);
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![MockStep::Fail(
+            "worker failed".into(),
+        )]));
+        let engine = Arc::new(Engine::new(repo.clone(), provider, SessionId::new(), tx));
+        let parent = engine
+            .create_task(AgentId::new(), "parent", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(parent.id).await.unwrap();
+        engine
+            .transition(parent.id, TaskStatus::Running)
+            .await
+            .unwrap();
+        let implementation = engine
+            .delegate_task(parent.id, AgentId::new(), "implement".into(), vec![])
+            .await
+            .unwrap();
+        let review = engine
+            .delegate_task(parent.id, AgentId::new(), "review".into(), vec![])
+            .await
+            .unwrap();
+        engine
+            .add_dependency(review.id, implementation.id)
+            .await
+            .unwrap();
+
+        engine.run_until_idle_bounded(2).await.unwrap();
+
+        assert_eq!(
+            repo.task(implementation.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            repo.task(review.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
     }
 }

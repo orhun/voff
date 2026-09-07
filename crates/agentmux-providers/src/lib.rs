@@ -470,11 +470,12 @@ fn openai_request_body(request: CanonicalRequest) -> Result<serde_json::Value, P
         .tools
         .into_iter()
         .map(|tool| {
-            let parameters: serde_json::Value =
+            let mut parameters: serde_json::Value =
                 serde_json::from_str(&tool.input_schema).map_err(openai_invalid)?;
+            normalize_openai_strict_schema(&mut parameters);
             Ok(serde_json::json!({
                 "type": "function",
-                "name": tool.name,
+                "name": openai_tool_name(&tool.name),
                 "description": tool.description,
                 "parameters": parameters,
                 "strict": true,
@@ -506,7 +507,7 @@ fn openai_events(value: &serde_json::Value) -> Result<Vec<ProviderEvent>, Provid
                 .and_then(serde_json::Value::as_str)
                 == Some("function_call") =>
         {
-            let name = required_string(value, "/item/name")?;
+            let name = canonical_tool_name(&required_string(value, "/item/name")?);
             let arguments_json = required_string(value, "/item/arguments")?;
             serde_json::from_str::<serde_json::Value>(&arguments_json).map_err(openai_invalid)?;
             Ok(vec![ProviderEvent::ToolRequest(StructuredToolRequest {
@@ -539,6 +540,46 @@ fn openai_events(value: &serde_json::Value) -> Result<Vec<ProviderEvent>, Provid
             retryable: false,
         }),
         _ => Ok(vec![]),
+    }
+}
+
+/// OpenAI function names allow letters, digits, underscores and hyphens, while
+/// AgentMux canonical names use dots as namespaces. A doubled underscore is
+/// reserved at this adapter boundary so the mapping remains reversible.
+fn openai_tool_name(canonical: &str) -> String {
+    canonical.replace('.', "__")
+}
+
+fn canonical_tool_name(openai: &str) -> String {
+    openai.replace("__", ".")
+}
+
+/// OpenAI strict function schemas require closed objects and every declared
+/// property to appear in `required`. This adapter-level normalization keeps
+/// the canonical tool definitions provider-neutral.
+fn normalize_openai_strict_schema(schema: &mut serde_json::Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.get("type").and_then(serde_json::Value::as_str) == Some("object") {
+        let required = object
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|properties| {
+                properties
+                    .keys()
+                    .map(|key| serde_json::Value::String(key.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        object.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert("required".into(), serde_json::Value::Array(required));
+    }
+    for value in object.values_mut() {
+        normalize_openai_strict_schema(value);
     }
 }
 
@@ -637,8 +678,7 @@ async fn response_error(response: reqwest::Response) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentmux_core::{MessageId, TaskId};
-    use tokio::sync::mpsc;
+    use agentmux_core::{MessageId, TaskId, ToolCallId};
     fn req() -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
@@ -654,32 +694,39 @@ mod tests {
     }
     #[tokio::test]
     async fn streams_success() {
-        let (tx, mut rx) = mpsc::channel(8);
-        MockProvider::success("ok")
-            .start(req(), tx, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(rx.recv().await, Some(ProviderEvent::TextDelta("ok".into())));
+        let provider: std::sync::Arc<dyn ModelProvider> =
+            std::sync::Arc::new(MockProvider::success("ok"));
+        agentmux_provider::contract::assert_descriptor(&provider.descriptor());
+        let (events, result) =
+            agentmux_provider::contract::run(provider, req(), CancellationToken::new()).await;
+        let completion = result.unwrap();
+        agentmux_provider::contract::assert_successful_stream(&events, &completion);
+        assert_eq!(events[0], ProviderEvent::TextDelta("ok".into()));
     }
     #[tokio::test]
     async fn simulates_failure() {
-        let (tx, _) = mpsc::channel(1);
-        let e = MockProvider::new(vec![MockStep::Fail("bad".into())])
-            .start(req(), tx, CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind, ProviderErrorKind::InvalidResponse);
+        let provider: std::sync::Arc<dyn ModelProvider> =
+            std::sync::Arc::new(MockProvider::new(vec![MockStep::Fail("bad".into())]));
+        let (events, result) =
+            agentmux_provider::contract::run(provider, req(), CancellationToken::new()).await;
+        agentmux_provider::contract::assert_failed_stream(
+            &events,
+            &result.unwrap_err(),
+            ProviderErrorKind::InvalidResponse,
+        );
     }
     #[tokio::test]
     async fn supports_cancellation() {
-        let (tx, _) = mpsc::channel(1);
         let c = CancellationToken::new();
         c.cancel();
-        let e = MockProvider::success("no")
-            .start(req(), tx, c)
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind, ProviderErrorKind::Cancelled);
+        let provider: std::sync::Arc<dyn ModelProvider> =
+            std::sync::Arc::new(MockProvider::success("no"));
+        let (events, result) = agentmux_provider::contract::run(provider, req(), c).await;
+        agentmux_provider::contract::assert_failed_stream(
+            &events,
+            &result.unwrap_err(),
+            ProviderErrorKind::Cancelled,
+        );
     }
     #[test]
     fn parses_ollama_chat_tool_call() {
@@ -687,6 +734,11 @@ mod tests {
         let call = &chunk.message.unwrap().tool_calls[0].function;
         assert_eq!(call.name, "file.patch");
         assert_eq!(call.arguments["path"], "README.md");
+        agentmux_provider::contract::assert_tool_request(&StructuredToolRequest {
+            id: ToolCallId::new(),
+            name: call.name.clone(),
+            arguments_json: serde_json::to_string(&call.arguments).unwrap(),
+        });
     }
 
     #[test]
@@ -716,12 +768,32 @@ mod tests {
     }
 
     #[test]
+    fn malformed_provider_output_fuzz_corpus_never_panics() {
+        let mut state = 0x9e37_79b9_u32;
+        for length in 0..512 {
+            let bytes = (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect::<Vec<_>>();
+            if let Ok(text) = std::str::from_utf8(&bytes)
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            {
+                let _ = openai_events(&value);
+            }
+        }
+    }
+
+    #[test]
     fn maps_openai_function_call() {
         let events = openai_events(&serde_json::json!({
             "type": "response.output_item.done",
             "item": {
                 "type": "function_call",
-                "name": "file.read",
+                "name": "file__read",
                 "arguments": "{\"path\":\"README.md\"}"
             }
         }))
@@ -731,5 +803,43 @@ mod tests {
         };
         assert_eq!(call.name, "file.read");
         assert_eq!(call.arguments_json, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn maps_canonical_tool_names_to_openai_safe_names() {
+        assert_eq!(openai_tool_name("file.read"), "file__read");
+        assert_eq!(openai_tool_name("task.delegate"), "task__delegate");
+        assert_eq!(canonical_tool_name("review__request"), "review.request");
+        assert!(
+            openai_tool_name("file.patch")
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
+    }
+
+    #[test]
+    fn normalizes_nested_objects_for_openai_strict_tools() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {"type": "string"},
+                "options": {
+                    "type": "object",
+                    "properties": {"depth": {"type": "integer"}}
+                }
+            },
+            "required": ["target"]
+        });
+        normalize_openai_strict_schema(&mut schema);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], serde_json::json!(["options", "target"]));
+        assert_eq!(
+            schema["properties"]["options"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["options"]["required"],
+            serde_json::json!(["depth"])
+        );
     }
 }

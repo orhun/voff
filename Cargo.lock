@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentmux-cli"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-config",
  "agentmux-core",
@@ -16,14 +16,18 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "agentmux-config"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -32,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-core"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "chrono",
  "serde",
@@ -42,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-engine"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "agentmux-executor",
@@ -61,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-executor"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "chrono",
@@ -73,11 +77,12 @@ dependencies = [
 
 [[package]]
 name = "agentmux-provider"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "async-trait",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -85,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-providers"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "agentmux-provider",
@@ -100,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-storage"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "async-trait",
@@ -115,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-tools"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "serde",
@@ -126,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-tui"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "agentmux-core",
  "agentmux-engine",

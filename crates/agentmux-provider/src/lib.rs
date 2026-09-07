@@ -313,6 +313,121 @@ fn retry_allowed(error: &ProviderError) -> bool {
         )
 }
 
+/// Reusable provider contract helpers for adapter tests.
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract {
+    use super::*;
+    use agentmux_core::{MessageId, TaskId};
+
+    #[must_use]
+    pub fn request(model: impl Into<String>) -> CanonicalRequest {
+        CanonicalRequest {
+            task_id: TaskId::new(),
+            model: model.into(),
+            messages: vec![CanonicalMessage {
+                id: MessageId::new(),
+                role: MessageRole::User,
+                content: "provider contract probe".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: Some(32),
+        }
+    }
+
+    pub async fn run(
+        provider: Arc<dyn ModelProvider>,
+        request: CanonicalRequest,
+        cancellation: CancellationToken,
+    ) -> (
+        Vec<ProviderEvent>,
+        Result<ProviderCompletion, ProviderError>,
+    ) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let task = tokio::spawn(async move { provider.start(request, tx, cancellation).await });
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        let result = task.await.expect("provider contract task must not panic");
+        (events, result)
+    }
+
+    pub fn assert_descriptor(descriptor: &ProviderDescriptor) {
+        assert!(!descriptor.id.trim().is_empty(), "provider id is required");
+        assert!(
+            !descriptor.display_name.trim().is_empty(),
+            "provider display name is required"
+        );
+    }
+
+    pub fn assert_successful_stream(events: &[ProviderEvent], completion: &ProviderCompletion) {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderEvent::Completed))
+                .count(),
+            1,
+            "a successful run emits exactly one Completed event"
+        );
+        assert!(
+            matches!(events.last(), Some(ProviderEvent::Completed)),
+            "Completed must be the final event"
+        );
+        let streamed_usage = events.iter().rev().find_map(|event| match event {
+            ProviderEvent::Usage(usage) => Some(usage),
+            _ => None,
+        });
+        assert_eq!(
+            streamed_usage,
+            completion.usage.as_ref(),
+            "streamed and returned usage must both be absent or match"
+        );
+    }
+
+    pub fn assert_failed_stream(
+        events: &[ProviderEvent],
+        error: &ProviderError,
+        expected_kind: ProviderErrorKind,
+    ) {
+        assert_eq!(
+            error.kind, expected_kind,
+            "provider error kind must be canonical"
+        );
+        assert!(
+            !error.message.trim().is_empty(),
+            "provider errors need an actionable message"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Completed)),
+            "failed runs must not emit Completed"
+        );
+        if matches!(
+            expected_kind,
+            ProviderErrorKind::Authentication
+                | ProviderErrorKind::Authorization
+                | ProviderErrorKind::InvalidResponse
+                | ProviderErrorKind::Cancelled
+        ) {
+            assert!(
+                !error.retryable,
+                "permanent and cancelled errors cannot be retryable"
+            );
+        }
+    }
+
+    pub fn assert_tool_request(request: &StructuredToolRequest) {
+        assert!(!request.name.trim().is_empty(), "tool name is required");
+        let arguments: serde_json::Value = serde_json::from_str(&request.arguments_json)
+            .expect("tool arguments must be valid JSON");
+        assert!(
+            arguments.is_object(),
+            "tool arguments must be a JSON object"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

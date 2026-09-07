@@ -15,6 +15,10 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub runtime: RuntimeConfig,
     pub provider: ProviderConfig,
+    /// Named providers used by heterogeneous formations. Empty keeps the
+    /// legacy single-provider configuration fully compatible.
+    #[serde(default)]
+    pub providers: Vec<NamedProviderConfig>,
     #[serde(default)]
     pub cost: CostConfig,
     pub agent: AgentConfig,
@@ -72,6 +76,12 @@ pub enum ProviderConfig {
         api_key_env: String,
     },
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NamedProviderConfig {
+    pub id: String,
+    #[serde(flatten)]
+    pub config: ProviderConfig,
+}
 fn default_openai_key_env() -> String {
     "OPENAI_API_KEY".into()
 }
@@ -96,6 +106,10 @@ pub struct FormationAgentConfig {
     pub role: String,
     pub system_prompt: String,
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub delegation: DelegationConfig,
 }
@@ -140,6 +154,7 @@ impl Default for Config {
                 event_channel_capacity: 128,
             },
             provider: ProviderConfig::Mock,
+            providers: vec![],
             cost: CostConfig::default(),
             agent: AgentConfig {
                 name: "Solo Agent".into(),
@@ -181,6 +196,10 @@ pub enum ConfigError {
     EntryAgentNotFound(String),
     #[error("duplicate formation agent id: {0}")]
     DuplicateAgent(String),
+    #[error("duplicate provider id: {0}")]
+    DuplicateProvider(String),
+    #[error("provider was not found: {0}")]
+    ProviderNotFound(String),
     #[error("delegation target was not found: {0}")]
     TargetNotFound(String),
     #[error("formation and agents must be configured together")]
@@ -254,27 +273,16 @@ impl Config {
         {
             return Err(ConfigError::UnsupportedTool(tool.clone()));
         }
-        if let ProviderConfig::Ollama { base_url, model } = &config.provider {
-            if model.trim().is_empty() {
-                return Err(ConfigError::EmptyAgentField("provider.model"));
+        validate_provider(&config.provider)?;
+        let mut provider_ids = HashSet::new();
+        for provider in &config.providers {
+            if provider.id.trim().is_empty() {
+                return Err(ConfigError::EmptyAgentField("provider.id"));
             }
-            if !(base_url.starts_with("http://127.0.0.1:")
-                || base_url.starts_with("http://localhost:"))
-            {
-                return Err(ConfigError::UnsafeOllamaEndpoint);
+            if !provider_ids.insert(provider.id.as_str()) {
+                return Err(ConfigError::DuplicateProvider(provider.id.clone()));
             }
-        }
-        if let ProviderConfig::Openai { model, api_key_env } = &config.provider {
-            if model.trim().is_empty() {
-                return Err(ConfigError::EmptyAgentField("provider.model"));
-            }
-            if api_key_env.trim().is_empty()
-                || !api_key_env
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-            {
-                return Err(ConfigError::EmptyAgentField("provider.api_key_env"));
-            }
+            validate_provider(&provider.config)?;
         }
         match (&config.formation, config.agents.is_empty()) {
             (None, true) => {}
@@ -295,6 +303,21 @@ impl Config {
                     }
                     if let Some(tool) = agent.tools.iter().find(|t| !allowed.contains(t.as_str())) {
                         return Err(ConfigError::UnsupportedTool(tool.clone()));
+                    }
+                    if let Some(provider) = &agent.provider
+                        && ((!config.providers.is_empty()
+                            && !provider_ids.contains(provider.as_str()))
+                            || (config.providers.is_empty()
+                                && provider != provider_kind(&config.provider)))
+                    {
+                        return Err(ConfigError::ProviderNotFound(provider.clone()));
+                    }
+                    if agent
+                        .model
+                        .as_ref()
+                        .is_some_and(|model| model.trim().is_empty())
+                    {
+                        return Err(ConfigError::EmptyAgentField("formation agent model"));
                     }
                 }
                 if !ids.contains(formation.entry_agent.as_str()) {
@@ -319,6 +342,39 @@ impl Config {
     #[must_use]
     pub fn state_path(&self) -> PathBuf {
         self.workspace.root.join(&self.workspace.state_file)
+    }
+}
+
+fn validate_provider(provider: &ProviderConfig) -> Result<(), ConfigError> {
+    if let ProviderConfig::Ollama { base_url, model } = provider {
+        if model.trim().is_empty() {
+            return Err(ConfigError::EmptyAgentField("provider.model"));
+        }
+        if !(base_url.starts_with("http://127.0.0.1:") || base_url.starts_with("http://localhost:"))
+        {
+            return Err(ConfigError::UnsafeOllamaEndpoint);
+        }
+    }
+    if let ProviderConfig::Openai { model, api_key_env } = provider {
+        if model.trim().is_empty() {
+            return Err(ConfigError::EmptyAgentField("provider.model"));
+        }
+        if api_key_env.trim().is_empty()
+            || !api_key_env
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(ConfigError::EmptyAgentField("provider.api_key_env"));
+        }
+    }
+    Ok(())
+}
+
+fn provider_kind(provider: &ProviderConfig) -> &'static str {
+    match provider {
+        ProviderConfig::Mock => "mock",
+        ProviderConfig::Ollama { .. } => "ollama",
+        ProviderConfig::Openai { .. } => "openai",
     }
 }
 
@@ -402,6 +458,44 @@ mod tests {
         ));
     }
     #[test]
+    fn validates_named_provider_routes_for_formation_agents() {
+        let c = Config {
+            providers: vec![
+                NamedProviderConfig {
+                    id: "local".into(),
+                    config: ProviderConfig::Ollama {
+                        base_url: "http://127.0.0.1:11434".into(),
+                        model: "qwen3:4b".into(),
+                    },
+                },
+                NamedProviderConfig {
+                    id: "cloud".into(),
+                    config: ProviderConfig::Openai {
+                        model: "gpt-5-mini".into(),
+                        api_key_env: "OPENAI_API_KEY".into(),
+                    },
+                },
+            ],
+            formation: Some(FormationConfig {
+                name: "Mixed".into(),
+                entry_agent: "lead".into(),
+                max_parallel_tasks: 2,
+            }),
+            agents: vec![FormationAgentConfig {
+                id: "lead".into(),
+                name: "Lead".into(),
+                role: "lead".into(),
+                system_prompt: "delegate".into(),
+                tools: vec![],
+                provider: Some("cloud".into()),
+                model: Some("gpt-5-mini".into()),
+                delegation: DelegationConfig::default(),
+            }],
+            ..Config::default()
+        };
+        assert!(Config::validate(c).is_ok());
+    }
+    #[test]
     fn validates_multi_agent_formation() {
         let c = Config {
             formation: Some(FormationConfig {
@@ -416,6 +510,8 @@ mod tests {
                     role: "technical_lead".into(),
                     system_prompt: "Delegate bounded work.".into(),
                     tools: vec!["task.delegate".into()],
+                    provider: None,
+                    model: None,
                     delegation: DelegationConfig {
                         allowed_targets: vec!["worker".into()],
                         ..DelegationConfig::default()
@@ -427,6 +523,8 @@ mod tests {
                     role: "developer".into(),
                     system_prompt: "Implement and test.".into(),
                     tools: vec!["file.patch".into(), "process.test".into()],
+                    provider: None,
+                    model: None,
                     delegation: DelegationConfig::default(),
                 },
             ],
@@ -448,6 +546,8 @@ mod tests {
                 role: "lead".into(),
                 system_prompt: "x".into(),
                 tools: vec![],
+                provider: None,
+                model: None,
                 delegation: DelegationConfig {
                     allowed_targets: vec!["missing".into()],
                     ..DelegationConfig::default()

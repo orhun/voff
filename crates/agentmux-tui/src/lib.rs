@@ -356,6 +356,8 @@ pub async fn run() -> Result<(), TuiError> {
 pub struct ConfiguredRun {
     pub repo: Arc<SqliteRepository>,
     pub provider: Arc<dyn agentmux_provider::ModelProvider>,
+    pub providers: std::collections::HashMap<String, Arc<dyn agentmux_provider::ModelProvider>>,
+    pub default_provider: String,
     pub session: SessionId,
     pub owner: AgentId,
     pub model_name: String,
@@ -381,6 +383,7 @@ pub async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError> {
     let model_label = config.model_name.clone();
     let engine = Arc::new(
         Engine::new(config.repo, config.provider, config.session, event_tx)
+            .with_provider_registry(config.providers, config.default_provider)
             .with_runtime(config.model_name, config.system_prompt)
             .with_workspace_context(config.workspace_context)
             .with_safe_workflow(&config.workspace_root)
@@ -393,7 +396,7 @@ pub async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError> {
     app.agent_lines = config
         .agent_profiles
         .into_iter()
-        .map(|a| format!("{} — {}", a.name, a.role))
+        .map(|a| format!("{} — {}\n  {} / {}", a.name, a.role, a.provider, a.model))
         .collect();
     app.model_label = model_label;
     app.input_cost_per_million = config.input_cost_per_million;

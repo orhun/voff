@@ -3,3 +3,5 @@
 .agentmux/*.db
 .agentmux/*.db-shm
 .agentmux/*.db-wal
+.agentmux/diagnostic*.json
+.agentmux/backups/
