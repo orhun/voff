@@ -1,5 +1,7 @@
 # AgentMux
 
+**AI agent orchestration, done right.**
+
 AgentMux is a provider-neutral, terminal-first AI agent workspace written in
 Rust. It runs local and cloud models as a supervised software team with
 persisted tasks, explicit delegation, approvals, dependency-aware scheduling,
