@@ -1,9 +1,13 @@
 # Provider Adapter Development
 
 Provider adapters translate an external model API into voff's canonical
-contract. Provider-specific request, response, SDK, and error types must remain
-inside the `voff-provider` adapter module; the engine depends only on
-`ModelProvider`.
+contract. OpenAI and Ollama transports use `rig-core`, but Rig and other
+provider-specific types must remain inside the `voff-provider` adapter module;
+the engine depends only on `ModelProvider`.
+
+Use Rig's low-level completion model directly. Do not use an SDK-owned agent
+loop or allow the provider layer to execute tools; tool requests must return to
+voff for policy evaluation and approval.
 
 ## Implementation checklist
 
@@ -25,14 +29,6 @@ inside the `voff-provider` adapter module; the engine depends only on
     to orchestration logic.
 
 ## Contract test support
-
-Enable `voff-provider`'s `test-support` feature in the adapter crate's dev
-dependencies:
-
-```toml
-[dev-dependencies]
-voff-provider = { path = "../voff-provider", features = ["test-support"] }
-```
 
 The `voff_provider::contract` module provides:
 

@@ -1,8 +1,18 @@
-//! Built-in provider adapters kept behind the provider-neutral execution port.
+//! Built-in provider adapters backed by Rig's provider-neutral model clients.
 use crate::*;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use rig_core::{
+    client::{CompletionClient, ModelListingClient, Nothing},
+    completion::{
+        CompletionError, CompletionModel, CompletionRequest as RigCompletionRequest,
+        ToolDefinition as RigToolDefinition,
+    },
+    message::{AssistantContent, Message, Text, UserContent},
+    model::{ModelList, ModelListingError},
+    providers::{ollama, openai},
+    streaming::StreamedAssistantContent,
+};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -12,15 +22,18 @@ pub enum MockStep {
     Delay(Duration),
     Fail(String),
 }
+
 #[derive(Clone, Debug)]
 pub struct MockProvider {
     script: Vec<MockStep>,
 }
+
 impl MockProvider {
     #[must_use]
     pub fn new(script: Vec<MockStep>) -> Self {
         Self { script }
     }
+
     #[must_use]
     pub fn success(text: impl Into<String>) -> Self {
         Self::new(vec![
@@ -33,6 +46,7 @@ impl MockProvider {
         ])
     }
 }
+
 #[async_trait]
 impl ModelProvider for MockProvider {
     fn descriptor(&self) -> ProviderDescriptor {
@@ -48,6 +62,7 @@ impl ModelProvider for MockProvider {
             },
         }
     }
+
     async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
         Ok(vec![ModelDescriptor {
             id: "mock-v1".into(),
@@ -55,26 +70,30 @@ impl ModelProvider for MockProvider {
             context_limit: Some(4096),
         }])
     }
+
     async fn start(
         &self,
         _: CanonicalRequest,
         sink: ProviderEventSink,
-        cancel: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError> {
         let mut usage = None;
         for step in &self.script {
-            if cancel.is_cancelled() {
+            if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
             match step {
                 MockStep::Event(event) => {
                     if let ProviderEvent::Usage(value) = event {
-                        usage = Some(value.clone())
+                        usage = Some(value.clone());
                     }
-                    tokio::select! {()=cancel.cancelled()=>return Err(cancelled()), result=sink.send(event.clone())=>if result.is_err(){return Err(ProviderError{kind:ProviderErrorKind::Internal,message:"event receiver closed".into(),retryable:false})}}
+                    send(&sink, event.clone(), &cancellation).await?;
                 }
                 MockStep::Delay(delay) => {
-                    tokio::select! {()=cancel.cancelled()=>return Err(cancelled()),()=tokio::time::sleep(*delay)=>{}}
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Err(cancelled()),
+                        () = tokio::time::sleep(*delay) => {}
+                    }
                 }
                 MockStep::Fail(message) => {
                     return Err(ProviderError {
@@ -88,19 +107,12 @@ impl ModelProvider for MockProvider {
         Ok(ProviderCompletion { usage })
     }
 }
-fn cancelled() -> ProviderError {
-    ProviderError {
-        kind: ProviderErrorKind::Cancelled,
-        message: "request cancelled".into(),
-        retryable: false,
-    }
-}
 
 #[derive(Clone)]
 pub struct OllamaProvider {
-    client: reqwest::Client,
-    base_url: String,
+    client: ollama::Client,
 }
+
 impl OllamaProvider {
     pub fn new(base_url: impl Into<String>) -> Result<Self, ProviderError> {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
@@ -108,213 +120,51 @@ impl OllamaProvider {
         {
             return Err(ProviderError {
                 kind: ProviderErrorKind::Authorization,
-                message: "Phase 1 permits only a loopback Ollama endpoint".into(),
+                message: "Ollama permits only a loopback endpoint".into(),
                 retryable: false,
             });
         }
-        Ok(Self {
-            client: reqwest::Client::new(),
-            base_url,
-        })
+        let client = ollama::Client::builder()
+            .api_key(Nothing)
+            .base_url(&base_url)
+            .build()
+            .map_err(client_configuration_error)?;
+        Ok(Self { client })
     }
 }
-#[derive(Deserialize)]
-struct Tags {
-    models: Vec<TagModel>,
-}
-#[derive(Deserialize)]
-struct TagModel {
-    name: String,
-}
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage>,
-    tools: Vec<ChatTool>,
-    stream: bool,
-}
-#[derive(Serialize)]
-struct ChatMessage {
-    role: &'static str,
-    content: String,
-}
-#[derive(Serialize)]
-struct ChatTool {
-    r#type: &'static str,
-    function: ChatFunction,
-}
-#[derive(Serialize)]
-struct ChatFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-#[derive(Deserialize, Debug)]
-struct ChatChunk {
-    #[serde(default)]
-    message: Option<ChatResponseMessage>,
-    #[serde(default)]
-    done: bool,
-    prompt_eval_count: Option<u64>,
-    eval_count: Option<u64>,
-    error: Option<String>,
-}
-#[derive(Deserialize, Debug)]
-struct ChatResponseMessage {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    tool_calls: Vec<ChatToolCall>,
-}
-#[derive(Deserialize, Debug)]
-struct ChatToolCall {
-    function: ChatFunctionCall,
-}
-#[derive(Deserialize, Debug)]
-struct ChatFunctionCall {
-    name: String,
-    arguments: serde_json::Value,
-}
+
 #[async_trait]
 impl ModelProvider for OllamaProvider {
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor {
             id: "ollama".into(),
             display_name: "Local Ollama".into(),
-            capabilities: ProviderCapabilities {
-                streaming: true,
-                tools: true,
-                structured_output: true,
-                images: false,
-                cancellation: true,
-            },
+            capabilities: provider_capabilities(),
         }
     }
+
     async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
-        let response = self
-            .client
-            .get(format!("{}/api/tags", self.base_url))
-            .send()
+        self.client
+            .list_models()
             .await
-            .map_err(network)?;
-        if !response.status().is_success() {
-            return Err(response_error(response).await);
-        }
-        let tags: Tags = response.json().await.map_err(invalid)?;
-        Ok(tags
-            .models
-            .into_iter()
-            .map(|m| ModelDescriptor {
-                id: m.name.clone(),
-                display_name: m.name,
-                context_limit: None,
-            })
-            .collect())
+            .map(model_descriptors)
+            .map_err(model_listing_error)
     }
+
     async fn start(
         &self,
         request: CanonicalRequest,
         sink: ProviderEventSink,
-        cancel: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError> {
-        let messages = request
-            .messages
-            .into_iter()
-            .map(|message| ChatMessage {
-                role: match message.role {
-                    MessageRole::System => "system",
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                    MessageRole::Tool => "tool",
-                },
-                content: message.content,
-            })
-            .collect();
-        let tools = request
-            .tools
-            .into_iter()
-            .map(|tool| {
-                let parameters = serde_json::from_str(&tool.input_schema)
-                    .unwrap_or_else(|_| serde_json::json!({"type":"object"}));
-                ChatTool {
-                    r#type: "function",
-                    function: ChatFunction {
-                        name: tool.name,
-                        description: tool.description,
-                        parameters,
-                    },
-                }
-            })
-            .collect();
-        let body = ChatRequest {
-            model: &request.model,
-            messages,
-            tools,
-            stream: true,
-        };
-        let response = tokio::select! {()=cancel.cancelled()=>return Err(cancelled()),value=self.client.post(format!("{}/api/chat",self.base_url)).json(&body).send()=>value.map_err(network)?};
-        if !response.status().is_success() {
-            return Err(response_error(response).await);
-        }
-        let mut bytes = response.bytes_stream();
-        let mut pending = Vec::new();
-        let mut usage = None;
-        loop {
-            let next = tokio::select! {()=cancel.cancelled()=>return Err(cancelled()),value=bytes.next()=>value};
-            let Some(chunk) = next else { break };
-            pending.extend_from_slice(&chunk.map_err(network)?);
-            while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                let line = pending.drain(..=pos).collect::<Vec<_>>();
-                if line.iter().all(u8::is_ascii_whitespace) {
-                    continue;
-                }
-                let parsed: ChatChunk = serde_json::from_slice(&line).map_err(invalid)?;
-                if let Some(error) = parsed.error {
-                    return Err(ProviderError {
-                        kind: ProviderErrorKind::InvalidResponse,
-                        message: error,
-                        retryable: false,
-                    });
-                }
-                if let Some(message) = parsed.message {
-                    if !message.content.is_empty() {
-                        send(&sink, ProviderEvent::TextDelta(message.content), &cancel).await?;
-                    }
-                    for call in message.tool_calls {
-                        send(
-                            &sink,
-                            ProviderEvent::ToolRequest(StructuredToolRequest {
-                                id: voff_core::ToolCallId::new(),
-                                name: call.function.name,
-                                arguments_json: call.function.arguments.to_string(),
-                            }),
-                            &cancel,
-                        )
-                        .await?;
-                    }
-                }
-                if parsed.done {
-                    let value = Usage {
-                        input_tokens: parsed.prompt_eval_count.unwrap_or(0),
-                        output_tokens: parsed.eval_count.unwrap_or(0),
-                    };
-                    send(&sink, ProviderEvent::Usage(value.clone()), &cancel).await?;
-                    send(&sink, ProviderEvent::Completed, &cancel).await?;
-                    usage = Some(value);
-                }
-            }
-        }
-        Ok(ProviderCompletion { usage })
+        let model = self.client.completion_model(&request.model);
+        stream_model(&model, request, sink, cancellation, ToolNames::Canonical).await
     }
 }
 
-/// OpenAI Responses API adapter. Credentials are kept in memory and are never
-/// serialized into voff state or configuration.
 #[derive(Clone)]
 pub struct OpenAiProvider {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: String,
+    client: openai::Client,
 }
 
 impl OpenAiProvider {
@@ -338,28 +188,13 @@ impl OpenAiProvider {
                 retryable: false,
             });
         }
-        Ok(Self {
-            client: reqwest::Client::new(),
-            base_url,
-            api_key,
-        })
+        let client = openai::Client::builder()
+            .api_key(api_key)
+            .base_url(format!("{base_url}/v1"))
+            .build()
+            .map_err(client_configuration_error)?;
+        Ok(Self { client })
     }
-
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.client
-            .request(method, format!("{}{path}", self.base_url))
-            .bearer_auth(&self.api_key)
-    }
-}
-
-#[derive(Deserialize)]
-struct OpenAiModels {
-    data: Vec<OpenAiModel>,
-}
-
-#[derive(Deserialize)]
-struct OpenAiModel {
-    id: String,
 }
 
 #[async_trait]
@@ -368,318 +203,362 @@ impl ModelProvider for OpenAiProvider {
         ProviderDescriptor {
             id: "openai".into(),
             display_name: "OpenAI Responses API".into(),
-            capabilities: ProviderCapabilities {
-                streaming: true,
-                tools: true,
-                structured_output: true,
-                images: false,
-                cancellation: true,
-            },
+            capabilities: provider_capabilities(),
         }
     }
 
     async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
-        let response = self
-            .request(reqwest::Method::GET, "/v1/models")
-            .send()
+        self.client
+            .list_models()
             .await
-            .map_err(openai_network)?;
-        if !response.status().is_success() {
-            return Err(openai_response_error(response).await);
-        }
-        let models: OpenAiModels = response.json().await.map_err(openai_invalid)?;
-        Ok(models
-            .data
-            .into_iter()
-            .map(|model| ModelDescriptor {
-                display_name: model.id.clone(),
-                id: model.id,
-                context_limit: None,
-            })
-            .collect())
+            .map(model_descriptors)
+            .map_err(model_listing_error)
     }
 
     async fn start(
         &self,
         request: CanonicalRequest,
         sink: ProviderEventSink,
-        cancel: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError> {
-        let body = openai_request_body(request)?;
-        let response = tokio::select! {
-            () = cancel.cancelled() => return Err(cancelled()),
-            value = self.request(reqwest::Method::POST, "/v1/responses").json(&body).send() => value.map_err(openai_network)?,
-        };
-        if !response.status().is_success() {
-            return Err(openai_response_error(response).await);
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut pending = Vec::new();
-        let mut usage = None;
-        while let Some(chunk) = tokio::select! {
-            () = cancel.cancelled() => return Err(cancelled()),
-            value = stream.next() => value,
-        } {
-            pending.extend_from_slice(&chunk.map_err(openai_network)?);
-            while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
-                let line = pending.drain(..=pos).collect::<Vec<_>>();
-                let line = String::from_utf8_lossy(&line);
-                let Some(data) = line.trim().strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                let value: serde_json::Value =
-                    serde_json::from_str(data).map_err(openai_invalid)?;
-                for event in openai_events(&value)? {
-                    if let ProviderEvent::Usage(value) = &event {
-                        usage = Some(value.clone());
-                    }
-                    send(&sink, event, &cancel).await?;
-                }
-            }
-        }
-        Ok(ProviderCompletion { usage })
+        let model = self
+            .client
+            .completion_model(&request.model)
+            .with_strict_tools();
+        stream_model(&model, request, sink, cancellation, ToolNames::OpenAi).await
     }
 }
 
-fn openai_request_body(request: CanonicalRequest) -> Result<serde_json::Value, ProviderError> {
-    let mut instructions = Vec::new();
-    let mut input = Vec::new();
-    for message in request.messages {
-        match message.role {
-            MessageRole::System => instructions.push(message.content),
-            MessageRole::User => input.push(serde_json::json!({
-                "role": "user",
-                "content": message.content,
-            })),
-            MessageRole::Assistant => input.push(serde_json::json!({
-                "role": "assistant",
-                "content": message.content,
-            })),
-            MessageRole::Tool => input.push(serde_json::json!({
-                "role": "user",
-                "content": format!("Tool result (untrusted data): {}", message.content),
-            })),
+#[derive(Clone, Copy)]
+enum ToolNames {
+    Canonical,
+    OpenAi,
+}
+
+async fn stream_model<M: CompletionModel>(
+    model: &M,
+    request: CanonicalRequest,
+    sink: ProviderEventSink,
+    cancellation: CancellationToken,
+    tool_names: ToolNames,
+) -> Result<ProviderCompletion, ProviderError> {
+    let request = rig_request(request, tool_names)?;
+    request
+        .validate_message_content()
+        .map_err(completion_error)?;
+    let mut stream = tokio::select! {
+        () = cancellation.cancelled() => return Err(cancelled()),
+        result = model.stream(request) => result.map_err(completion_error)?,
+    };
+    let mut completion = None;
+    let mut last_error = None;
+    loop {
+        let item = tokio::select! {
+            () = cancellation.cancelled() => {
+                stream.cancel();
+                return Err(cancelled());
+            }
+            item = stream.next() => item,
+        };
+        let Some(item) = item else {
+            break;
+        };
+        match item {
+            Ok(StreamedAssistantContent::Text(text)) => {
+                send(&sink, ProviderEvent::TextDelta(text.text), &cancellation).await?;
+            }
+            Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                let name = match tool_names {
+                    ToolNames::Canonical => tool_call.function.name,
+                    ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
+                };
+                send(
+                    &sink,
+                    ProviderEvent::ToolRequest(StructuredToolRequest {
+                        id: voff_core::ToolCallId::new(),
+                        name,
+                        arguments_json: tool_call.function.arguments.to_string(),
+                    }),
+                    &cancellation,
+                )
+                .await?;
+            }
+            Ok(StreamedAssistantContent::Final(final_response)) => {
+                let usage = final_response.usage.has_values().then_some(Usage {
+                    input_tokens: final_response.usage.input_tokens,
+                    output_tokens: final_response.usage.output_tokens,
+                });
+                if let Some(usage) = &usage {
+                    send(&sink, ProviderEvent::Usage(usage.clone()), &cancellation).await?;
+                }
+                send(&sink, ProviderEvent::Completed, &cancellation).await?;
+                completion = Some(ProviderCompletion { usage });
+            }
+            Ok(StreamedAssistantContent::Unknown(_)) => {
+                send(
+                    &sink,
+                    ProviderEvent::Warning("provider returned an unsupported output item".into()),
+                    &cancellation,
+                )
+                .await?;
+            }
+            Ok(
+                StreamedAssistantContent::ToolCallDelta { .. }
+                | StreamedAssistantContent::Reasoning { .. }
+                | StreamedAssistantContent::ReasoningDelta { .. },
+            ) => {}
+            Err(error) => {
+                last_error = Some(completion_error(error));
+            }
         }
     }
+    if let Some(completion) = completion {
+        Ok(completion)
+    } else if let Some(error) = last_error {
+        Err(error)
+    } else {
+        Err(ProviderError {
+            kind: ProviderErrorKind::InvalidResponse,
+            message: "provider stream ended without a terminal response".into(),
+            retryable: true,
+        })
+    }
+}
+
+fn rig_request(
+    request: CanonicalRequest,
+    tool_names: ToolNames,
+) -> Result<RigCompletionRequest, ProviderError> {
+    let chat_history = request
+        .messages
+        .into_iter()
+        .map(|message| match message.role {
+            MessageRole::System => Message::System {
+                content: message.content,
+            },
+            MessageRole::User => Message::User {
+                content: vec![UserContent::Text(Text::new(message.content))],
+            },
+            MessageRole::Assistant => Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::Text(Text::new(message.content))],
+            },
+            MessageRole::Tool => Message::User {
+                content: vec![UserContent::Text(Text::new(format!(
+                    "Tool result (untrusted data): {}",
+                    message.content
+                )))],
+            },
+        })
+        .collect();
     let tools = request
         .tools
         .into_iter()
         .map(|tool| {
-            let mut parameters: serde_json::Value =
-                serde_json::from_str(&tool.input_schema).map_err(openai_invalid)?;
-            normalize_openai_strict_schema(&mut parameters);
-            Ok(serde_json::json!({
-                "type": "function",
-                "name": openai_tool_name(&tool.name),
-                "description": tool.description,
-                "parameters": parameters,
-                "strict": true,
-            }))
+            let parameters =
+                serde_json::from_str(&tool.input_schema).map_err(|error| ProviderError {
+                    kind: ProviderErrorKind::InvalidResponse,
+                    message: format!("invalid tool schema for {}: {error}", tool.name),
+                    retryable: false,
+                })?;
+            Ok(RigToolDefinition {
+                name: match tool_names {
+                    ToolNames::Canonical => tool.name,
+                    ToolNames::OpenAi => openai_tool_name(&tool.name),
+                },
+                description: tool.description,
+                parameters,
+            })
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    Ok(serde_json::json!({
-        "model": request.model,
-        "instructions": instructions.join("\n\n"),
-        "input": input,
-        "tools": tools,
-        "stream": true,
-        "store": false,
-        "max_output_tokens": request.max_output_tokens,
-    }))
+    Ok(RigCompletionRequest {
+        model: Some(request.model),
+        preamble: None,
+        chat_history,
+        documents: vec![],
+        tools,
+        temperature: None,
+        max_tokens: request.max_output_tokens,
+        tool_choice: None,
+        additional_params: matches!(tool_names, ToolNames::OpenAi)
+            .then(|| serde_json::json!({"store": false})),
+        output_schema: None,
+        record_telemetry_content: false,
+    })
 }
 
-fn openai_events(value: &serde_json::Value) -> Result<Vec<ProviderEvent>, ProviderError> {
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("response.output_text.delta") => Ok(value
-            .get("delta")
-            .and_then(serde_json::Value::as_str)
-            .filter(|delta| !delta.is_empty())
-            .map(|delta| vec![ProviderEvent::TextDelta(delta.into())])
-            .unwrap_or_default()),
-        Some("response.output_item.done")
-            if value
-                .pointer("/item/type")
-                .and_then(serde_json::Value::as_str)
-                == Some("function_call") =>
-        {
-            let name = canonical_tool_name(&required_string(value, "/item/name")?);
-            let arguments_json = required_string(value, "/item/arguments")?;
-            serde_json::from_str::<serde_json::Value>(&arguments_json).map_err(openai_invalid)?;
-            Ok(vec![ProviderEvent::ToolRequest(StructuredToolRequest {
-                id: voff_core::ToolCallId::new(),
-                name,
-                arguments_json,
-            })])
-        }
-        Some("response.completed") => {
-            let usage = Usage {
-                input_tokens: value
-                    .pointer("/response/usage/input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                output_tokens: value
-                    .pointer("/response/usage/output_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            };
-            Ok(vec![ProviderEvent::Usage(usage), ProviderEvent::Completed])
-        }
-        Some("response.failed" | "error") => Err(ProviderError {
-            kind: ProviderErrorKind::InvalidResponse,
-            message: value
-                .pointer("/response/error/message")
-                .or_else(|| value.pointer("/error/message"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("OpenAI response failed")
-                .to_owned(),
-            retryable: false,
-        }),
-        _ => Ok(vec![]),
+fn model_descriptors(models: ModelList) -> Vec<ModelDescriptor> {
+    models
+        .into_iter()
+        .map(|model| ModelDescriptor {
+            display_name: model.display_name().to_owned(),
+            id: model.id,
+            context_limit: model.context_length.map(u64::from),
+        })
+        .collect()
+}
+
+fn provider_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        streaming: true,
+        tools: true,
+        structured_output: true,
+        images: false,
+        cancellation: true,
     }
 }
 
-/// OpenAI function names allow letters, digits, underscores and hyphens, while
-/// voff canonical names use dots as namespaces. A doubled underscore is
-/// reserved at this adapter boundary so the mapping remains reversible.
-fn openai_tool_name(canonical: &str) -> String {
-    canonical.replace('.', "__")
-}
-
-fn canonical_tool_name(openai: &str) -> String {
-    openai.replace("__", ".")
-}
-
-/// OpenAI strict function schemas require closed objects and every declared
-/// property to appear in `required`. This adapter-level normalization keeps
-/// the canonical tool definitions provider-neutral.
-fn normalize_openai_strict_schema(schema: &mut serde_json::Value) {
-    let Some(object) = schema.as_object_mut() else {
-        return;
-    };
-    if object.get("type").and_then(serde_json::Value::as_str) == Some("object") {
-        let required = object
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .map(|properties| {
-                properties
-                    .keys()
-                    .map(|key| serde_json::Value::String(key.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        object.insert(
-            "additionalProperties".into(),
-            serde_json::Value::Bool(false),
-        );
-        object.insert("required".into(), serde_json::Value::Array(required));
-    }
-    for value in object.values_mut() {
-        normalize_openai_strict_schema(value);
-    }
-}
-
-fn required_string(value: &serde_json::Value, pointer: &str) -> Result<String, ProviderError> {
-    value
-        .pointer(pointer)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| openai_invalid(format!("missing {pointer}")))
-}
-
-fn openai_network(error: reqwest::Error) -> ProviderError {
+fn client_configuration_error(error: impl std::fmt::Display) -> ProviderError {
     ProviderError {
-        kind: if error.is_timeout() {
-            ProviderErrorKind::Timeout
-        } else {
-            ProviderErrorKind::Internal
-        },
-        message: format!("OpenAI request failed: {error}"),
-        retryable: true,
-    }
-}
-
-fn openai_invalid(error: impl std::fmt::Display) -> ProviderError {
-    ProviderError {
-        kind: ProviderErrorKind::InvalidResponse,
-        message: format!("invalid OpenAI response: {error}"),
+        kind: ProviderErrorKind::Internal,
+        message: format!("provider client configuration failed: {error}"),
         retryable: false,
     }
 }
 
-async fn openai_response_error(response: reqwest::Response) -> ProviderError {
-    let status = response.status();
-    let detail = response.text().await.unwrap_or_default();
-    let kind = match status.as_u16() {
-        401 => ProviderErrorKind::Authentication,
-        403 => ProviderErrorKind::Authorization,
-        408 | 504 => ProviderErrorKind::Timeout,
-        429 => ProviderErrorKind::RateLimit,
-        _ => ProviderErrorKind::Internal,
+fn model_listing_error(error: ModelListingError) -> ProviderError {
+    let (kind, retryable) = match &error {
+        ModelListingError::AuthError { .. } => (ProviderErrorKind::Authentication, false),
+        ModelListingError::ApiError { status_code, .. } => status_error(*status_code),
+        ModelListingError::RequestError { message } if is_timeout(message) => {
+            (ProviderErrorKind::Timeout, true)
+        }
+        ModelListingError::RequestError { .. } => (ProviderErrorKind::Internal, true),
+        ModelListingError::ParseError { .. } => (ProviderErrorKind::InvalidResponse, false),
     };
     ProviderError {
         kind,
-        message: if detail.is_empty() {
-            format!("OpenAI returned HTTP {status}")
-        } else {
-            format!("OpenAI returned HTTP {status}: {detail}")
-        },
-        retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429 | 504),
+        message: error.to_string(),
+        retryable,
     }
 }
+
+fn completion_error(error: CompletionError) -> ProviderError {
+    let status = error
+        .provider_response_status()
+        .map(|status| status.as_u16());
+    let message = error.to_string();
+    let (kind, retryable) = status.map_or_else(
+        || match &error {
+            CompletionError::JsonError(_)
+            | CompletionError::UrlError(_)
+            | CompletionError::RequestError(_)
+            | CompletionError::ResponseError(_) => (ProviderErrorKind::InvalidResponse, false),
+            CompletionError::HttpError(_) if is_timeout(&message) => {
+                (ProviderErrorKind::Timeout, true)
+            }
+            CompletionError::HttpError(_)
+            | CompletionError::ProviderError(_)
+            | CompletionError::ProviderResponse(_) => (ProviderErrorKind::Internal, true),
+        },
+        status_error,
+    );
+    ProviderError {
+        kind,
+        message,
+        retryable,
+    }
+}
+
+fn status_error(status: u16) -> (ProviderErrorKind, bool) {
+    match status {
+        401 => (ProviderErrorKind::Authentication, false),
+        403 => (ProviderErrorKind::Authorization, false),
+        408 | 504 => (ProviderErrorKind::Timeout, true),
+        429 => (ProviderErrorKind::RateLimit, true),
+        500..=599 => (ProviderErrorKind::Internal, true),
+        _ => (ProviderErrorKind::InvalidResponse, false),
+    }
+}
+
+fn is_timeout(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("timeout")
+}
+
+fn openai_tool_name(name: &str) -> String {
+    name.replace('.', "__")
+}
+
+fn canonical_tool_name(name: &str) -> String {
+    name.replace("__", ".")
+}
+
 async fn send(
     sink: &ProviderEventSink,
     event: ProviderEvent,
-    cancel: &CancellationToken,
+    cancellation: &CancellationToken,
 ) -> Result<(), ProviderError> {
-    tokio::select! {()=cancel.cancelled()=>Err(cancelled()),result=sink.send(event)=>result.map_err(|_|ProviderError{kind:ProviderErrorKind::Internal,message:"event receiver closed".into(),retryable:false})}
-}
-fn network(error: reqwest::Error) -> ProviderError {
-    ProviderError {
-        kind: if error.is_timeout() {
-            ProviderErrorKind::Timeout
-        } else {
-            ProviderErrorKind::Internal
-        },
-        message: format!("Ollama request failed: {error}"),
-        retryable: true,
+    tokio::select! {
+        () = cancellation.cancelled() => Err(cancelled()),
+        result = sink.send(event) => result.map_err(|_| ProviderError {
+            kind: ProviderErrorKind::Internal,
+            message: "provider event receiver closed".into(),
+            retryable: false,
+        }),
     }
 }
-fn invalid(error: impl std::fmt::Display) -> ProviderError {
+
+fn cancelled() -> ProviderError {
     ProviderError {
-        kind: ProviderErrorKind::InvalidResponse,
-        message: format!("invalid Ollama response: {error}"),
+        kind: ProviderErrorKind::Cancelled,
+        message: "request cancelled".into(),
         retryable: false,
     }
 }
-async fn response_error(response: reqwest::Response) -> ProviderError {
-    let status = response.status();
-    let detail = response.text().await.unwrap_or_default();
-    let kind = match status.as_u16() {
-        404 => ProviderErrorKind::InvalidResponse,
-        429 => ProviderErrorKind::RateLimit,
-        401 | 403 => ProviderErrorKind::Authorization,
-        _ => ProviderErrorKind::Internal,
-    };
-    ProviderError {
-        kind,
-        message: if detail.is_empty() {
-            format!("Ollama returned HTTP {status}")
-        } else {
-            format!("Ollama returned HTTP {status}: {detail}")
-        },
-        retryable: status.is_server_error() || status.as_u16() == 429,
-    }
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voff_core::{MessageId, TaskId, ToolCallId};
-    fn req() -> CanonicalRequest {
+    use rig_core::{
+        completion::{CompletionResponse, Usage as RigUsage},
+        streaming::{
+            RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamingCompletionResponse,
+        },
+    };
+    use voff_core::{MessageId, TaskId};
+
+    #[derive(Clone)]
+    struct RigFixtureModel;
+
+    impl CompletionModel for RigFixtureModel {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            Err(CompletionError::ResponseError(
+                "fixture only supports streaming".into(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            let usage = RigUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                total_tokens: 10,
+                ..RigUsage::default()
+            };
+            let items = vec![
+                Ok(RawStreamingChoice::Message("hello".into())),
+                Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+                    "call-1",
+                    "file__patch".into(),
+                    serde_json::json!({"path": "README.md"}),
+                ))),
+                Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(
+                    "fixture", usage,
+                ))),
+            ];
+            Ok(StreamingCompletionResponse::stream(
+                "fixture",
+                Box::pin(futures_util::stream::iter(items)),
+            ))
+        }
+    }
+
+    fn request() -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
             model: "mock-v1".into(),
@@ -692,154 +571,121 @@ mod tests {
             max_output_tokens: Some(10),
         }
     }
+
     #[tokio::test]
-    async fn streams_success() {
+    async fn mock_streams_success() {
         let provider: std::sync::Arc<dyn ModelProvider> =
             std::sync::Arc::new(MockProvider::success("ok"));
         crate::contract::assert_descriptor(&provider.descriptor());
         let (events, result) =
-            crate::contract::run(provider, req(), CancellationToken::new()).await;
+            crate::contract::run(provider, request(), CancellationToken::new()).await;
         let completion = result.unwrap();
         crate::contract::assert_successful_stream(&events, &completion);
         assert_eq!(events[0], ProviderEvent::TextDelta("ok".into()));
     }
+
     #[tokio::test]
-    async fn simulates_failure() {
+    async fn mock_simulates_failure() {
         let provider: std::sync::Arc<dyn ModelProvider> =
             std::sync::Arc::new(MockProvider::new(vec![MockStep::Fail("bad".into())]));
         let (events, result) =
-            crate::contract::run(provider, req(), CancellationToken::new()).await;
+            crate::contract::run(provider, request(), CancellationToken::new()).await;
         crate::contract::assert_failed_stream(
             &events,
             &result.unwrap_err(),
             ProviderErrorKind::InvalidResponse,
         );
     }
+
     #[tokio::test]
-    async fn supports_cancellation() {
-        let c = CancellationToken::new();
-        c.cancel();
+    async fn mock_supports_cancellation() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
         let provider: std::sync::Arc<dyn ModelProvider> =
             std::sync::Arc::new(MockProvider::success("no"));
-        let (events, result) = crate::contract::run(provider, req(), c).await;
+        let (events, result) = crate::contract::run(provider, request(), cancellation).await;
         crate::contract::assert_failed_stream(
             &events,
             &result.unwrap_err(),
             ProviderErrorKind::Cancelled,
         );
     }
-    #[test]
-    fn parses_ollama_chat_tool_call() {
-        let chunk: ChatChunk = serde_json::from_str(r#"{"model":"gemma3","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"file.patch","arguments":{"path":"README.md","replacement":"new"}}}]},"done":false}"#).unwrap();
-        let call = &chunk.message.unwrap().tool_calls[0].function;
-        assert_eq!(call.name, "file.patch");
-        assert_eq!(call.arguments["path"], "README.md");
-        crate::contract::assert_tool_request(&StructuredToolRequest {
-            id: ToolCallId::new(),
-            name: call.name.clone(),
-            arguments_json: serde_json::to_string(&call.arguments).unwrap(),
-        });
-    }
 
-    #[test]
-    fn maps_openai_text_and_usage_events() {
-        let text = openai_events(&serde_json::json!({
-            "type": "response.output_text.delta",
-            "delta": "hello"
-        }))
+    #[tokio::test]
+    async fn maps_rig_streams_to_voff_events() {
+        let (sink, mut events) = tokio::sync::mpsc::channel(16);
+        let completion = stream_model(
+            &RigFixtureModel,
+            request(),
+            sink,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
         .unwrap();
-        assert_eq!(text, vec![ProviderEvent::TextDelta("hello".into())]);
-
-        let completed = openai_events(&serde_json::json!({
-            "type": "response.completed",
-            "response": {"usage": {"input_tokens": 12, "output_tokens": 5}}
-        }))
-        .unwrap();
-        assert_eq!(
-            completed,
-            vec![
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 12,
-                    output_tokens: 5
-                }),
-                ProviderEvent::Completed
-            ]
-        );
-    }
-
-    #[test]
-    fn malformed_provider_output_fuzz_corpus_never_panics() {
-        let mut state = 0x9e37_79b9_u32;
-        for length in 0..512 {
-            let bytes = (0..length)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    state as u8
-                })
-                .collect::<Vec<_>>();
-            if let Ok(text) = std::str::from_utf8(&bytes)
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-            {
-                let _ = openai_events(&value);
-            }
+        let mut received = Vec::new();
+        while let Some(event) = events.recv().await {
+            received.push(event);
         }
-    }
-
-    #[test]
-    fn maps_openai_function_call() {
-        let events = openai_events(&serde_json::json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "name": "file__read",
-                "arguments": "{\"path\":\"README.md\"}"
-            }
-        }))
-        .unwrap();
-        let ProviderEvent::ToolRequest(call) = &events[0] else {
-            panic!("expected tool request");
+        assert_eq!(received[0], ProviderEvent::TextDelta("hello".into()));
+        let ProviderEvent::ToolRequest(tool) = &received[1] else {
+            panic!("expected a tool request");
         };
-        assert_eq!(call.name, "file.read");
-        assert_eq!(call.arguments_json, r#"{"path":"README.md"}"#);
+        assert_eq!(tool.name, "file.patch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool.arguments_json).unwrap()["path"],
+            "README.md"
+        );
+        assert_eq!(
+            received[2],
+            ProviderEvent::Usage(Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+            })
+        );
+        assert_eq!(received[3], ProviderEvent::Completed);
+        assert_eq!(completion.usage.unwrap().output_tokens, 3);
     }
 
     #[test]
-    fn maps_canonical_tool_names_to_openai_safe_names() {
-        assert_eq!(openai_tool_name("file.read"), "file__read");
+    fn maps_requests_to_rig_without_exposing_rig_to_the_engine() {
+        let mut request = request();
+        request.messages.insert(
+            0,
+            CanonicalMessage {
+                id: MessageId::new(),
+                role: MessageRole::System,
+                content: "system".into(),
+            },
+        );
+        request.tools.push(ToolDefinition {
+            name: "file.patch".into(),
+            description: "patch a file".into(),
+            input_schema: r#"{"type":"object"}"#.into(),
+        });
+        let mapped = rig_request(request, ToolNames::OpenAi).unwrap();
+        assert_eq!(mapped.chat_history.len(), 2);
+        assert_eq!(mapped.tools[0].name, "file__patch");
+        assert_eq!(mapped.max_tokens, Some(10));
+        assert_eq!(mapped.additional_params.unwrap()["store"], false);
+    }
+
+    #[test]
+    fn rejects_invalid_tool_schema_before_provider_io() {
+        let mut request = request();
+        request.tools.push(ToolDefinition {
+            name: "bad".into(),
+            description: "bad".into(),
+            input_schema: "not-json".into(),
+        });
+        let error = rig_request(request, ToolNames::Canonical).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn maps_openai_tool_names_both_directions() {
         assert_eq!(openai_tool_name("task.delegate"), "task__delegate");
         assert_eq!(canonical_tool_name("review__request"), "review.request");
-        assert!(
-            openai_tool_name("file.patch")
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        );
-    }
-
-    #[test]
-    fn normalizes_nested_objects_for_openai_strict_tools() {
-        let mut schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "target": {"type": "string"},
-                "options": {
-                    "type": "object",
-                    "properties": {"depth": {"type": "integer"}}
-                }
-            },
-            "required": ["target"]
-        });
-        normalize_openai_strict_schema(&mut schema);
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["required"], serde_json::json!(["options", "target"]));
-        assert_eq!(
-            schema["properties"]["options"]["additionalProperties"],
-            false
-        );
-        assert_eq!(
-            schema["properties"]["options"]["required"],
-            serde_json::json!(["depth"])
-        );
     }
 }

@@ -10,7 +10,7 @@ test-support=[]
 voff-core.workspace=true
 async-trait.workspace=true
 futures-util="0.3"
-reqwest={version="0.12",default-features=false,features=["json","stream","rustls-tls"]}
+rig-core={version="0.42",default-features=false,features=["reqwest","rustls"]}
 serde.workspace=true
 serde_json.workspace=true
 thiserror.workspace=true
