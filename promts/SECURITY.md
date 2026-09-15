@@ -111,6 +111,15 @@ Audit at minimum:
 
 Audit data must not become a secret archive.
 
+## 11.1 MCP and external tool discovery
+
+Treat MCP server identity, advertised tools, schemas, arguments, results, and
+notifications as untrusted. MCP execution remains disabled until an adapter can
+validate discovered capabilities and route every call through the existing
+AgentMux policy, approval, timeout, cancellation, executor, audit, and redaction
+boundaries. A disconnect must retire its tools and cancel or safely resolve
+pending calls. Provider or agent runtimes must not invoke MCP tools directly.
+
 ## 12. Security acceptance tests
 
 - Reject path traversal and symlink escape.

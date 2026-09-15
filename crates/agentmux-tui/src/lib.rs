@@ -256,6 +256,13 @@ fn format_event(kind: &CanonicalEventKind) -> String {
             input_tokens,
             output_tokens,
         } => format!("usage: {input_tokens} in / {output_tokens} out"),
+        CanonicalEventKind::BudgetExceeded {
+            resource,
+            limit,
+            observed,
+        } => {
+            format!("budget exceeded: {resource}, limit {limit}, observed {observed}")
+        }
         CanonicalEventKind::ProviderCompleted => "provider completed".into(),
         CanonicalEventKind::ProviderFailed(e) => format!("provider failed: {}", sanitize(e)),
         CanonicalEventKind::TaskCancelled => "task cancelled".into(),
@@ -282,9 +289,39 @@ fn format_event(kind: &CanonicalEventKind) -> String {
         CanonicalEventKind::DependencyAdded { task, depends_on } => {
             format!("dependency: {task} waits for {depends_on}")
         }
+        CanonicalEventKind::TaskAssigned { from, to } => format!("assigned: {from} -> {to}"),
+        CanonicalEventKind::ReworkRequested { attempt, limit } => {
+            format!("rework requested: {attempt}/{limit}")
+        }
+        CanonicalEventKind::ScopeClaimed { path, mode, .. } => {
+            format!("scope claimed ({mode:?}): {}", sanitize(path))
+        }
+        CanonicalEventKind::ScopeReleased { path, .. } => {
+            format!("scope released: {}", sanitize(path))
+        }
         CanonicalEventKind::TaskResultPublished { summary, .. } => {
             format!("result: {}", sanitize(summary))
         }
+        CanonicalEventKind::AcceptanceEvaluated {
+            satisfied,
+            failed,
+            unknown,
+        } => format!("acceptance: {satisfied} satisfied, {failed} failed, {unknown} unknown"),
+        CanonicalEventKind::CompletionSummary {
+            requested_tasks,
+            completed_tasks,
+            artifact_count,
+            review_status,
+            open_risks,
+        } => format!(
+            "completion: {completed_tasks}/{requested_tasks} tasks, {artifact_count} artifacts, review: {}, risks: {}",
+            sanitize(review_status),
+            if open_risks.is_empty() {
+                "none".into()
+            } else {
+                sanitize(&open_risks.join("; "))
+            }
+        ),
     }
 }
 fn sanitize(value: &str) -> String {
@@ -384,6 +421,10 @@ pub async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError> {
     let engine = Arc::new(
         Engine::new(config.repo, config.provider, config.session, event_tx)
             .with_provider_registry(config.providers, config.default_provider)
+            .with_budget_rates(agentmux_engine::BudgetRates {
+                input_per_million: config.input_cost_per_million,
+                output_per_million: config.output_cost_per_million,
+            })
             .with_runtime(config.model_name, config.system_prompt)
             .with_workspace_context(config.workspace_context)
             .with_safe_workflow(&config.workspace_root)

@@ -21,11 +21,38 @@ pub struct Config {
     pub providers: Vec<NamedProviderConfig>,
     #[serde(default)]
     pub cost: CostConfig,
+    #[serde(default)]
+    pub charter: Option<CharterConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub formation: Option<FormationConfig>,
     #[serde(default)]
     pub agents: Vec<FormationAgentConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CharterConfig {
+    #[serde(default = "default_definition_version")]
+    pub schema_version: u16,
+    pub name: String,
+    pub mission: String,
+    #[serde(default = "default_allowed_paths")]
+    pub allowed_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub denied_paths: Vec<PathBuf>,
+    #[serde(default = "default_privacy_class")]
+    pub privacy_class: String,
+    #[serde(default)]
+    pub budgets: CharterBudgetConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CharterBudgetConfig {
+    pub max_tokens: Option<u64>,
+    pub max_cost: Option<f64>,
+    pub max_duration_seconds: Option<u64>,
+    #[serde(default = "default_reworks")]
+    pub max_reworks_per_task: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -50,6 +77,18 @@ impl Default for CostConfig {
 
 fn default_currency() -> String {
     "USD".into()
+}
+const fn default_definition_version() -> u16 {
+    1
+}
+fn default_allowed_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from(".")]
+}
+fn default_privacy_class() -> String {
+    "project".into()
+}
+const fn default_reworks() -> u16 {
+    2
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -112,6 +151,8 @@ pub struct FormationAgentConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub delegation: DelegationConfig,
+    #[serde(default = "default_queue")]
+    pub max_queue: usize,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DelegationConfig {
@@ -140,6 +181,9 @@ const fn default_depth() -> u16 {
 const fn default_children() -> u16 {
     5
 }
+const fn default_queue() -> usize {
+    8
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -156,6 +200,7 @@ impl Default for Config {
             provider: ProviderConfig::Mock,
             providers: vec![],
             cost: CostConfig::default(),
+            charter: None,
             agent: AgentConfig {
                 name: "Solo Agent".into(),
                 role: "software_developer".into(),
@@ -204,6 +249,14 @@ pub enum ConfigError {
     TargetNotFound(String),
     #[error("formation and agents must be configured together")]
     IncompleteFormation,
+    #[error("unsupported charter schema_version {0}; expected 1")]
+    CharterVersion(u16),
+    #[error("charter path must be relative and cannot contain '..': {0}")]
+    UnsafeCharterPath(PathBuf),
+    #[error("unsupported charter privacy_class {0}")]
+    InvalidPrivacyClass(String),
+    #[error("charter max_cost requires both input and output cost rates")]
+    MissingCostRates,
 }
 
 impl Config {
@@ -242,6 +295,47 @@ impl Config {
         if config.cost.currency.trim().is_empty() {
             return Err(ConfigError::EmptyAgentField("cost.currency"));
         }
+        if let Some(charter) = &config.charter {
+            if charter.schema_version != 1 {
+                return Err(ConfigError::CharterVersion(charter.schema_version));
+            }
+            if charter.name.trim().is_empty() || charter.mission.trim().is_empty() {
+                return Err(ConfigError::EmptyAgentField("charter name or mission"));
+            }
+            if !matches!(
+                charter.privacy_class.as_str(),
+                "public" | "project" | "sensitive"
+            ) {
+                return Err(ConfigError::InvalidPrivacyClass(
+                    charter.privacy_class.clone(),
+                ));
+            }
+            for path in charter.allowed_paths.iter().chain(&charter.denied_paths) {
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| matches!(part, Component::ParentDir))
+                {
+                    return Err(ConfigError::UnsafeCharterPath(path.clone()));
+                }
+            }
+            if charter.allowed_paths.is_empty()
+                || charter.budgets.max_tokens == Some(0)
+                || charter.budgets.max_duration_seconds == Some(0)
+                || charter
+                    .budgets
+                    .max_cost
+                    .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+            {
+                return Err(ConfigError::NonPositive("charter budget or allowed_paths"));
+            }
+            if charter.budgets.max_cost.is_some()
+                && (config.cost.input_per_million.is_none()
+                    || config.cost.output_per_million.is_none())
+            {
+                return Err(ConfigError::MissingCostRates);
+            }
+        }
         if config.workspace.state_file.is_absolute()
             || config
                 .workspace
@@ -260,6 +354,7 @@ impl Config {
         let allowed = HashSet::from([
             "file.read",
             "search.text",
+            "file.create",
             "file.patch",
             "process.test",
             "task.delegate",
@@ -297,6 +392,9 @@ impl Config {
                         || agent.role.trim().is_empty()
                     {
                         return Err(ConfigError::EmptyAgentField("formation agent"));
+                    }
+                    if agent.max_queue == 0 || agent.max_queue > 1024 {
+                        return Err(ConfigError::NonPositive("agent.max_queue"));
                     }
                     if !ids.insert(agent.id.as_str()) {
                         return Err(ConfigError::DuplicateAgent(agent.id.clone()));
@@ -424,10 +522,43 @@ mod tests {
     #[test]
     fn accepts_phase2_scoped_tools() {
         let mut c = Config::default();
-        c.agent
-            .tools
-            .extend(["file.patch".into(), "process.test".into()]);
+        c.agent.tools.extend([
+            "file.create".into(),
+            "file.patch".into(),
+            "process.test".into(),
+        ]);
         assert!(Config::validate(c).is_ok());
+    }
+    #[test]
+    fn validates_versioned_project_charter() {
+        let mut config = Config {
+            charter: Some(CharterConfig {
+                schema_version: 1,
+                name: "Calculator".into(),
+                mission: "Build a safe calculator".into(),
+                allowed_paths: vec!["src".into()],
+                denied_paths: vec![".env".into()],
+                privacy_class: "project".into(),
+                budgets: CharterBudgetConfig {
+                    max_tokens: Some(20_000),
+                    max_cost: Some(2.0),
+                    max_duration_seconds: Some(900),
+                    max_reworks_per_task: 2,
+                },
+            }),
+            cost: CostConfig {
+                input_per_million: Some(1.0),
+                output_per_million: Some(1.0),
+                currency: "USD".into(),
+            },
+            ..Config::default()
+        };
+        assert!(Config::validate(config.clone()).is_ok());
+        config.charter.as_mut().unwrap().allowed_paths = vec!["../outside".into()];
+        assert!(matches!(
+            Config::validate(config),
+            Err(ConfigError::UnsafeCharterPath(_))
+        ));
     }
     #[test]
     fn validates_openai_secret_reference_and_cost_rates() {
@@ -490,6 +621,7 @@ mod tests {
                 provider: Some("cloud".into()),
                 model: Some("gpt-5-mini".into()),
                 delegation: DelegationConfig::default(),
+                max_queue: 8,
             }],
             ..Config::default()
         };
@@ -516,6 +648,7 @@ mod tests {
                         allowed_targets: vec!["worker".into()],
                         ..DelegationConfig::default()
                     },
+                    max_queue: 8,
                 },
                 FormationAgentConfig {
                     id: "worker".into(),
@@ -526,6 +659,7 @@ mod tests {
                     provider: None,
                     model: None,
                     delegation: DelegationConfig::default(),
+                    max_queue: 8,
                 },
             ],
             ..Config::default()
@@ -552,6 +686,7 @@ mod tests {
                     allowed_targets: vec!["missing".into()],
                     ..DelegationConfig::default()
                 },
+                max_queue: 8,
             }],
             ..Config::default()
         };

@@ -1,5 +1,18 @@
 config_version = 1
 
+[charter]
+schema_version = 1
+name = "Review-gated development"
+mission = "Implement and independently review bounded project changes."
+allowed_paths = ["."]
+denied_paths = [".git", ".env"]
+privacy_class = "project"
+
+[charter.budgets]
+max_tokens = 50000
+max_duration_seconds = 1800
+max_reworks_per_task = 2
+
 [workspace]
 root = "."
 state_file = ".agentmux/agentmux.db"
@@ -18,7 +31,7 @@ model = "qwen3:4b"
 name = "Solo Agent"
 role = "software_developer"
 system_prompt = "Follow repository rules and return verifiable results."
-tools = ["file.read", "search.text", "file.patch", "process.test"]
+tools = ["file.read", "search.text", "file.create", "file.patch", "process.test"]
 
 [formation]
 name = "Lead and Workers"
@@ -42,7 +55,7 @@ id = "implementer"
 name = "Implementer"
 role = "software_developer"
 system_prompt = "Implement scoped changes and provide verifiable evidence."
-tools = ["file.read", "search.text", "file.patch", "process.test"]
+tools = ["file.read", "search.text", "file.create", "file.patch", "process.test"]
 
 [[agents]]
 id = "reviewer"

@@ -10,6 +10,8 @@ fn main() {
             id: SessionId::new(),
             formation_id: FormationId::new(),
             workspace: ".".into(),
+            charter: None,
+            team: None,
             created_at: chrono::Utc::now(),
         };
         repository

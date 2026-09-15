@@ -4,6 +4,26 @@ Provider adapters translate an external model API into AgentMux's canonical
 contract. Provider-specific request, response, SDK, and error types must remain
 inside `agentmux-providers`; the engine depends only on `ModelProvider`.
 
+The production OpenAI and Ollama adapters use the exact-pinned Rig provider
+crates through one implementation path. Rig types remain private to this crate;
+canonical AgentMux requests, events, errors, and usage records are the public
+boundary.
+
+## Adding a provider
+
+1. Verify that the provider exists in the pinned Rig release and inspect its
+   actual features, target support, and source-level behavior.
+2. Define a stable descriptor and advertise only capabilities the adapter can
+   prove.
+3. Add validated configuration that stores only an environment-variable or
+   secret-store reference, never the credential value.
+4. Map canonical messages, tools, streams, usage, and errors inside
+   `agentmux-providers`.
+5. Run the shared contract suite and add deterministic provider wire fixtures.
+6. Add a health/model probe; keep cost metadata optional and user-maintained.
+7. Wire the adapter in CLI composition and doctor/TUI reporting without adding
+   concrete-provider branches to the scheduler.
+
 ## Implementation checklist
 
 1. Implement `ModelProvider::descriptor`, `models`, and `start`.
@@ -47,6 +67,10 @@ The `agentmux_provider::contract` module provides:
 Use a deterministic fake server or transport to test a real adapter. Contract
 tests must not require paid credentials or public network access.
 
+Live provider tests are opt-in smoke tests. Keep them ignored by default,
+require explicit environment credentials, and never make them a substitute for
+deterministic contract and wire-fixture coverage.
+
 ## Required adapter tests
 
 - successful text streaming and completion;
@@ -74,3 +98,8 @@ Adding a provider changes the external data boundary and requires tests,
 configuration documentation, a security review, and an ADR when it introduces
 new protocol or capability behavior. Do not log raw prompts merely to simplify
 debugging; use the redacted diagnostic export and synthetic fixtures.
+
+MCP-discovered servers, tools, schemas, and responses are untrusted input. Any
+future MCP adapter must route calls through AgentMux validation, policy,
+approval, timeout/cancellation, executor, audit, and redaction boundaries; a
+provider runtime must never invoke a discovered tool directly.

@@ -2,8 +2,9 @@ use agentmux_config::{
     Config, DelegationConfig, FormationAgentConfig, FormationConfig, ProviderConfig,
 };
 use agentmux_core::{
-    AgentId, AgentProfile, CanonicalEvent, CanonicalEventKind, EventId, FormationId, Session,
-    SessionId, TaskStatus,
+    AgentDefinition, AgentId, AgentInstance, AgentInstanceId, AgentProfile, CanonicalEvent,
+    CanonicalEventKind, CharterBudgets, EventId, FormationId, ProjectCharter, Session, SessionId,
+    TaskStatus, TeamDefinition,
 };
 use agentmux_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use agentmux_providers::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
@@ -201,16 +202,18 @@ fn team_template() -> Vec<FormationAgentConfig> {
             provider: None,
             model: None,
             delegation: DelegationConfig { allowed_targets: vec!["implementer".into(), "reviewer".into()], max_depth: 2, max_children: 5 },
+            max_queue: 8,
         },
         FormationAgentConfig {
             id: "implementer".into(),
             name: "Implementer".into(),
             role: "software_developer".into(),
             system_prompt: "Make minimal scoped changes and return verifiable test evidence.".into(),
-            tools: vec!["file.read".into(), "search.text".into(), "file.patch".into(), "process.test".into()],
+            tools: vec!["file.read".into(), "search.text".into(), "file.create".into(), "file.patch".into(), "process.test".into()],
             provider: None,
             model: None,
             delegation: DelegationConfig::default(),
+            max_queue: 8,
         },
         FormationAgentConfig {
             id: "reviewer".into(),
@@ -221,6 +224,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             provider: None,
             model: None,
             delegation: DelegationConfig::default(),
+            max_queue: 8,
         },
     ]
 }
@@ -269,17 +273,38 @@ async fn run(
             .max_by_key(|session| session.created_at)
             .expect("non-empty checked")
     } else {
+        let (charter, team) = runtime_definition_snapshots(&config, &default_provider);
         let value = Session {
             id: SessionId::new(),
             formation_id: FormationId::new(),
             workspace: config.workspace.root.display().to_string(),
+            charter: Some(charter),
+            team: Some(team),
             created_at: chrono::Utc::now(),
         };
         repo.save_session(value.clone()).await?;
         value
     };
     let mut agent_profiles = Vec::new();
-    let owner = if let Some(formation) = &config.formation {
+    let persisted_instances = repo.agent_instances(session.id).await?;
+    let owner = if !persisted_instances.is_empty() {
+        for instance in &persisted_instances {
+            let profile = repo.agent(instance.profile_id).await?.with_context(|| {
+                format!("runtime agent profile {} is missing", instance.profile_id)
+            })?;
+            agent_profiles.push(profile);
+        }
+        let entry_definition = session
+            .team
+            .as_ref()
+            .map(|team| team.entry_agent.as_str())
+            .unwrap_or("solo");
+        persisted_instances
+            .iter()
+            .find(|instance| instance.definition_id == entry_definition)
+            .map(|instance| instance.profile_id)
+            .context("persisted team entry agent instance is missing")?
+    } else if let Some(formation) = &config.formation {
         let mut entry = None;
         let names = config
             .agents
@@ -321,6 +346,15 @@ async fn run(
                 entry = Some(profile.id);
             }
             repo.save_agent(profile.clone()).await?;
+            repo.save_agent_instance(AgentInstance {
+                id: AgentInstanceId::new(),
+                session_id: session.id,
+                definition_id: configured.id.clone(),
+                profile_id: profile.id,
+                max_queue: configured.max_queue,
+                lease: None,
+            })
+            .await?;
             agent_profiles.push(profile);
         }
         entry.context("validated formation entry agent missing")?
@@ -339,6 +373,15 @@ async fn run(
         };
         let id = profile.id;
         repo.save_agent(profile.clone()).await?;
+        repo.save_agent_instance(AgentInstance {
+            id: AgentInstanceId::new(),
+            session_id: session.id,
+            definition_id: "solo".into(),
+            profile_id: profile.id,
+            max_queue: 1,
+            lease: None,
+        })
+        .await?;
         agent_profiles.push(profile);
         id
     };
@@ -421,6 +464,105 @@ async fn run(
     })
     .await?;
     Ok(())
+}
+
+fn runtime_definition_snapshots(
+    config: &Config,
+    default_provider: &str,
+) -> (ProjectCharter, TeamDefinition) {
+    let charter = config.charter.as_ref().map_or_else(
+        || ProjectCharter {
+            schema_version: 1,
+            name: config.formation.as_ref().map_or_else(
+                || "Solo workspace".into(),
+                |formation| formation.name.clone(),
+            ),
+            mission: "Complete user-approved objectives within the configured workspace policy."
+                .into(),
+            allowed_paths: vec![".".into()],
+            denied_paths: vec![".git".into(), ".env".into()],
+            privacy_class: "project".into(),
+            budgets: CharterBudgets {
+                max_tokens: None,
+                max_cost: None,
+                max_duration_seconds: Some(config.runtime.default_timeout_seconds),
+                max_reworks_per_task: 2,
+            },
+        },
+        |charter| ProjectCharter {
+            schema_version: charter.schema_version,
+            name: charter.name.clone(),
+            mission: charter.mission.clone(),
+            allowed_paths: charter
+                .allowed_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            denied_paths: charter
+                .denied_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            privacy_class: charter.privacy_class.clone(),
+            budgets: CharterBudgets {
+                max_tokens: charter.budgets.max_tokens,
+                max_cost: charter.budgets.max_cost,
+                max_duration_seconds: charter.budgets.max_duration_seconds,
+                max_reworks_per_task: charter.budgets.max_reworks_per_task,
+            },
+        },
+    );
+    let team = if let Some(formation) = &config.formation {
+        TeamDefinition {
+            schema_version: 1,
+            name: formation.name.clone(),
+            entry_agent: formation.entry_agent.clone(),
+            agents: config
+                .agents
+                .iter()
+                .map(|agent| {
+                    let provider = agent
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| default_provider.to_owned());
+                    let model = agent.model.clone().unwrap_or_else(|| {
+                        provider_config(config, &provider)
+                            .map(model_name)
+                            .unwrap_or_default()
+                    });
+                    AgentDefinition {
+                        id: agent.id.clone(),
+                        name: agent.name.clone(),
+                        role: agent.role.clone(),
+                        provider,
+                        model,
+                        tools: agent.tools.clone(),
+                        allowed_targets: agent.delegation.allowed_targets.clone(),
+                        max_queue: agent.max_queue,
+                    }
+                })
+                .collect(),
+        }
+    } else {
+        TeamDefinition {
+            schema_version: 1,
+            name: "Solo".into(),
+            entry_agent: "solo".into(),
+            agents: vec![AgentDefinition {
+                id: "solo".into(),
+                name: config.agent.name.clone(),
+                role: config.agent.role.clone(),
+                provider: default_provider.to_owned(),
+                model: provider_config(config, default_provider)
+                    .map(model_name)
+                    .unwrap_or_default(),
+                tools: config.agent.tools.clone(),
+                allowed_targets: vec![],
+                max_queue: 1,
+            }],
+        }
+    };
+    (charter, team)
 }
 
 async fn list_sessions(path: &Path) -> Result<()> {
@@ -536,6 +678,8 @@ struct DiagnosticBundle {
     format_version: u16,
     session: Session,
     agents: Vec<AgentProfile>,
+    agent_instances: Vec<AgentInstance>,
+    scope_claims: Vec<agentmux_core::ScopeClaim>,
     tasks: Vec<agentmux_core::Task>,
     events: Vec<CanonicalEvent>,
     approvals: Vec<agentmux_core::Approval>,
@@ -574,6 +718,8 @@ async fn export(path: &Path, output: &Path) -> Result<()> {
             .into_iter()
             .filter(|agent| owner_ids.contains(&agent.id))
             .collect(),
+        agent_instances: repo.agent_instances(session_id).await?,
+        scope_claims: repo.scope_claims(session_id).await?,
         tasks,
         events,
         approvals: repo.approvals(session_id).await?,
@@ -744,6 +890,16 @@ mod tests {
     use agentmux_storage::InMemoryRepository;
 
     #[test]
+    fn real_provider_factory_uses_the_rig_production_adapter() {
+        let configured = ProviderConfig::Ollama {
+            base_url: "http://127.0.0.1:11434".into(),
+            model: "qwen3:4b".into(),
+        };
+        let selected = provider(&configured).expect("safe loopback configuration should build");
+        assert!(selected.descriptor().display_name.contains("Rig"));
+    }
+
+    #[test]
     fn run_resume_is_explicit() {
         let cli = Cli::try_parse_from(["agentmux", "run", "--resume"]).unwrap();
         assert!(matches!(
@@ -759,6 +915,26 @@ mod tests {
             cli.command,
             Some(Command::Run { resume: false, .. })
         ));
+    }
+
+    #[test]
+    fn runtime_snapshots_separate_team_definitions_from_instances() {
+        let config = Config {
+            formation: Some(FormationConfig {
+                name: "Team".into(),
+                entry_agent: "lead".into(),
+                max_parallel_tasks: 2,
+            }),
+            agents: team_template(),
+            ..Config::default()
+        };
+        let (charter, team) = runtime_definition_snapshots(&config, "mock");
+        assert_eq!(charter.schema_version, 1);
+        assert_eq!(team.schema_version, 1);
+        assert_eq!(team.entry_agent, "lead");
+        assert_eq!(team.agents.len(), 3);
+        assert_eq!(team.agents[0].id, "lead");
+        assert!(!team.agents[0].provider.is_empty());
     }
 
     #[tokio::test]

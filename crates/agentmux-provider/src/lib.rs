@@ -84,10 +84,19 @@ pub struct ProviderCompletion {
 pub enum ProviderErrorKind {
     Authentication,
     Authorization,
+    InsufficientQuota,
     RateLimit,
     Timeout,
+    Transport,
+    InvalidRequest,
+    ContextLengthExceeded,
+    UnsupportedCapability,
     InvalidResponse,
+    ToolProtocolViolation,
+    OutputTruncated,
     Cancelled,
+    Transient,
+    Permanent,
     Internal,
 }
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -111,6 +120,57 @@ pub trait ModelProvider: Send + Sync {
         sink: ProviderEventSink,
         cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError>;
+}
+
+/// Provider-neutral boundary for one model/agent turn.
+///
+/// The orchestration engine owns task state, approvals, tools, budgets and
+/// persistence. Runtime implementations may drive a provider-specific agent
+/// protocol, but they may only propose effects through [`ProviderEvent`].
+#[async_trait]
+pub trait AgentRuntime: Send + Sync {
+    fn descriptor(&self) -> ProviderDescriptor;
+    async fn health(&self) -> ProviderHealth;
+    async fn run_turn(
+        &self,
+        request: CanonicalRequest,
+        sink: ProviderEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderCompletion, ProviderError>;
+}
+
+/// Compatibility adapter used while provider-backed turns migrate to a Rig
+/// agent runtime. It deliberately delegates execution only to `ModelProvider`;
+/// tool requests still return to the AgentMux engine for authorization.
+pub struct ProviderAgentRuntime {
+    provider: Arc<dyn ModelProvider>,
+}
+
+impl ProviderAgentRuntime {
+    #[must_use]
+    pub fn new(provider: Arc<dyn ModelProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for ProviderAgentRuntime {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.provider.descriptor()
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        self.provider.health().await
+    }
+
+    async fn run_turn(
+        &self,
+        request: CanonicalRequest,
+        sink: ProviderEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderCompletion, ProviderError> {
+        self.provider.start(request, sink, cancellation).await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -309,7 +369,12 @@ fn retry_allowed(error: &ProviderError) -> bool {
     error.retryable
         && matches!(
             error.kind,
-            ProviderErrorKind::RateLimit | ProviderErrorKind::Timeout | ProviderErrorKind::Internal
+            ProviderErrorKind::RateLimit
+                | ProviderErrorKind::Timeout
+                | ProviderErrorKind::Transport
+                | ProviderErrorKind::Transient
+                | ProviderErrorKind::OutputTruncated
+                | ProviderErrorKind::Internal
         )
 }
 
@@ -407,7 +472,13 @@ pub mod contract {
             expected_kind,
             ProviderErrorKind::Authentication
                 | ProviderErrorKind::Authorization
+                | ProviderErrorKind::InsufficientQuota
+                | ProviderErrorKind::InvalidRequest
+                | ProviderErrorKind::ContextLengthExceeded
+                | ProviderErrorKind::UnsupportedCapability
                 | ProviderErrorKind::InvalidResponse
+                | ProviderErrorKind::ToolProtocolViolation
+                | ProviderErrorKind::Permanent
                 | ProviderErrorKind::Cancelled
         ) {
             assert!(
@@ -436,6 +507,7 @@ mod tests {
         calls: AtomicUsize,
         fail_until: usize,
         emit_before_failure: bool,
+        error_kind: ProviderErrorKind,
     }
     #[async_trait]
     impl ModelProvider for Flaky {
@@ -463,7 +535,7 @@ mod tests {
             }
             if call <= self.fail_until {
                 return Err(ProviderError {
-                    kind: ProviderErrorKind::Timeout,
+                    kind: self.error_kind,
                     message: "temporary".into(),
                     retryable: true,
                 });
@@ -495,6 +567,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_until: 1,
             emit_before_failure: false,
+            error_kind: ProviderErrorKind::Timeout,
         });
         let provider = ResilientProvider::new(inner.clone(), policy());
         let (tx, mut rx) = mpsc::channel(8);
@@ -506,12 +579,31 @@ mod tests {
         assert_eq!(rx.recv().await, Some(ProviderEvent::Completed));
         assert_eq!(provider.health().await.retries, 1);
     }
+
+    #[tokio::test]
+    async fn repairs_truncated_output_only_before_any_event() {
+        let inner = Arc::new(Flaky {
+            calls: AtomicUsize::new(0),
+            fail_until: 1,
+            emit_before_failure: false,
+            error_kind: ProviderErrorKind::OutputTruncated,
+        });
+        let provider = ResilientProvider::new(inner.clone(), policy());
+        let (tx, mut rx) = mpsc::channel(8);
+        provider
+            .start(request(), tx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(rx.recv().await, Some(ProviderEvent::Completed));
+    }
     #[tokio::test]
     async fn never_retries_after_stream_output() {
         let inner = Arc::new(Flaky {
             calls: AtomicUsize::new(0),
             fail_until: 3,
             emit_before_failure: true,
+            error_kind: ProviderErrorKind::Timeout,
         });
         let provider = ResilientProvider::new(inner.clone(), policy());
         let (tx, _rx) = mpsc::channel(8);
@@ -529,6 +621,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_until: 10,
             emit_before_failure: false,
+            error_kind: ProviderErrorKind::Timeout,
         });
         let provider = ResilientProvider::new(
             inner.clone(),
@@ -558,5 +651,63 @@ mod tests {
                 .contains("circuit")
         );
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_forwards_tool_proposals_without_executing_them() {
+        struct ToolProposal;
+
+        #[async_trait]
+        impl ModelProvider for ToolProposal {
+            fn descriptor(&self) -> ProviderDescriptor {
+                ProviderDescriptor {
+                    id: "runtime-probe".into(),
+                    display_name: "Runtime Probe".into(),
+                    capabilities: ProviderCapabilities {
+                        tools: true,
+                        ..ProviderCapabilities::default()
+                    },
+                }
+            }
+
+            async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+                Ok(Vec::new())
+            }
+
+            async fn start(
+                &self,
+                _: CanonicalRequest,
+                sink: ProviderEventSink,
+                _: CancellationToken,
+            ) -> Result<ProviderCompletion, ProviderError> {
+                sink.send(ProviderEvent::ToolRequest(StructuredToolRequest {
+                    id: ToolCallId::new(),
+                    name: "file.patch".into(),
+                    arguments_json: r#"{"path":"README.md"}"#.into(),
+                }))
+                .await
+                .expect("engine-side receiver should remain open");
+                sink.send(ProviderEvent::Completed)
+                    .await
+                    .expect("engine-side receiver should remain open");
+                Ok(ProviderCompletion { usage: None })
+            }
+        }
+
+        let runtime = ProviderAgentRuntime::new(Arc::new(ToolProposal));
+        let (tx, mut rx) = mpsc::channel(2);
+        runtime
+            .run_turn(request(), tx, CancellationToken::new())
+            .await
+            .expect("compatibility runtime should complete");
+
+        let proposed = rx.recv().await.expect("tool proposal should be forwarded");
+        assert!(matches!(
+            proposed,
+            ProviderEvent::ToolRequest(StructuredToolRequest { ref name, .. })
+                if name == "file.patch"
+        ));
+        assert_eq!(rx.recv().await, Some(ProviderEvent::Completed));
+        assert_eq!(runtime.descriptor().id, "runtime-probe");
     }
 }

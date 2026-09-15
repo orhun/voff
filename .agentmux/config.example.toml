@@ -1,5 +1,18 @@
 config_version = 1
 
+[charter]
+schema_version = 1
+name = "Solo workspace"
+mission = "Complete scoped changes with verifiable evidence."
+allowed_paths = ["."]
+denied_paths = [".git", ".env"]
+privacy_class = "project"
+
+[charter.budgets]
+max_tokens = 20000
+max_duration_seconds = 1800
+max_reworks_per_task = 2
+
 [workspace]
 root = "."
 state_file = ".agentmux/agentmux.db"
@@ -29,4 +42,4 @@ kind = "mock"
 name = "Solo Agent"
 role = "software_developer"
 system_prompt = "Follow repository rules and return verifiable results."
-tools = ["file.read", "search.text", "file.patch", "process.test"]
+tools = ["file.read", "search.text", "file.create", "file.patch", "process.test"]

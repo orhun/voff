@@ -17,6 +17,12 @@
 - [ ] `cargo bench -p agentmux-storage --bench large_history`
 - [ ] `cargo deny check`
 - [ ] `cargo build --locked --release -p agentmux-cli`
+- [ ] Confirm the production graph has one HTTP/Rig provider stack and Rig is
+      confined to `agentmux-providers`.
+- [ ] Confirm `rmcp` and experimental effect-log dependencies are absent unless
+      a separate security/architecture review explicitly approved them.
+- [ ] Run the ignored live-provider smoke tests manually with disposable or
+      tightly scoped credentials; do not expose values in logs.
 
 ## GitHub dry run
 

@@ -94,6 +94,8 @@ cargo deny check
 See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/ARCHITECTURE.md),
 [security model](docs/SECURITY.md), and [roadmap](docs/ROADMAP.md) for project
 rules and current milestone evidence.
+The evidence-based status matrix and planned phases are maintained in
+[docs/PRODUCT_STATUS.md](docs/PRODUCT_STATUS.md).
 
 Security vulnerabilities must follow the private process in
 [SECURITY.md](SECURITY.md). Community participation is governed by
@@ -103,6 +105,9 @@ Maintainers can find the tagged binary workflow and checksum procedure in
 [docs/RELEASING.md](docs/RELEASING.md).
 Provider contributors should start with
 [docs/PROVIDER_ADAPTERS.md](docs/PROVIDER_ADAPTERS.md).
+Existing deployments can use the [Rig migration guide](docs/MIGRATING_TO_RIG.md),
+and operators can diagnose provider failures with
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ## Security
 

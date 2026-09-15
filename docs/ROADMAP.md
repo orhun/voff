@@ -86,6 +86,45 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
 
 ## Phase 5 progress
 
+### Phase 5A — Beta correctness
+
+- `file.create` is implemented as a separate approval-gated operation with an
+  absent-target precondition, content digest, privacy classification, bounded
+  UTF-8 content, full preview, workspace/symlink protection and atomic
+  no-overwrite application (ADR 0014).
+- Unit and engine integration tests cover denial, race conflicts, traversal,
+  artifact publication, audit persistence and successful creation.
+- Equivalent sibling delegations and ancestor owner/scope loops are rejected;
+  changed acceptance criteria remain a bounded rework revision.
+- Truncated OpenAI tool arguments emit no tool request and use a distinct,
+  bounded pre-output retry path.
+- Delegated acceptance criteria persist evidence-backed outcomes; missing
+  evidence moves work to `NeedsWork` instead of completing it.
+- Evidence-producing implementation work automatically creates a dependent
+  reviewer task when an enabled reviewer role is configured.
+- Root completion publishes one durable, exportable completion summary.
+
+Phase 5A is complete. A localhost browser adapter remains a separately scoped
+future tool because it is not required by the correctness exit gate.
+
+Planned sequence after Phase 5A: Phase 5B Team Runtime v2; Phase 6 team-first
+TUI and token UX; Phase 6.5 context/workflow efficiency; Phase 7 headless core
+and desktop client; Phase 8 opt-in notifications and collaboration.
+
+### Phase 5B progress
+
+- Version 1 Project Charter and Team Definition snapshots are persisted with
+  every new session and survive SQLite reopen.
+- Stable Agent Definitions are separated from generated runtime AgentProfile
+  identities (ADR 0016).
+- Session-keyed runtime instances, per-agent queue capacity and expiring
+  exclusive task leases are persisted and scheduler-enforced (ADR 0017).
+- Persistent shared/exclusive path claims reject overlapping writes before an
+  artifact or approval is created; direct assignment and charter-bounded
+  rework are provider-neutral and auditable (ADR 0018).
+- Runtime token/cost/time and provider/privacy enforcement completes the Phase
+  5B charter boundary (ADR 0019).
+
 - Root README now provides local and heterogeneous-team onboarding, secure
   credential setup, TUI controls, and contributor quality commands.
 - `agentmux init` interactively creates a validated solo Ollama or OpenAI

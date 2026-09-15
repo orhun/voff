@@ -40,6 +40,8 @@ macro_rules! typed_id {
 }
 typed_id!(SessionId, "ses");
 typed_id!(AgentId, "agt");
+typed_id!(AgentInstanceId, "agi");
+typed_id!(ScopeClaimId, "clm");
 typed_id!(FormationId, "frm");
 typed_id!(TaskId, "tsk");
 typed_id!(MessageId, "msg");
@@ -53,6 +55,81 @@ pub struct Session {
     pub id: SessionId,
     pub formation_id: FormationId,
     pub workspace: String,
+    #[serde(default)]
+    pub charter: Option<ProjectCharter>,
+    #[serde(default)]
+    pub team: Option<TeamDefinition>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectCharter {
+    pub schema_version: u16,
+    pub name: String,
+    pub mission: String,
+    pub allowed_paths: Vec<String>,
+    pub denied_paths: Vec<String>,
+    pub privacy_class: String,
+    pub budgets: CharterBudgets,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CharterBudgets {
+    pub max_tokens: Option<u64>,
+    pub max_cost: Option<f64>,
+    pub max_duration_seconds: Option<u64>,
+    pub max_reworks_per_task: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TeamDefinition {
+    pub schema_version: u16,
+    pub name: String,
+    pub entry_agent: String,
+    pub agents: Vec<AgentDefinition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentDefinition {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    pub tools: Vec<String>,
+    pub allowed_targets: Vec<String>,
+    pub max_queue: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentInstance {
+    pub id: AgentInstanceId,
+    pub session_id: SessionId,
+    pub definition_id: String,
+    pub profile_id: AgentId,
+    pub max_queue: usize,
+    pub lease: Option<TaskLease>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskLease {
+    pub task_id: TaskId,
+    pub acquired_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScopeClaimMode {
+    Shared,
+    Exclusive,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScopeClaim {
+    pub id: ScopeClaimId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub owner: AgentId,
+    pub path: String,
+    pub mode: ScopeClaimMode,
     pub created_at: DateTime<Utc>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,6 +203,22 @@ impl Default for TaskLimits {
 pub struct TaskResult {
     pub summary: String,
     pub evidence: Vec<ArtifactId>,
+    #[serde(default)]
+    pub criteria: Vec<CriterionOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CriterionStatus {
+    Satisfied,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CriterionOutcome {
+    pub criterion: String,
+    pub status: CriterionStatus,
+    pub evidence: Vec<ArtifactId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -134,6 +227,7 @@ pub enum TaskStatus {
     Ready,
     Running,
     WaitingApproval,
+    NeedsWork,
     Blocked,
     Completed,
     Failed,
@@ -155,6 +249,8 @@ pub struct Task {
     pub limits: TaskLimits,
     pub depth: u16,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub rework_count: u16,
     pub result: Option<TaskResult>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -177,6 +273,7 @@ impl Task {
             limits,
             depth: 0,
             status: TaskStatus::Queued,
+            rework_count: 0,
             result: None,
             created_at: now,
             updated_at: now,
@@ -194,14 +291,22 @@ impl Task {
             ) | (
                 TaskStatus::Running,
                 TaskStatus::WaitingApproval
+                    | TaskStatus::NeedsWork
                     | TaskStatus::Blocked
                     | TaskStatus::Completed
                     | TaskStatus::Failed
                     | TaskStatus::Cancelled
             ) | (
                 TaskStatus::WaitingApproval,
-                TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Failed
+                TaskStatus::Running
+                    | TaskStatus::NeedsWork
+                    | TaskStatus::Blocked
+                    | TaskStatus::Failed
             ) | (TaskStatus::Blocked, TaskStatus::Ready)
+                | (
+                    TaskStatus::NeedsWork,
+                    TaskStatus::Ready | TaskStatus::Failed | TaskStatus::Cancelled
+                )
         );
         if !valid {
             return Err(DomainError::InvalidTransition {
@@ -232,6 +337,11 @@ pub enum CanonicalEventKind {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    BudgetExceeded {
+        resource: String,
+        limit: String,
+        observed: String,
     },
     ProviderCompleted,
     ProviderFailed(String),
@@ -270,9 +380,38 @@ pub enum CanonicalEventKind {
         task: TaskId,
         depends_on: TaskId,
     },
+    TaskAssigned {
+        from: AgentId,
+        to: AgentId,
+    },
+    ReworkRequested {
+        attempt: u16,
+        limit: u16,
+    },
+    ScopeClaimed {
+        claim_id: ScopeClaimId,
+        path: String,
+        mode: ScopeClaimMode,
+    },
+    ScopeReleased {
+        claim_id: ScopeClaimId,
+        path: String,
+    },
     TaskResultPublished {
         summary: String,
         evidence: Vec<ArtifactId>,
+    },
+    AcceptanceEvaluated {
+        satisfied: usize,
+        failed: usize,
+        unknown: usize,
+    },
+    CompletionSummary {
+        requested_tasks: usize,
+        completed_tasks: usize,
+        artifact_count: usize,
+        review_status: String,
+        open_risks: Vec<String>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -298,6 +437,10 @@ pub enum DomainError {
     DepthLimit,
     #[error("child task limit exceeded")]
     ChildLimit,
+    #[error("duplicate delegation for the same parent, owner and scope")]
+    DuplicateDelegation,
+    #[error("delegation repeats an ancestor owner and scope")]
+    DelegationLoop,
     #[error("task was not found")]
     TaskNotFound,
 }
@@ -318,6 +461,8 @@ impl TaskGraph {
         objective: impl Into<String>,
         criteria: Vec<String>,
     ) -> Result<TaskId, DomainError> {
+        let objective = objective.into();
+        let signature = delegation_signature(&objective, &criteria);
         let p = self.tasks.get(&parent).ok_or(DomainError::ParentNotFound)?;
         if p.depth >= p.limits.max_delegation_depth {
             return Err(DomainError::DepthLimit);
@@ -331,16 +476,34 @@ impl TaskGraph {
         {
             return Err(DomainError::ChildLimit);
         }
+        if self.tasks.values().any(|task| {
+            task.parent == Some(parent)
+                && task.owner == owner
+                && delegation_signature(&task.objective, &task.acceptance_criteria) == signature
+        }) {
+            return Err(DomainError::DuplicateDelegation);
+        }
+        let mut ancestor = Some(parent);
+        while let Some(id) = ancestor {
+            let task = self.tasks.get(&id).ok_or(DomainError::ParentNotFound)?;
+            if task.owner == owner
+                && delegation_signature(&task.objective, &task.acceptance_criteria) == signature
+            {
+                return Err(DomainError::DelegationLoop);
+            }
+            ancestor = task.parent;
+        }
         let now = Utc::now();
         let task = Task {
             id: TaskId::new(),
             parent: Some(parent),
             owner,
-            objective: objective.into(),
+            objective,
             acceptance_criteria: criteria,
             limits: p.limits.clone(),
             depth: p.depth + 1,
             status: TaskStatus::Queued,
+            rework_count: 0,
             result: None,
             created_at: now,
             updated_at: now,
@@ -405,6 +568,19 @@ impl TaskGraph {
     }
 }
 
+fn delegation_signature(objective: &str, criteria: &[String]) -> String {
+    let normalize = |value: &str| {
+        value
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut criteria = criteria.iter().map(|v| normalize(v)).collect::<Vec<_>>();
+    criteria.sort();
+    format!("{}\n{}", normalize(objective), criteria.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +592,8 @@ mod tests {
         assert!(
             t.complete(TaskResult {
                 summary: "ok".into(),
-                evidence: vec![]
+                evidence: vec![],
+                criteria: vec![],
             })
             .is_ok()
         );
@@ -435,7 +612,8 @@ mod tests {
         assert!(
             t.complete(TaskResult {
                 summary: "no".into(),
-                evidence: vec![]
+                evidence: vec![],
+                criteria: vec![],
             })
             .is_err()
         );
@@ -474,6 +652,84 @@ mod tests {
         assert_eq!(
             g.add_child(b, AgentId::new(), "c", vec![]),
             Err(DomainError::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn duplicate_delegation_is_normalized_and_rejected() {
+        let mut graph = TaskGraph::default();
+        let root = Task::root(
+            AgentId::new(),
+            "root",
+            vec![],
+            TaskLimits {
+                max_delegation_depth: 3,
+                max_children: 4,
+                max_duration_seconds: 60,
+            },
+        );
+        let root_id = root.id;
+        let worker = AgentId::new();
+        graph.add_root(root);
+        graph
+            .add_child(
+                root_id,
+                worker,
+                "Implement the feature",
+                vec!["Tests pass".into(), "No secrets".into()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            graph.add_child(
+                root_id,
+                worker,
+                "  IMPLEMENT   the feature ",
+                vec!["no secrets".into(), "tests pass".into()],
+            ),
+            Err(DomainError::DuplicateDelegation)
+        );
+        assert!(
+            graph
+                .add_child(
+                    root_id,
+                    worker,
+                    "Implement the feature",
+                    vec!["Tests pass with new evidence".into()],
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn delegation_that_repeats_ancestor_scope_is_rejected() {
+        let mut graph = TaskGraph::default();
+        let lead = AgentId::new();
+        let worker = AgentId::new();
+        let root = Task::root(
+            lead,
+            "Ship safe calculator",
+            vec!["Tests pass".into()],
+            TaskLimits {
+                max_delegation_depth: 3,
+                max_children: 4,
+                max_duration_seconds: 60,
+            },
+        );
+        let root_id = root.id;
+        graph.add_root(root);
+        let child = graph
+            .add_child(root_id, worker, "Implement calculator", vec![])
+            .unwrap();
+
+        assert_eq!(
+            graph.add_child(
+                child,
+                lead,
+                " SHIP  SAFE CALCULATOR ",
+                vec!["tests pass".into()],
+            ),
+            Err(DomainError::DelegationLoop)
         );
     }
 

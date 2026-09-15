@@ -14,6 +14,20 @@ Workspace config should be safe to commit. Secrets must not appear in it.
 ```toml
 config_version = 1
 
+[charter]
+schema_version = 1
+name = "AgentMux development"
+mission = "Make scoped, reviewed changes with verifiable evidence."
+allowed_paths = ["."]
+denied_paths = [".git", ".env"]
+privacy_class = "project"
+
+[charter.budgets]
+max_tokens = 50000
+max_cost = 10.0
+max_duration_seconds = 1800
+max_reworks_per_task = 2
+
 [workspace]
 root = "."
 write_mode = "patch_review"
@@ -47,6 +61,7 @@ provider = "openai"
 model = "configured-by-user"
 prompt_file = ".agentmux/prompts/team-lead.md"
 tools = ["file.read", "search.text", "task.delegate", "review.request"]
+max_queue = 8
 
 [agents.delegation]
 mode = "propose_only"
@@ -61,7 +76,7 @@ role = "backend_developer"
 provider = "anthropic"
 model = "configured-by-user"
 prompt_file = ".agentmux/prompts/backend.md"
-tools = ["file.read", "search.text", "file.patch", "process.test"]
+tools = ["file.read", "search.text", "file.create", "file.patch", "process.test"]
 
 [[agents]]
 id = "frontend"
@@ -70,7 +85,7 @@ role = "frontend_developer"
 provider = "google"
 model = "configured-by-user"
 prompt_file = ".agentmux/prompts/frontend.md"
-tools = ["file.read", "search.text", "file.patch", "process.test"]
+tools = ["file.read", "search.text", "file.create", "file.patch", "process.test"]
 
 [formation]
 name = "Lead and Specialists"
@@ -85,6 +100,11 @@ deny_paths = [".git", ".env", "**/secrets/**"]
 ```
 
 Provider and model strings are user configuration, not promises that a particular model exists. The UI should discover or validate them at runtime.
+
+There is one production provider path. The removed `rig-provider` feature and
+`AGENTMUX_PROVIDER_BACKEND` selector are not supported configuration. Rig
+optional integrations are build-time implementation choices and must not become
+hidden runtime switches.
 
 ## 3. Agent prompt contract
 
@@ -130,6 +150,29 @@ Warnings may cover unavailable optional capabilities, unknown price data and unv
 ## 5. Precedence and snapshots
 
 Merge configuration using documented precedence, validate once, then persist a redacted immutable formation snapshot with the session. Later config edits do not silently change an active session.
+
+Phase 5B stores the versioned charter and static team/agent definitions in the
+session record. Existing version 1 configs may omit `[charter]`; a conservative
+snapshot is generated. Charter schema versions other than 1, absolute/traversal
+paths, unsupported privacy classes and non-positive configured budgets fail
+validation before a session starts.
+
+Each formation agent may set `max_queue` (default 8, valid range 1–1024). The
+runtime persists one session-scoped instance per definition and leases it to at
+most one running task at a time. Queue and lease state contain no credentials
+and are included in redacted diagnostic exports.
+
+Write proposals acquire persistent exclusive path claims before artifacts or
+approvals are created; overlapping shared/exclusive claims from different tasks
+are rejected. Queued or `NeedsWork` tasks can be directly reassigned to enabled
+agents within `max_queue`, and `NeedsWork` retries are capped by
+`charter.budgets.max_reworks_per_task`.
+
+Token and elapsed-session limits are checked before dispatch and while a
+provider runs. `max_cost` requires both `[cost].input_per_million` and
+`output_per_million`; rates are user-maintained estimates and are never inferred
+from provider names. Provider routes must occur in the persisted Team Definition,
+and a `file.create` proposal cannot declare a privacy class above the charter.
 
 ## 6. Secret handling
 

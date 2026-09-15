@@ -67,6 +67,77 @@ Exit gate: the same agent profile can switch supported providers without engine 
 
 Exit gate: a new contributor can build/test locally; a new user can complete documented solo and multi-agent tutorials.
 
+## Phase 5A — Beta correctness
+
+- Safe `file.create` with explicit absent-target semantics and approval preview
+- Delegation duplicate/loop/rework guards
+- Truncated tool-call detection and bounded repair
+- Deterministic acceptance evidence gate
+- Policy-driven automatic review
+- Structured, exportable completion summary
+
+Exit gate: an agent can bootstrap an empty text project without placeholder
+files; duplicate delegation and partial tool calls cannot cause side effects;
+review-required work cannot complete without evidence-backed review; the user
+receives one durable final summary.
+
+Status: complete. The implementation is documented in ADR 0014 and ADR 0015.
+
+## Phase 5B — Team Runtime v2
+
+- Versioned Project Charter and Team Definition
+- Agent Definition/Instance separation and bounded work queues
+- Path/scope claims, leases, rework budgets and direct assignment
+- Enforced token, cost, time and provider/privacy budgets
+
+Exit gate: a configured team executes under a versioned charter with enforced
+scope, concurrency and budget policies that survive restart.
+
+Status: active. Versioned charter/team snapshots and Agent Definition/runtime
+identity separation are implemented in the first vertical slice (ADR 0016).
+Session-scoped instances, bounded per-agent queues and durable expiring leases
+are implemented in the second slice (ADR 0017). Persistent path claims,
+queue-aware direct assignment and charter-bounded rework are implemented in the
+third slice (ADR 0018). Runtime token, cost, time and provider/privacy budget
+enforcement completes the fourth slice (ADR 0019).
+
+Status: complete. The exit gate is covered by persisted definitions, queues,
+leases, claims, assignment/rework limits and runtime charter budget tests.
+
+## Phase 6 — Team-first TUI and token UX
+
+- Setup wizard for charter, team templates, roles and provider routes
+- TechLead summary view plus inspectable per-agent activity
+- Task/agent/provider cost views and actionable failure explanations
+
+Exit gate: a terminal-first user can configure, run, inspect and understand a
+multi-agent project without editing TOML or reading raw event JSON.
+
+## Phase 6.5 — Context efficiency and workflow as code
+
+- Deterministic task compiler and optional prompt optimizer preview
+- Context checkpoints, artifact references and reusable versioned workflows
+- Measured context/token growth and regression budgets
+
+Exit gate: repeated runs are reproducible and context growth stays within
+published budgets without losing required evidence.
+
+## Phase 7 — Headless core and desktop client
+
+- Local authenticated control API/daemon over the existing engine
+- Thin Tauri client with feature parity for approvals, tasks and summaries
+
+Exit gate: TUI and desktop clients drive the same persisted core and permission
+model without duplicating orchestration logic.
+
+## Phase 8 — Notifications and collaboration
+
+- Redacted, opt-in notification interface
+- Read-only notification adapters before any remote control capability
+
+Exit gate: notifications expose no secrets or unapproved control surface and
+can be disabled without affecting core execution.
+
 ## Post-MVP candidates
 
 - Git worktree or container-isolated agent workers

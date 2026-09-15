@@ -101,9 +101,20 @@ pub trait ModelProvider: Send + Sync {
 
 `CanonicalRequest` carries normalized messages, tool definitions, structured-output schema and limits. Provider-specific payloads never escape the adapter.
 
+The exact-pinned Rig provider crates are an implementation detail of
+`agentmux-providers`. Rig agent/run/tool types must not cross into core, engine,
+tools, executor, storage, TUI, or CLI contracts. AgentMux remains the source of
+truth for task state, approvals, tool execution, budgets, and audit history; no
+Rig run or effect state is persisted.
+
 Provider events include text delta, reasoning-status metadata when legally/technically exposed, tool request, usage update, warning, completion and error. Do not depend on private chain-of-thought.
 
 ## 7. Orchestration engine
+
+Model turns execute through the provider-neutral `AgentRuntime` port. During the
+Rig migration a compatibility runtime wraps `ModelProvider`; future Rig runtime
+implementations must suspend and return tool proposals to the engine rather
+than executing tools. See ADR 0020.
 
 Responsibilities:
 
@@ -148,6 +159,9 @@ Post-MVP isolation may use Git worktrees or sandboxed workers. Do not let multip
 - Transactions for task transition plus corresponding event.
 - Schema migrations embedded and tested.
 - Sensitive request bodies redacted or optionally excluded.
+- Provider wire fixtures are deterministic test replay data, not the canonical
+  audit log. Do not introduce a second durable effect log without an ADR and a
+  migration/recovery design.
 
 Suggested tables:
 

@@ -3,7 +3,8 @@ use agentmux_core::{ArtifactId, TaskId, ToolCallId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -30,6 +31,8 @@ pub enum ToolError {
     InvalidLimit,
     #[error("patch base digest conflicts with the current file")]
     PatchConflict,
+    #[error("create target already exists")]
+    CreateConflict,
     #[error("patch was not explicitly approved")]
     ApprovalRequired,
 }
@@ -40,6 +43,16 @@ pub struct PatchProposal {
     pub path: PathBuf,
     pub base_digest: String,
     pub replacement: String,
+    pub preview: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateProposal {
+    pub artifact_id: ArtifactId,
+    pub task_id: TaskId,
+    pub path: PathBuf,
+    pub content_digest: String,
+    pub content: String,
+    pub privacy_class: String,
     pub preview: String,
 }
 #[derive(Clone, Debug)]
@@ -60,8 +73,9 @@ impl ScopedWorkspace {
             max_file_bytes,
         })
     }
-    fn resolve(&self, relative: &Path) -> Result<PathBuf, ToolError> {
+    fn validate_relative(relative: &Path) -> Result<(), ToolError> {
         if relative.is_absolute()
+            || relative.as_os_str().is_empty()
             || relative
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -74,11 +88,25 @@ impl ScopedWorkspace {
         {
             return Err(ToolError::SensitivePath);
         }
+        Ok(())
+    }
+    fn resolve(&self, relative: &Path) -> Result<PathBuf, ToolError> {
+        Self::validate_relative(relative)?;
         let path = self.root.join(relative).canonicalize()?;
         if !path.starts_with(&self.root) {
             return Err(ToolError::OutsideWorkspace);
         }
         Ok(path)
+    }
+    fn resolve_create_target(&self, relative: &Path) -> Result<PathBuf, ToolError> {
+        Self::validate_relative(relative)?;
+        let file_name = relative.file_name().ok_or(ToolError::OutsideWorkspace)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new("."));
+        let canonical_parent = self.root.join(parent).canonicalize()?;
+        if !canonical_parent.starts_with(&self.root) {
+            return Err(ToolError::OutsideWorkspace);
+        }
+        Ok(canonical_parent.join(file_name))
     }
     pub fn read_text(&self, relative: &Path) -> Result<String, ToolError> {
         let path = self.resolve(relative)?;
@@ -118,6 +146,61 @@ impl ScopedWorkspace {
         fs::write(&temporary, proposal.replacement.as_bytes())?;
         fs::rename(temporary, path)?;
         Ok(())
+    }
+    pub fn propose_create(
+        &self,
+        task_id: TaskId,
+        relative: &Path,
+        content: String,
+        privacy_class: String,
+    ) -> Result<CreateProposal, ToolError> {
+        let path = self.resolve_create_target(relative)?;
+        if path.exists() {
+            return Err(ToolError::CreateConflict);
+        }
+        if content.len() as u64 > self.max_file_bytes {
+            return Err(ToolError::TooLarge(self.max_file_bytes));
+        }
+        Ok(CreateProposal {
+            artifact_id: ArtifactId::new(),
+            task_id,
+            path: relative.to_path_buf(),
+            content_digest: digest(content.as_bytes()),
+            preview: diff_preview("", &content),
+            content,
+            privacy_class,
+        })
+    }
+    pub fn apply_create(&self, proposal: &CreateProposal, approved: bool) -> Result<(), ToolError> {
+        if !approved {
+            return Err(ToolError::ApprovalRequired);
+        }
+        if digest(proposal.content.as_bytes()) != proposal.content_digest {
+            return Err(ToolError::PatchConflict);
+        }
+        let target = self.resolve_create_target(&proposal.path)?;
+        if target.exists() {
+            return Err(ToolError::CreateConflict);
+        }
+        let temporary = target.with_extension(format!("agentmux-{}.tmp", proposal.artifact_id));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(proposal.content.as_bytes())?;
+            file.sync_all()?;
+            fs::hard_link(&temporary, &target).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ToolError::CreateConflict
+                } else {
+                    ToolError::Io(error)
+                }
+            })?;
+            Ok(())
+        })();
+        let _ = fs::remove_file(&temporary);
+        result
     }
     pub fn search_text(&self, query: &str, limit: usize) -> Result<Vec<SearchMatch>, ToolError> {
         if !(1..=1000).contains(&limit) {
@@ -200,6 +283,19 @@ impl PatchProposal {
             kind: "patch".into(),
             location: self.path.display().to_string(),
             digest: self.base_digest.clone(),
+            preview: self.preview.clone(),
+        }
+    }
+}
+impl CreateProposal {
+    #[must_use]
+    pub fn artifact(&self) -> agentmux_core::Artifact {
+        agentmux_core::Artifact {
+            id: self.artifact_id,
+            producer: self.task_id,
+            kind: "create".into(),
+            location: self.path.display().to_string(),
+            digest: self.content_digest.clone(),
             preview: self.preview.clone(),
         }
     }
@@ -309,5 +405,60 @@ mod tests {
             .unwrap();
         w.apply_patch(&proposal, true).unwrap();
         assert_eq!(fs::read_to_string(d.path().join("a.txt")).unwrap(), "new");
+    }
+    #[test]
+    fn create_requires_approval_and_never_overwrites() {
+        let d = tempfile::tempdir().unwrap();
+        let w = ScopedWorkspace::new(d.path(), 1024).unwrap();
+        let proposal = w
+            .propose_create(
+                TaskId::new(),
+                Path::new("new.txt"),
+                "hello".into(),
+                "project".into(),
+            )
+            .unwrap();
+        assert!(proposal.preview.contains("+hello"));
+        assert!(matches!(
+            w.apply_create(&proposal, false),
+            Err(ToolError::ApprovalRequired)
+        ));
+        fs::write(d.path().join("new.txt"), "raced").unwrap();
+        assert!(matches!(
+            w.apply_create(&proposal, true),
+            Err(ToolError::CreateConflict)
+        ));
+        assert_eq!(
+            fs::read_to_string(d.path().join("new.txt")).unwrap(),
+            "raced"
+        );
+    }
+    #[test]
+    fn approved_create_is_atomic_and_scoped() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        let w = ScopedWorkspace::new(d.path(), 1024).unwrap();
+        let proposal = w
+            .propose_create(
+                TaskId::new(),
+                Path::new("src/new.rs"),
+                "fn main() {}".into(),
+                "project".into(),
+            )
+            .unwrap();
+        w.apply_create(&proposal, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(d.path().join("src/new.rs")).unwrap(),
+            "fn main() {}"
+        );
+        assert!(matches!(
+            w.propose_create(
+                TaskId::new(),
+                Path::new("../escape"),
+                "x".into(),
+                "project".into()
+            ),
+            Err(ToolError::OutsideWorkspace)
+        ));
     }
 }

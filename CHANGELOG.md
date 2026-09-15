@@ -12,6 +12,18 @@ All notable changes to AgentMux are documented here. This project follows
 - Provider adapter guide and reusable contract assertions.
 - Task-graph property checks, malformed-input fuzz corpora, and large-history
   benchmarks.
+- Exact-pinned Rig provider adapters, migration guidance, and provider
+  troubleshooting documentation.
+
+### Changed
+
+- OpenAI and Ollama now use a single Rig-backed production implementation; the
+  legacy custom HTTP/stream parsers and runtime backend selector were removed.
+
+### Security
+
+- Rig agent, MCP, and experimental effect execution remain outside production
+  authority; AgentMux continues to own approvals, execution, and audit state.
 
 ## [0.1.0-beta.1] - Unreleased
 
