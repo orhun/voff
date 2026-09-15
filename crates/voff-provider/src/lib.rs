@@ -1,4 +1,8 @@
 //! Provider-neutral model execution port.
+mod adapters;
+
+pub use adapters::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{

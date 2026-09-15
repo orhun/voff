@@ -1,10 +1,10 @@
-//! Built-in provider adapters. Phase 0 intentionally includes only a mock.
+//! Built-in provider adapters kept behind the provider-neutral execution port.
+use crate::*;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use voff_provider::*;
 
 #[derive(Clone, Debug)]
 pub enum MockStep {
@@ -696,11 +696,11 @@ mod tests {
     async fn streams_success() {
         let provider: std::sync::Arc<dyn ModelProvider> =
             std::sync::Arc::new(MockProvider::success("ok"));
-        voff_provider::contract::assert_descriptor(&provider.descriptor());
+        crate::contract::assert_descriptor(&provider.descriptor());
         let (events, result) =
-            voff_provider::contract::run(provider, req(), CancellationToken::new()).await;
+            crate::contract::run(provider, req(), CancellationToken::new()).await;
         let completion = result.unwrap();
-        voff_provider::contract::assert_successful_stream(&events, &completion);
+        crate::contract::assert_successful_stream(&events, &completion);
         assert_eq!(events[0], ProviderEvent::TextDelta("ok".into()));
     }
     #[tokio::test]
@@ -708,8 +708,8 @@ mod tests {
         let provider: std::sync::Arc<dyn ModelProvider> =
             std::sync::Arc::new(MockProvider::new(vec![MockStep::Fail("bad".into())]));
         let (events, result) =
-            voff_provider::contract::run(provider, req(), CancellationToken::new()).await;
-        voff_provider::contract::assert_failed_stream(
+            crate::contract::run(provider, req(), CancellationToken::new()).await;
+        crate::contract::assert_failed_stream(
             &events,
             &result.unwrap_err(),
             ProviderErrorKind::InvalidResponse,
@@ -721,8 +721,8 @@ mod tests {
         c.cancel();
         let provider: std::sync::Arc<dyn ModelProvider> =
             std::sync::Arc::new(MockProvider::success("no"));
-        let (events, result) = voff_provider::contract::run(provider, req(), c).await;
-        voff_provider::contract::assert_failed_stream(
+        let (events, result) = crate::contract::run(provider, req(), c).await;
+        crate::contract::assert_failed_stream(
             &events,
             &result.unwrap_err(),
             ProviderErrorKind::Cancelled,
@@ -734,7 +734,7 @@ mod tests {
         let call = &chunk.message.unwrap().tool_calls[0].function;
         assert_eq!(call.name, "file.patch");
         assert_eq!(call.arguments["path"], "README.md");
-        voff_provider::contract::assert_tool_request(&StructuredToolRequest {
+        crate::contract::assert_tool_request(&StructuredToolRequest {
             id: ToolCallId::new(),
             name: call.name.clone(),
             arguments_json: serde_json::to_string(&call.arguments).unwrap(),

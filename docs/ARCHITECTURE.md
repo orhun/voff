@@ -4,23 +4,23 @@
 
 Use a layered, event-driven Rust workspace with ports and adapters. The domain and orchestration engine must compile and test without Ratatui, a network connection or real provider credentials.
 
-## 2. Proposed workspace
+## 2. Workspace
 
 ```text
 crates/
   voff-core/          # IDs, entities, state machines, policies, events
   voff-engine/        # scheduler, delegation, budgets, cancellation
-  voff-provider/      # provider traits and canonical streaming events
-  voff-providers/     # concrete adapters, separated by module/feature
-  voff-tools/         # tool contracts, authorization and built-ins
-  voff-executor/      # process and workspace execution boundaries
+  voff-provider/      # provider port, canonical events and concrete adapters
+  voff-tools/         # tool contracts, authorization and controlled execution
   voff-storage/       # repository traits, SQLite and artifact store
-  voff-config/        # schema, validation, loading and migration
-  voff-tui/           # Ratatui application, views and input mapping
-  voff-cli/           # binary, commands, startup and dependency wiring
+  voff/               # binary, config, composition and Ratatui UI
 ```
 
-Crates may initially be combined if Phase 0 demonstrates that boundaries create needless overhead, but core/provider/TUI separation is mandatory.
+The six crates follow change and dependency boundaries rather than assigning a
+crate to every module. The application owns configuration and terminal UI;
+tools own their controlled executor; provider adapters remain behind the
+provider-neutral port. Core remains independent from provider SDKs, storage,
+and Ratatui.
 
 ## 3. Dependency direction
 

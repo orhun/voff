@@ -9,15 +9,15 @@ documented.
 - Workspace boundaries: `Cargo.toml`, `crates/*`, ADR 0001.
 - Typed domain, state machine, task graph: `voff-core` tests.
 - Canonical events and memory repositories: `voff-storage` tests.
-- Deterministic mock streaming/cancellation/errors: `voff-providers` tests.
+- Deterministic mock streaming/cancellation/errors: `voff-provider` adapter tests.
 - Engine event recording and cancellation: `voff-engine` tests.
-- Responsive TUI action reducer and bounded channels: `voff-tui` tests, ADR 0004.
+- Responsive TUI action reducer and bounded channels: `voff` TUI tests, ADR 0004.
 - CI and ADRs: `.github/workflows/ci.yml`, `docs/adr/`.
 
 ## Phase 1 evidence
 
-- Versioned TOML config and validation: `voff-config`, `.voff/config.example.toml`.
-- Real provider: local-only Ollama adapter in `voff-providers`, ADR 0006.
+- Versioned TOML config and validation: `voff` config module, `.voff/config.example.toml`.
+- Real provider: local-only Ollama adapter in `voff-provider`, ADR 0006.
 - Session creation, SQLite migrations, atomic transitions/events and restart recovery: `voff-storage`, `voff-cli`, ADR 0005.
 - Streaming, cancellation and usage: provider/engine contract tests and `usage_records`.
 - Scoped read/search: `voff-tools` security tests, ADR 0007.
@@ -29,18 +29,18 @@ Phase 1 exit gate is complete: a configured Ollama agent can run and cancel a ta
 ## Phase 2 evidence
 
 - Patch proposal artifact, SHA-256 base digest, atomic apply and conflict denial: `voff-tools` security tests.
-- Structured test executor without a shell, command allowlist, workspace boundary, timeout/output bounds and consumed approval grant: `voff-executor` tests.
+- Structured test executor without a shell, command allowlist, workspace boundary, timeout/output bounds and consumed approval grant: `voff-tools` executor tests.
 - Approval/artifact domain events and SQLite migration: `voff-core`, `voff-storage` contract tests.
 - Provider tool requests enter `WaitingApproval`; approval and denial are persisted and projected to the TUI: `voff-engine` integration test.
-- Approval dialog (`y` once / `n` deny), restored pending approvals and task-local artifact diff preview: `voff-tui`.
-- Terminal control sanitization and basic credential redaction: `voff-tui` tests.
+- Approval dialog (`y` once / `n` deny), restored pending approvals and task-local artifact diff preview: `voff` TUI module.
+- Terminal control sanitization and basic credential redaction: `voff` TUI tests.
 - Scoped Phase 2 capabilities are explicit in configuration: `file.patch` and `process.test`; arbitrary shell remains rejected.
 
 Phase 2 exit gate is complete: Qwen3/Ollama structured tool proposals enter durable approval, the TUI shows a digest-bound diff, approval dispatches only through scoped patch/test boundaries, and denial/conflict/failure remain visible and recoverable. Engine and executor acceptance tests cover approved patch application and approved Cargo verification.
 
 ## Phase 3 evidence
 
-- Backward-compatible formation loader, entry-agent/target/tool validation and example: `voff-config`, `.voff/formation.example.toml`.
+- Backward-compatible formation loader, entry-agent/target/tool validation and example: `voff` config module, `.voff/formation.example.toml`.
 - CLI composition persists all formation agents and selects the configured entry agent; each task uses its owner profile's prompt and tools.
 - Structured `task.delegate`/`review.request` proposals enforce enabled and allowed targets plus inherited depth/child limits.
 - Parent/child graph, cycle-safe dependencies, bounded wave scheduler, child result/evidence handoff and integration ordering: `voff-engine` acceptance tests.
@@ -67,7 +67,7 @@ Phase 4 exit gate is complete: the same configured agent runtime can select Olla
 
 ## Phase 4.5 evidence
 
-- Backward-compatible named provider registry and agent route/model validation: `voff-config`, `.voff/heterogeneous.example.toml`.
+- Backward-compatible named provider registry and agent route/model validation: `voff` config module, `.voff/heterogeneous.example.toml`.
 - Task-owner routing without provider-specific engine branches: `Engine::with_provider_registry`, ADR 0012.
 - CLI builds one independently resilient adapter per named route and persists route/model identity in every agent profile.
 - The TUI lists each formation agent with its selected provider and model.

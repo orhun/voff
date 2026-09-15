@@ -2,7 +2,8 @@
 
 Provider adapters translate an external model API into voff's canonical
 contract. Provider-specific request, response, SDK, and error types must remain
-inside `voff-providers`; the engine depends only on `ModelProvider`.
+inside the `voff-provider` adapter module; the engine depends only on
+`ModelProvider`.
 
 ## Implementation checklist
 

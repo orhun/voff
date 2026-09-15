@@ -59,8 +59,8 @@ Do not claim success if a check was skipped or failed. Explain environmental blo
 - Domain types and state machines belong in `voff-core`.
 - Application orchestration belongs in `voff-engine`.
 - Provider-specific translation belongs only in provider adapter crates.
-- Terminal rendering and input handling belong in `voff-tui`.
-- Shell/process execution belongs behind the executor interface.
+- Terminal rendering and input handling belong in the `voff` application crate's `tui` module.
+- Shell/process execution belongs behind the executor interface in `voff-tools`.
 - SQLite persistence belongs behind repository traits.
 - Cross-crate dependencies must point inward toward stable abstractions.
 - Avoid a global mutable application state. Use explicit ownership and message passing.

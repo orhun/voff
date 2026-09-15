@@ -1,3 +1,9 @@
+mod config;
+mod tui;
+
+use crate::config::{
+    Config, DelegationConfig, FormationAgentConfig, FormationConfig, ProviderConfig,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -8,15 +14,12 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use voff_config::{
-    Config, DelegationConfig, FormationAgentConfig, FormationConfig, ProviderConfig,
-};
 use voff_core::{
     AgentId, AgentProfile, CanonicalEvent, CanonicalEventKind, EventId, FormationId, Session,
     SessionId, TaskStatus,
 };
+use voff_provider::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
-use voff_providers::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 use voff_storage::{Repository, SqliteRepository};
 use voff_tools::ScopedWorkspace;
 #[derive(Parser)]
@@ -379,7 +382,7 @@ async fn run(
         .unwrap_or_else(|| model_name(&config.provider));
     let workspace = ScopedWorkspace::new(&config.workspace.root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
-    voff_tui::run_configured(voff_tui::ConfiguredRun {
+    tui::run_configured(tui::ConfiguredRun {
         repo,
         provider,
         providers,

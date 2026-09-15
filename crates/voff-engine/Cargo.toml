@@ -9,7 +9,6 @@ voff-core.workspace=true
 voff-provider.workspace=true
 voff-storage.workspace=true
 voff-tools={path="../voff-tools",version="=0.1.0-beta.1"}
-voff-executor={path="../voff-executor",version="=0.1.0-beta.1"}
 chrono.workspace=true
 serde.workspace=true
 serde_json="1"
@@ -17,7 +16,7 @@ thiserror.workspace=true
 tokio.workspace=true
 tokio-util.workspace=true
 [dev-dependencies]
-voff-providers.workspace=true
+voff-provider={workspace=true,features=["test-support"]}
 tempfile="3"
 [lints]
 workspace=true

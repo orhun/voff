@@ -20,8 +20,7 @@ use voff_core::{
 };
 use voff_engine::{Engine, EngineEvent};
 use voff_provider::ProviderHealth;
-use voff_providers::{MockProvider, MockStep};
-use voff_storage::{InMemoryRepository, Repository, SqliteRepository};
+use voff_storage::{Repository, SqliteRepository};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Panel {
@@ -324,34 +323,6 @@ fn redact_token(output: &mut String, token: &str) {
 pub enum TuiError {
     #[error("terminal error: {0}")]
     Io(#[from] io::Error),
-}
-pub async fn run() -> Result<(), TuiError> {
-    let session = SessionId::new();
-    let repo = Arc::new(InMemoryRepository::default());
-    let provider = Arc::new(MockProvider::new(vec![
-        MockStep::Event(voff_provider::ProviderEvent::TextDelta(
-            "mock analysis".into(),
-        )),
-        MockStep::Delay(Duration::from_millis(400)),
-        MockStep::Event(voff_provider::ProviderEvent::Completed),
-    ]));
-    let (event_tx, event_rx) = mpsc::channel(128);
-    let engine = Arc::new(Engine::new(repo, provider, session, event_tx));
-    let (action_tx, action_rx) = mpsc::channel(32);
-    let mut model = AppModel::new(session);
-    terminal_loop(
-        &mut model,
-        engine,
-        LoopConfig {
-            owner: AgentId::new(),
-            objective: "Run deterministic mock task".into(),
-            max_parallel_tasks: 1,
-        },
-        action_tx,
-        action_rx,
-        event_rx,
-    )
-    .await
 }
 pub struct ConfiguredRun {
     pub repo: Arc<SqliteRepository>,

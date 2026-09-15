@@ -11,10 +11,8 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 voff-core = { path = "crates/voff-core", version = "=0.1.0-beta.1" }
 voff-provider = { path = "crates/voff-provider", version = "=0.1.0-beta.1" }
-voff-providers = { path = "crates/voff-providers", version = "=0.1.0-beta.1" }
 voff-storage = { path = "crates/voff-storage", version = "=0.1.0-beta.1" }
 voff-engine = { path = "crates/voff-engine", version = "=0.1.0-beta.1" }
-voff-tui = { path = "crates/voff-tui", version = "=0.1.0-beta.1" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

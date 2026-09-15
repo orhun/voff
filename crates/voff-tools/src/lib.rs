@@ -1,4 +1,8 @@
 //! Read-only, workspace-scoped Phase 1 tools.
+mod executor;
+
+pub use executor::{CommandSpec, ControlledExecutor, ExecutionGrant, ExecutorError, ProcessResult};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{

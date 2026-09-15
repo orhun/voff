@@ -9,10 +9,12 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use voff_core::*;
-use voff_executor::{CommandSpec, ControlledExecutor, ExecutionGrant, ExecutorError};
 use voff_provider::*;
 use voff_storage::{Repository, RepositoryError};
-use voff_tools::{PatchProposal, ScopedWorkspace, ToolError};
+use voff_tools::{
+    CommandSpec, ControlledExecutor, ExecutionGrant, ExecutorError, PatchProposal, ScopedWorkspace,
+    ToolError,
+};
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("repository: {0}")]
@@ -1048,7 +1050,7 @@ fn delegation_tool(name: &str, description: &str, allowed_targets: &[String]) ->
 mod tests {
     use super::*;
     use std::time::Duration;
-    use voff_providers::{MockProvider, MockStep};
+    use voff_provider::{MockProvider, MockStep};
     use voff_storage::InMemoryRepository;
     #[test]
     fn delegation_schema_exposes_only_exact_allowed_agent_names() {
