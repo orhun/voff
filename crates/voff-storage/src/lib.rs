@@ -1,10 +1,21 @@
 //! Repository ports plus in-memory and SQLite adapters.
 use async_trait::async_trait;
-use rusqlite::OptionalExtension;
+use rusqlite_migration::{M, Migrations};
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
+use tokio_rusqlite::rusqlite::{self, OptionalExtension};
 use voff_core::*;
+
+fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/0001_base.sql")),
+        M::up(include_str!(
+            "../migrations/0002_approvals_and_artifacts.sql"
+        )),
+        M::up(include_str!("../migrations/0003_task_dependencies.sql")),
+    ])
+}
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -174,287 +185,422 @@ impl Repository for InMemoryRepository {
     }
 }
 
+#[derive(Clone)]
 pub struct SqliteRepository {
-    connection: Mutex<rusqlite::Connection>,
+    connection: tokio_rusqlite::Connection,
 }
+
 impl SqliteRepository {
-    pub fn open(path: &std::path::Path) -> Result<Self, RepositoryError> {
+    pub async fn open(path: &std::path::Path) -> Result<Self, RepositoryError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| RepositoryError::Invariant(e.to_string()))?;
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
         }
-        let c = rusqlite::Connection::open(path).map_err(db)?;
-        Self::initialize(&c)?;
-        Ok(Self {
-            connection: Mutex::new(c),
+        let connection = tokio_rusqlite::Connection::open(path).await.map_err(db)?;
+        let repository = Self { connection };
+        repository.initialize().await?;
+        Ok(repository)
+    }
+
+    pub async fn open_in_memory() -> Result<Self, RepositoryError> {
+        let connection = tokio_rusqlite::Connection::open_in_memory()
+            .await
+            .map_err(db)?;
+        let repository = Self { connection };
+        repository.initialize().await?;
+        Ok(repository)
+    }
+
+    async fn initialize(&self) -> Result<(), RepositoryError> {
+        self.call(|connection| {
+            connection
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+                .map_err(db)?;
+            migrations().to_latest(connection).map_err(migration)?;
+            Ok(())
         })
+        .await
     }
-    pub fn open_in_memory() -> Result<Self, RepositoryError> {
-        let c = rusqlite::Connection::open_in_memory().map_err(db)?;
-        Self::initialize(&c)?;
-        Ok(Self {
-            connection: Mutex::new(c),
-        })
+
+    async fn call<R, F>(&self, operation: F) -> Result<R, RepositoryError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, RepositoryError> + Send + 'static,
+    {
+        self.connection.call(operation).await.map_err(worker)
     }
-    fn initialize(c: &rusqlite::Connection) -> Result<(), RepositoryError> {
-        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY); INSERT OR IGNORE INTO schema_migrations(version) VALUES(1); INSERT OR IGNORE INTO schema_migrations(version) VALUES(2); INSERT OR IGNORE INTO schema_migrations(version) VALUES(3); CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,created_at TEXT NOT NULL,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage_records(event_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS task_dependencies(task_id TEXT NOT NULL,depends_on TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(task_id,depends_on));").map_err(db)
+
+    fn encode<T: serde::Serialize>(value: &T) -> Result<String, RepositoryError> {
+        serde_json::to_string(value).map_err(|error| RepositoryError::Invariant(error.to_string()))
     }
-    fn encode<T: serde::Serialize>(v: &T) -> Result<String, RepositoryError> {
-        serde_json::to_string(v).map_err(|e| RepositoryError::Invariant(e.to_string()))
-    }
-    fn decode<T: serde::de::DeserializeOwned>(v: String) -> Result<T, RepositoryError> {
-        serde_json::from_str(&v).map_err(|e| RepositoryError::Invariant(e.to_string()))
+
+    fn decode<T: serde::de::DeserializeOwned>(value: String) -> Result<T, RepositoryError> {
+        serde_json::from_str(&value).map_err(|error| RepositoryError::Invariant(error.to_string()))
     }
 }
-fn invariant(e: voff_core::DomainError) -> RepositoryError {
-    RepositoryError::Invariant(e.to_string())
+
+fn invariant(error: voff_core::DomainError) -> RepositoryError {
+    RepositoryError::Invariant(error.to_string())
 }
-fn db(e: rusqlite::Error) -> RepositoryError {
-    RepositoryError::Invariant(format!("sqlite: {e}"))
+
+fn db(error: rusqlite::Error) -> RepositoryError {
+    RepositoryError::Invariant(format!("sqlite: {error}"))
 }
+
+fn migration(error: rusqlite_migration::Error) -> RepositoryError {
+    RepositoryError::Invariant(format!("sqlite migration: {error}"))
+}
+
+fn worker(error: tokio_rusqlite::Error<RepositoryError>) -> RepositoryError {
+    match error {
+        tokio_rusqlite::Error::Error(error) => error,
+        other => RepositoryError::Invariant(format!("sqlite worker: {other}")),
+    }
+}
+
 #[async_trait]
 impl Repository for SqliteRepository {
-    async fn save_session(&self, v: Session) -> Result<(), RepositoryError> {
-        let c = self.connection.lock().await;
-        c.execute(
-            "INSERT OR REPLACE INTO sessions(id,data) VALUES(?1,?2)",
-            rusqlite::params![v.id.to_string(), Self::encode(&v)?],
-        )
-        .map_err(db)?;
-        Ok(())
-    }
-    async fn session(&self, id: SessionId) -> Result<Option<Session>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let v = c
-            .query_row(
-                "SELECT data FROM sessions WHERE id=?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        v.map(Self::decode).transpose()
-    }
-    async fn sessions(&self) -> Result<Vec<Session>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let mut q = c
-            .prepare("SELECT data FROM sessions ORDER BY rowid")
-            .map_err(db)?;
-        q.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|v| Self::decode(v.map_err(db)?))
-            .collect()
-    }
-    async fn save_approval(&self, v: Approval) -> Result<(), RepositoryError> {
-        let c = self.connection.lock().await;
-        c.execute(
-            "INSERT OR REPLACE INTO approvals(id,task_id,data) VALUES(?1,?2,?3)",
-            rusqlite::params![v.id.to_string(), v.task_id.to_string(), Self::encode(&v)?],
-        )
-        .map_err(db)?;
-        Ok(())
-    }
-    async fn approval(&self, id: ApprovalId) -> Result<Option<Approval>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let value = c
-            .query_row(
-                "SELECT data FROM approvals WHERE id=?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        value.map(Self::decode).transpose()
-    }
-    async fn approvals(&self, s: SessionId) -> Result<Vec<Approval>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let task_ids = {
-            let mut events = c
-                .prepare("SELECT data FROM events WHERE session_id=?1")
+    async fn save_session(&self, value: Session) -> Result<(), RepositoryError> {
+        let id = value.id.to_string();
+        let data = Self::encode(&value)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO sessions(id,data) VALUES(?1,?2)",
+                    rusqlite::params![id, data],
+                )
                 .map_err(db)?;
-            events
-                .query_map([s.to_string()], |r| r.get::<_, String>(0))
+            Ok(())
+        })
+        .await
+    }
+
+    async fn session(&self, id: SessionId) -> Result<Option<Session>, RepositoryError> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT data FROM sessions WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
                 .map_err(db)?
-                .map(|value| {
-                    let event: CanonicalEvent = Self::decode(value.map_err(db)?)?;
-                    Ok(event.task_id)
+                .map(Self::decode)
+                .transpose()
+        })
+        .await
+    }
+
+    async fn sessions(&self) -> Result<Vec<Session>, RepositoryError> {
+        self.call(|connection| {
+            let mut query = connection
+                .prepare("SELECT data FROM sessions ORDER BY rowid")
+                .map_err(db)?;
+            query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .collect()
+        })
+        .await
+    }
+
+    async fn save_approval(&self, value: Approval) -> Result<(), RepositoryError> {
+        let id = value.id.to_string();
+        let task_id = value.task_id.to_string();
+        let data = Self::encode(&value)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO approvals(id,task_id,data) VALUES(?1,?2,?3)",
+                    rusqlite::params![id, task_id, data],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn approval(&self, id: ApprovalId) -> Result<Option<Approval>, RepositoryError> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT data FROM approvals WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)?
+                .map(Self::decode)
+                .transpose()
+        })
+        .await
+    }
+
+    async fn approvals(&self, session: SessionId) -> Result<Vec<Approval>, RepositoryError> {
+        self.call(move |connection| {
+            let task_ids = {
+                let mut events = connection
+                    .prepare("SELECT data FROM events WHERE session_id=?1")
+                    .map_err(db)?;
+                events
+                    .query_map([session.to_string()], |row| row.get::<_, String>(0))
+                    .map_err(db)?
+                    .map(|value| {
+                        let event: CanonicalEvent = Self::decode(value.map_err(db)?)?;
+                        Ok(event.task_id)
+                    })
+                    .collect::<Result<std::collections::HashSet<_>, RepositoryError>>()?
+            };
+            let mut approvals = connection
+                .prepare("SELECT data FROM approvals ORDER BY rowid")
+                .map_err(db)?;
+            approvals
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .filter_map(|value: Result<Approval, RepositoryError>| match value {
+                    Ok(approval) if task_ids.contains(&Some(approval.task_id)) => {
+                        Some(Ok(approval))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
                 })
-                .collect::<Result<std::collections::HashSet<_>, RepositoryError>>()?
-        };
-        let mut approvals = c
-            .prepare("SELECT data FROM approvals ORDER BY rowid")
-            .map_err(db)?;
-        approvals
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|value| Self::decode(value.map_err(db)?))
-            .filter_map(|value: Result<Approval, RepositoryError>| match value {
-                Ok(approval) if task_ids.contains(&Some(approval.task_id)) => Some(Ok(approval)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
-    async fn save_artifact(&self, v: Artifact) -> Result<(), RepositoryError> {
-        let c = self.connection.lock().await;
-        c.execute(
-            "INSERT OR REPLACE INTO artifacts(id,task_id,data) VALUES(?1,?2,?3)",
-            rusqlite::params![v.id.to_string(), v.producer.to_string(), Self::encode(&v)?],
-        )
-        .map_err(db)?;
-        Ok(())
+
+    async fn save_artifact(&self, value: Artifact) -> Result<(), RepositoryError> {
+        let id = value.id.to_string();
+        let task_id = value.producer.to_string();
+        let data = Self::encode(&value)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO artifacts(id,task_id,data) VALUES(?1,?2,?3)",
+                    rusqlite::params![id, task_id, data],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
     }
+
     async fn artifacts(&self) -> Result<Vec<Artifact>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let mut q = c
-            .prepare("SELECT data FROM artifacts ORDER BY rowid")
-            .map_err(db)?;
-        q.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|v| Self::decode(v.map_err(db)?))
-            .collect()
+        self.call(|connection| {
+            let mut query = connection
+                .prepare("SELECT data FROM artifacts ORDER BY rowid")
+                .map_err(db)?;
+            query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .collect()
+        })
+        .await
     }
-    async fn save_dependency(&self, v: TaskDependency) -> Result<(), RepositoryError> {
-        let c = self.connection.lock().await;
-        c.execute(
-            "INSERT OR REPLACE INTO task_dependencies(task_id,depends_on,data) VALUES(?1,?2,?3)",
-            rusqlite::params![
-                v.task_id.to_string(),
-                v.depends_on.to_string(),
-                Self::encode(&v)?
-            ],
-        )
-        .map_err(db)?;
-        Ok(())
+
+    async fn save_dependency(&self, value: TaskDependency) -> Result<(), RepositoryError> {
+        let task_id = value.task_id.to_string();
+        let depends_on = value.depends_on.to_string();
+        let data = Self::encode(&value)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO task_dependencies(task_id,depends_on,data) VALUES(?1,?2,?3)",
+                    rusqlite::params![task_id, depends_on, data],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
     }
+
     async fn dependencies(&self) -> Result<Vec<TaskDependency>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let mut q = c
-            .prepare("SELECT data FROM task_dependencies ORDER BY rowid")
-            .map_err(db)?;
-        q.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|v| Self::decode(v.map_err(db)?))
-            .collect()
+        self.call(|connection| {
+            let mut query = connection
+                .prepare("SELECT data FROM task_dependencies ORDER BY rowid")
+                .map_err(db)?;
+            query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .collect()
+        })
+        .await
     }
-    async fn save_agent(&self, v: AgentProfile) -> Result<(), RepositoryError> {
-        let c = self.connection.lock().await;
-        c.execute(
-            "INSERT OR REPLACE INTO agents(id,data) VALUES(?1,?2)",
-            rusqlite::params![v.id.to_string(), Self::encode(&v)?],
-        )
-        .map_err(db)?;
-        Ok(())
+
+    async fn save_agent(&self, value: AgentProfile) -> Result<(), RepositoryError> {
+        let id = value.id.to_string();
+        let data = Self::encode(&value)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO agents(id,data) VALUES(?1,?2)",
+                    rusqlite::params![id, data],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
     }
+
     async fn agent(&self, id: AgentId) -> Result<Option<AgentProfile>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let v = c
-            .query_row(
-                "SELECT data FROM agents WHERE id=?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        v.map(Self::decode).transpose()
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT data FROM agents WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)?
+                .map(Self::decode)
+                .transpose()
+        })
+        .await
     }
+
     async fn agents(&self) -> Result<Vec<AgentProfile>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let mut q = c
-            .prepare("SELECT data FROM agents ORDER BY rowid")
-            .map_err(db)?;
-        q.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|v| Self::decode(v.map_err(db)?))
-            .collect()
+        self.call(|connection| {
+            let mut query = connection
+                .prepare("SELECT data FROM agents ORDER BY rowid")
+                .map_err(db)?;
+            query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .collect()
+        })
+        .await
     }
-    async fn save_task(&self, v: Task) -> Result<(), RepositoryError> {
-        let c = self.connection.lock().await;
-        c.execute(
-            "INSERT OR REPLACE INTO tasks(id,data) VALUES(?1,?2)",
-            rusqlite::params![v.id.to_string(), Self::encode(&v)?],
-        )
-        .map_err(db)?;
-        Ok(())
+
+    async fn save_task(&self, value: Task) -> Result<(), RepositoryError> {
+        let id = value.id.to_string();
+        let data = Self::encode(&value)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO tasks(id,data) VALUES(?1,?2)",
+                    rusqlite::params![id, data],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
     }
+
     async fn task(&self, id: TaskId) -> Result<Option<Task>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let v = c
-            .query_row(
-                "SELECT data FROM tasks WHERE id=?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        v.map(Self::decode).transpose()
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT data FROM tasks WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)?
+                .map(Self::decode)
+                .transpose()
+        })
+        .await
     }
+
     async fn tasks(&self) -> Result<Vec<Task>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let mut q = c
-            .prepare("SELECT data FROM tasks ORDER BY rowid")
-            .map_err(db)?;
-        q.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|v| Self::decode(v.map_err(db)?))
-            .collect()
+        self.call(|connection| {
+            let mut query = connection
+                .prepare("SELECT data FROM tasks ORDER BY rowid")
+                .map_err(db)?;
+            query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .collect()
+        })
+        .await
     }
-    async fn append_event(&self, v: CanonicalEvent) -> Result<(), RepositoryError> {
-        let mut c = self.connection.lock().await;
-        let tx = c.transaction().map_err(db)?;
-        insert_event(&tx, &v)?;
-        tx.commit().map_err(db)
+
+    async fn append_event(&self, value: CanonicalEvent) -> Result<(), RepositoryError> {
+        self.call(move |connection| {
+            let transaction = connection.transaction().map_err(db)?;
+            insert_event(&transaction, &value)?;
+            transaction.commit().map_err(db)
+        })
+        .await
     }
-    async fn events(&self, s: SessionId) -> Result<Vec<CanonicalEvent>, RepositoryError> {
-        let c = self.connection.lock().await;
-        let mut q = c
-            .prepare("SELECT data FROM events WHERE session_id=?1 ORDER BY created_at,rowid")
-            .map_err(db)?;
-        q.query_map([s.to_string()], |r| r.get::<_, String>(0))
-            .map_err(db)?
-            .map(|v| Self::decode(v.map_err(db)?))
-            .collect()
+
+    async fn events(&self, session: SessionId) -> Result<Vec<CanonicalEvent>, RepositoryError> {
+        self.call(move |connection| {
+            let mut query = connection
+                .prepare("SELECT data FROM events WHERE session_id=?1 ORDER BY created_at,rowid")
+                .map_err(db)?;
+            query
+                .query_map([session.to_string()], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .map(|value| Self::decode(value.map_err(db)?))
+                .collect()
+        })
+        .await
     }
+
     async fn update_task_status(
         &self,
         id: TaskId,
         to: TaskStatus,
     ) -> Result<Task, RepositoryError> {
-        let mut task = self.task(id).await?.ok_or(RepositoryError::NotFound)?;
-        task.transition(to).map_err(invariant)?;
-        self.save_task(task.clone()).await?;
-        Ok(task)
+        self.call(move |connection| {
+            let transaction = connection.transaction().map_err(db)?;
+            let mut task = load_task(&transaction, id)?;
+            task.transition(to).map_err(invariant)?;
+            transaction
+                .execute(
+                    "UPDATE tasks SET data=?2 WHERE id=?1",
+                    rusqlite::params![id.to_string(), Self::encode(&task)?],
+                )
+                .map_err(db)?;
+            transaction.commit().map_err(db)?;
+            Ok(task)
+        })
+        .await
     }
+
     async fn transition_task_with_event(
         &self,
         id: TaskId,
         to: TaskStatus,
         event: CanonicalEvent,
     ) -> Result<Task, RepositoryError> {
-        let mut c = self.connection.lock().await;
-        let tx = c.transaction().map_err(db)?;
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT data FROM tasks WHERE id=?1",
-                [id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        let mut task: Task = raw
-            .map(Self::decode)
-            .transpose()?
-            .ok_or(RepositoryError::NotFound)?;
-        task.transition(to).map_err(invariant)?;
-        tx.execute(
-            "UPDATE tasks SET data=?2 WHERE id=?1",
-            rusqlite::params![id.to_string(), Self::encode(&task)?],
-        )
-        .map_err(db)?;
-        insert_event(&tx, &event)?;
-        tx.commit().map_err(db)?;
-        Ok(task)
+        self.call(move |connection| {
+            let transaction = connection.transaction().map_err(db)?;
+            let mut task = load_task(&transaction, id)?;
+            task.transition(to).map_err(invariant)?;
+            transaction
+                .execute(
+                    "UPDATE tasks SET data=?2 WHERE id=?1",
+                    rusqlite::params![id.to_string(), Self::encode(&task)?],
+                )
+                .map_err(db)?;
+            insert_event(&transaction, &event)?;
+            transaction.commit().map_err(db)?;
+            Ok(task)
+        })
+        .await
     }
+}
+
+fn load_task(transaction: &rusqlite::Transaction<'_>, id: TaskId) -> Result<Task, RepositoryError> {
+    transaction
+        .query_row(
+            "SELECT data FROM tasks WHERE id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?
+        .map(SqliteRepository::decode)
+        .transpose()?
+        .ok_or(RepositoryError::NotFound)
 }
 fn insert_event(tx: &rusqlite::Transaction<'_>, v: &CanonicalEvent) -> Result<(), RepositoryError> {
     tx.execute(
@@ -509,18 +655,79 @@ mod tests {
     async fn sqlite_contract_and_reopen() {
         let path = std::env::temp_dir().join(format!("voff-{}.db", uuid::Uuid::new_v4()));
         {
-            let r = SqliteRepository::open(&path).unwrap();
+            let r = SqliteRepository::open(&path).await.unwrap();
             contract(&r).await;
         }
         {
-            let r = SqliteRepository::open(&path).unwrap();
+            let r = SqliteRepository::open(&path).await.unwrap();
             assert_eq!(r.tasks().await.unwrap().len(), 1);
         }
         let _ = std::fs::remove_file(path);
     }
+
+    #[tokio::test]
+    async fn sqlite_applies_all_embedded_migrations() {
+        let r = SqliteRepository::open_in_memory().await.unwrap();
+        let version = r
+            .connection
+            .call(|connection| {
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[tokio::test]
+    async fn sqlite_adopts_the_legacy_unversioned_schema() {
+        let path = std::env::temp_dir().join(format!("voff-legacy-{}.db", uuid::Uuid::new_v4()));
+        let session = Session {
+            id: SessionId::new(),
+            formation_id: FormationId::new(),
+            workspace: ".".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let id = session.id;
+        let data = serde_json::to_string(&session).unwrap();
+        let legacy = tokio_rusqlite::Connection::open(&path).await.unwrap();
+        legacy
+            .call(move |connection| {
+                connection.execute_batch(
+                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);\
+                     CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+                )?;
+                connection.execute(
+                    "INSERT INTO sessions(id, data) VALUES (?1, ?2)",
+                    rusqlite::params![id.to_string(), data],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        legacy.close().await.unwrap();
+
+        let r = SqliteRepository::open(&path).await.unwrap();
+        let restored = r.session(id).await.unwrap().unwrap();
+        assert_eq!(restored.id, session.id);
+        assert_eq!(restored.formation_id, session.formation_id);
+        assert_eq!(restored.workspace, session.workspace);
+        assert_eq!(restored.created_at, session.created_at);
+        assert_eq!(r.dependencies().await.unwrap(), Vec::new());
+        let version = r
+            .connection
+            .call(|connection| {
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, 3);
+        drop(r);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn sqlite_transition_and_event_are_persisted_together() {
-        let r = SqliteRepository::open_in_memory().unwrap();
+        let r = SqliteRepository::open_in_memory().await.unwrap();
         let session = SessionId::new();
         let mut task = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());
         task.transition(TaskStatus::Ready).unwrap();
@@ -546,7 +753,7 @@ mod tests {
     }
     #[tokio::test]
     async fn sqlite_persists_approvals_and_artifacts() {
-        let r = SqliteRepository::open_in_memory().unwrap();
+        let r = SqliteRepository::open_in_memory().await.unwrap();
         let session = SessionId::new();
         let task = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());
         r.save_task(task.clone()).await.unwrap();
@@ -588,7 +795,7 @@ mod tests {
     }
     #[tokio::test]
     async fn sqlite_dependency_survives_query() {
-        let r = SqliteRepository::open_in_memory().unwrap();
+        let r = SqliteRepository::open_in_memory().await.unwrap();
         let first = Task::root(AgentId::new(), "first", vec![], TaskLimits::default());
         let second = Task::root(AgentId::new(), "second", vec![], TaskLimits::default());
         r.save_task(first.clone()).await.unwrap();
@@ -612,7 +819,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("voff-graph-{}.db", uuid::Uuid::new_v4()));
         let (first_id, integration_id);
         {
-            let r = SqliteRepository::open(&path).unwrap();
+            let r = SqliteRepository::open(&path).await.unwrap();
             let mut first = Task::root(AgentId::new(), "worker", vec![], TaskLimits::default());
             first.transition(TaskStatus::Ready).unwrap();
             first.transition(TaskStatus::Running).unwrap();
@@ -636,7 +843,7 @@ mod tests {
             .unwrap();
         }
         {
-            let r = SqliteRepository::open(&path).unwrap();
+            let r = SqliteRepository::open(&path).await.unwrap();
             assert_eq!(
                 r.dependencies().await.unwrap(),
                 vec![TaskDependency {

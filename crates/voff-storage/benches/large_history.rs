@@ -5,7 +5,9 @@ use voff_storage::{Repository, SqliteRepository};
 fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
-        let repository = SqliteRepository::open_in_memory().expect("repository");
+        let repository = SqliteRepository::open_in_memory()
+            .await
+            .expect("repository");
         let session = Session {
             id: SessionId::new(),
             formation_id: FormationId::new(),

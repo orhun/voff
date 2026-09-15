@@ -12,7 +12,8 @@ serde.workspace=true
 thiserror.workspace=true
 tokio.workspace=true
 uuid.workspace=true
-rusqlite={version="0.32",features=["bundled"]}
+rusqlite_migration="=2.3.0"
+tokio-rusqlite={version="0.7",features=["bundled"]}
 serde_json="1"
 [lints]
 workspace=true

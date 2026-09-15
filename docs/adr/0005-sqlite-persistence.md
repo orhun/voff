@@ -11,3 +11,4 @@ Session history survives restart and storage remains behind the repository port.
 ## Status
 Accepted
 
+The SQLite execution and migration mechanisms were refined by ADR 0016.

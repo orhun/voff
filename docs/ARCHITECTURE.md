@@ -144,14 +144,15 @@ Post-MVP isolation may use Git worktrees or sandboxed workers. Do not let multip
 ## 10. Storage
 
 - SQLite in WAL mode for sessions, profiles, tasks, messages, events, approvals and usage.
+- SQLite calls run on a dedicated worker thread so database work never blocks the async runtime.
 - Content-addressed files for large outputs/artifacts.
 - Transactions for task transition plus corresponding event.
-- Schema migrations embedded and tested.
+- Versioned migrations are embedded, applied through `rusqlite_migration`, and tracked with SQLite's `user_version` pragma.
 - Sensitive request bodies redacted or optionally excluded.
 
 Suggested tables:
 
-`sessions`, `agents`, `formation_snapshots`, `tasks`, `task_dependencies`, `messages`, `tool_calls`, `approvals`, `artifacts`, `events`, `usage_records`, `schema_migrations`.
+`sessions`, `agents`, `formation_snapshots`, `tasks`, `task_dependencies`, `messages`, `tool_calls`, `approvals`, `artifacts`, `events`, `usage_records`.
 
 ## 11. TUI architecture
 

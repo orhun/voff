@@ -255,7 +255,7 @@ async fn run(
 ) -> Result<()> {
     let config = load(path)?;
     let default_provider = default_provider_id(&config);
-    let repo = Arc::new(SqliteRepository::open(&config.state_path())?);
+    let repo = Arc::new(SqliteRepository::open(&config.state_path()).await?);
     let sessions = repo.sessions().await?;
     let session = if let Some(id) = selected_session {
         sessions
@@ -428,7 +428,7 @@ async fn run(
 
 async fn list_sessions(path: &Path) -> Result<()> {
     let config = load(path)?;
-    let repository = SqliteRepository::open(&config.state_path())?;
+    let repository = SqliteRepository::open(&config.state_path()).await?;
     let mut sessions = repository.sessions().await?;
     sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
     if sessions.is_empty() {
@@ -492,7 +492,7 @@ async fn doctor(path: &Path) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let repo = SqliteRepository::open(&config.state_path())?;
+    let repo = SqliteRepository::open(&config.state_path()).await?;
     println!(
         "[ok] SQLite state {} ({} session(s))",
         config.state_path().display(),
@@ -548,7 +548,7 @@ struct DiagnosticBundle {
 
 async fn export(path: &Path, output: &Path) -> Result<()> {
     let config = load(path)?;
-    let repo = SqliteRepository::open(&config.state_path())?;
+    let repo = SqliteRepository::open(&config.state_path()).await?;
     let session = repo
         .sessions()
         .await?
