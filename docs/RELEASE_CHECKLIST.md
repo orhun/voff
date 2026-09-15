@@ -6,7 +6,7 @@
 - [ ] Move relevant Unreleased entries under the dated beta heading.
 - [ ] Confirm `LICENSE-MIT`, `LICENSE-APACHE`, `SECURITY.md`, and
       `CODE_OF_CONDUCT.md` are included.
-- [ ] Ensure no `.agentmux` state, diagnostics, credentials, or local artifacts
+- [ ] Ensure no `.voff` state, diagnostics, credentials, or local artifacts
       are tracked.
 
 ## Quality gate
@@ -14,9 +14,9 @@
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace --all-features`
-- [ ] `cargo bench -p agentmux-storage --bench large_history`
+- [ ] `cargo bench -p voff-storage --bench large_history`
 - [ ] `cargo deny check`
-- [ ] `cargo build --locked --release -p agentmux-cli`
+- [ ] `cargo build --locked --release -p voff-cli`
 
 ## GitHub dry run
 
@@ -28,8 +28,8 @@
 ## Artifact verification
 
 - [ ] Verify every `.sha256` file.
-- [ ] Extract every archive and confirm it contains only the `agentmux` binary.
-- [ ] Run `agentmux --version` and `agentmux init --help` on the matching OS and
+- [ ] Extract every archive and confirm it contains only the `voff` binary.
+- [ ] Run `voff --version` and `voff init --help` on the matching OS and
       architecture.
 - [ ] Confirm the binary reports `0.1.0-beta.1`.
 

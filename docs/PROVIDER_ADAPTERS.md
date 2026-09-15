@@ -1,8 +1,8 @@
 # Provider Adapter Development
 
-Provider adapters translate an external model API into AgentMux's canonical
+Provider adapters translate an external model API into voff's canonical
 contract. Provider-specific request, response, SDK, and error types must remain
-inside `agentmux-providers`; the engine depends only on `ModelProvider`.
+inside `voff-providers`; the engine depends only on `ModelProvider`.
 
 ## Implementation checklist
 
@@ -25,15 +25,15 @@ inside `agentmux-providers`; the engine depends only on `ModelProvider`.
 
 ## Contract test support
 
-Enable `agentmux-provider`'s `test-support` feature in the adapter crate's dev
+Enable `voff-provider`'s `test-support` feature in the adapter crate's dev
 dependencies:
 
 ```toml
 [dev-dependencies]
-agentmux-provider = { path = "../agentmux-provider", features = ["test-support"] }
+voff-provider = { path = "../voff-provider", features = ["test-support"] }
 ```
 
-The `agentmux_provider::contract` module provides:
+The `voff_provider::contract` module provides:
 
 - `request(model)` for a canonical probe request;
 - `run(provider, request, cancellation)` for concurrently draining bounded

@@ -1,6 +1,6 @@
 # Security Policy
 
-AgentMux executes model-directed workflows around source code, local files, and
+voff executes model-directed workflows around source code, local files, and
 provider credentials. Security reports are welcome and should be handled
 privately until a coordinated disclosure is ready.
 
@@ -33,7 +33,7 @@ Include when possible:
 
 Never include real API keys, customer data, private repository contents, or
 other people's personal data. Use synthetic values and redact diagnostic
-bundles with `agentmux export` before attaching them.
+bundles with `voff export` before attaching them.
 
 ## Response process
 
@@ -63,7 +63,7 @@ boundary can be bypassed:
 
 Model hallucination, low-quality suggestions, expected provider billing, and
 denied operations are generally not vulnerabilities unless they bypass an
-enforced AgentMux boundary.
+enforced voff boundary.
 
 ## Safe research
 
