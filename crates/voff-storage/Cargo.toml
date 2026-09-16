@@ -1,23 +1,23 @@
 [package]
-name="voff-storage"
-version.workspace=true
-edition.workspace=true
-rust-version.workspace=true
-license.workspace=true
+name = "voff-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 [dependencies]
-voff-core.workspace=true
-async-trait.workspace=true
-serde.workspace=true
-thiserror.workspace=true
-tokio.workspace=true
-rusqlite_migration="=2.3.0"
-tokio-rusqlite={version="0.7",features=["bundled"]}
-serde_json="1"
+voff-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rusqlite_migration = "=2.3.0"
+tokio-rusqlite = { version = "0.7", features = ["bundled"] }
+serde_json = "1"
 [lints]
-workspace=true
+workspace = true
 [[bench]]
-name="large_history"
-harness=false
+name = "large_history"
+harness = false
 [dev-dependencies]
-chrono.workspace=true
-uuid.workspace=true
+chrono.workspace = true
+uuid.workspace = true
