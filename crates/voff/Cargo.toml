@@ -1,0 +1,30 @@
+[package]
+name = "voff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[[bin]]
+name = "voff"
+path = "src/main.rs"
+[dependencies]
+voff-core.workspace = true
+voff-provider.workspace = true
+voff-storage.workspace = true
+voff-engine.workspace = true
+voff-tools = { path = "../voff-tools", version = "=0.1.0-beta.1" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+chrono.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+toml = "0.8"
+[lints]
+workspace = true
+[dev-dependencies]
+tempfile = "3"

@@ -9,19 +9,24 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-agentmux-core = { path = "crates/agentmux-core", version = "=0.1.0-beta.1" }
-agentmux-provider = { path = "crates/agentmux-provider", version = "=0.1.0-beta.1" }
-agentmux-providers = { path = "crates/agentmux-providers", version = "=0.1.0-beta.1" }
-agentmux-storage = { path = "crates/agentmux-storage", version = "=0.1.0-beta.1" }
-agentmux-engine = { path = "crates/agentmux-engine", version = "=0.1.0-beta.1" }
-agentmux-tui = { path = "crates/agentmux-tui", version = "=0.1.0-beta.1" }
+voff-core = { path = "crates/voff-core", version = "=0.1.0-beta.1" }
+voff-provider = { path = "crates/voff-provider", version = "=0.1.0-beta.1" }
+voff-storage = { path = "crates/voff-storage", version = "=0.1.0-beta.1" }
+voff-engine = { path = "crates/voff-engine", version = "=0.1.0-beta.1" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 

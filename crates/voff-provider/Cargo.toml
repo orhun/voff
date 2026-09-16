@@ -1,0 +1,23 @@
+[package]
+name = "voff-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[features]
+test-support = []
+[dependencies]
+voff-core.workspace = true
+async-trait.workspace = true
+futures-util = "0.3"
+rig-core = { version = "0.42", default-features = false, features = [
+  "reqwest",
+  "rustls",
+] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+[lints]
+workspace = true

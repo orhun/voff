@@ -1,0 +1,68 @@
+config_version = 1
+
+[workspace]
+root = "."
+state_file = ".voff/voff.db"
+
+[runtime]
+default_timeout_seconds = 1800
+event_channel_capacity = 128
+
+# Backward-compatible fallback required by config schema v1.
+[provider]
+kind = "mock"
+
+[[providers]]
+id = "cloud"
+kind = "openai"
+model = "gpt-5-mini"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers]]
+id = "local"
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen3:4b"
+
+[agent]
+name = "Solo fallback"
+role = "software_developer"
+system_prompt = "Return verifiable results."
+tools = ["file.read", "search.text"]
+
+[formation]
+name = "Cloud lead and local implementation"
+entry_agent = "lead"
+max_parallel_tasks = 2
+
+[[agents]]
+id = "lead"
+name = "Cloud Lead"
+role = "technical_lead"
+provider = "cloud"
+model = "gpt-5-mini"
+system_prompt = "Split work into bounded tasks and review evidence."
+tools = ["file.read", "search.text", "task.delegate", "review.request"]
+
+[agents.delegation]
+allowed_targets = ["implementer", "reviewer"]
+max_depth = 2
+max_children = 5
+
+[[agents]]
+id = "implementer"
+name = "Local Implementer"
+role = "software_developer"
+provider = "local"
+model = "qwen3:4b"
+system_prompt = "Implement scoped changes and provide verifiable evidence."
+tools = ["file.read", "search.text", "file.patch", "process.test"]
+
+[[agents]]
+id = "reviewer"
+name = "Cloud Reviewer"
+role = "code_reviewer"
+provider = "cloud"
+model = "gpt-5-mini"
+system_prompt = "Review artifacts against acceptance criteria."
+tools = ["file.read", "search.text", "review.request"]

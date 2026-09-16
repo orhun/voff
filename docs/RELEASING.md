@@ -1,4 +1,4 @@
-# Releasing AgentMux
+# Releasing voff
 
 Use the auditable checklist in `docs/RELEASE_CHECKLIST.md` for every beta.
 
@@ -15,8 +15,8 @@ Run the local quality gate:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo bench -p agentmux-storage --bench large_history
-cargo build --locked --release -p agentmux-cli
+cargo bench -p voff-storage --bench large_history
+cargo build --locked --release -p voff
 cargo deny check
 ```
 
@@ -25,7 +25,7 @@ cargo deny check
 Create and push a signed or annotated semantic-version tag:
 
 ```bash
-git tag -a v0.1.0-beta.1 -m "AgentMux v0.1.0-beta.1"
+git tag -a v0.1.0-beta.1 -m "voff v0.1.0-beta.1"
 git push origin v0.1.0-beta.1
 ```
 
@@ -40,20 +40,20 @@ publishing a release.
 On Linux:
 
 ```bash
-sha256sum -c agentmux-linux-x86_64.tar.gz.sha256
+sha256sum -c voff-linux-x86_64.tar.gz.sha256
 ```
 
 On macOS:
 
 ```bash
-shasum -a 256 -c agentmux-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c voff-macos-aarch64.tar.gz.sha256
 ```
 
 After extracting, verify the binary before installation:
 
 ```bash
-./agentmux --version
-./agentmux init --help
+./voff --version
+./voff init --help
 ```
 
 Release archives include a project distributed under the user's choice of the

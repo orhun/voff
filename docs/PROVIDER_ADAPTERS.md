@@ -1,8 +1,13 @@
 # Provider Adapter Development
 
-Provider adapters translate an external model API into AgentMux's canonical
-contract. Provider-specific request, response, SDK, and error types must remain
-inside `agentmux-providers`; the engine depends only on `ModelProvider`.
+Provider adapters translate an external model API into voff's canonical
+contract. OpenAI and Ollama transports use `rig-core`, but Rig and other
+provider-specific types must remain inside the `voff-provider` adapter module;
+the engine depends only on `ModelProvider`.
+
+Use Rig's low-level completion model directly. Do not use an SDK-owned agent
+loop or allow the provider layer to execute tools; tool requests must return to
+voff for policy evaluation and approval.
 
 ## Implementation checklist
 
@@ -25,15 +30,7 @@ inside `agentmux-providers`; the engine depends only on `ModelProvider`.
 
 ## Contract test support
 
-Enable `agentmux-provider`'s `test-support` feature in the adapter crate's dev
-dependencies:
-
-```toml
-[dev-dependencies]
-agentmux-provider = { path = "../agentmux-provider", features = ["test-support"] }
-```
-
-The `agentmux_provider::contract` module provides:
+The `voff_provider::contract` module provides:
 
 - `request(model)` for a canonical probe request;
 - `run(provider, request, cancellation)` for concurrently draining bounded

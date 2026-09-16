@@ -1,7 +1,8 @@
 /target
 .DS_Store
-.agentmux/*.db
-.agentmux/*.db-shm
-.agentmux/*.db-wal
-.agentmux/diagnostic*.json
-.agentmux/backups/
+.voff/*.db
+.voff/*.db-shm
+.voff/*.db-wal
+.voff/diagnostic*.json
+.voff/backups/
+.voff/config.toml

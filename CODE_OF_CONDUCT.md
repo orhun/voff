@@ -2,7 +2,7 @@
 
 ## Our commitment
 
-AgentMux contributors, maintainers, and community members commit to providing a
+voff contributors, maintainers, and community members commit to providing a
 welcoming, safe, and constructive environment regardless of experience,
 identity, background, ability, appearance, or personal characteristics.
 
@@ -28,7 +28,7 @@ identity, background, ability, appearance, or personal characteristics.
 ## Scope
 
 This policy applies in project repositories, issues, reviews, discussions,
-events, and other spaces where someone represents AgentMux. It also applies to
+events, and other spaces where someone represents voff. It also applies to
 private interactions that materially affect community safety.
 
 ## Reporting and enforcement
