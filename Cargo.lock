@@ -2693,7 +2693,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
- "tracing",
  "tracing-subscriber",
  "voff-core",
  "voff-engine",

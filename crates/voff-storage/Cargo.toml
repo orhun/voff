@@ -7,11 +7,9 @@ license.workspace=true
 [dependencies]
 voff-core.workspace=true
 async-trait.workspace=true
-chrono.workspace=true
 serde.workspace=true
 thiserror.workspace=true
 tokio.workspace=true
-uuid.workspace=true
 rusqlite_migration="=2.3.0"
 tokio-rusqlite={version="0.7",features=["bundled"]}
 serde_json="1"
@@ -20,3 +18,6 @@ workspace=true
 [[bench]]
 name="large_history"
 harness=false
+[dev-dependencies]
+chrono.workspace=true
+uuid.workspace=true

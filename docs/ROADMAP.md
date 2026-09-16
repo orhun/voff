@@ -18,10 +18,10 @@ documented.
 
 - Versioned TOML config and validation: `voff` config module, `.voff/config.example.toml`.
 - Real provider: local-only Ollama adapter in `voff-provider`, ADR 0006.
-- Session creation, SQLite migrations, atomic transitions/events and restart recovery: `voff-storage`, `voff-cli`, ADR 0005.
+- Session creation, SQLite migrations, atomic transitions/events and restart recovery: `voff-storage`, `voff`, ADR 0005.
 - Streaming, cancellation and usage: provider/engine contract tests and `usage_records`.
 - Scoped read/search: `voff-tools` security tests, ADR 0007.
-- Resumable single-agent composition: `voff-cli run`, configured Ratatui projection.
+- Resumable single-agent composition: `voff run`, configured Ratatui projection.
 - Bounded workspace evidence supplied to the model: `ScopedWorkspace::context_bundle`, engine workspace context, traversal/size tests.
 
 Phase 1 exit gate is complete: a configured Ollama agent can run and cancel a task, receives bounded workspace evidence, records streaming output/usage in SQLite, and restores the same session history after restart.

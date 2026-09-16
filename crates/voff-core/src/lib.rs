@@ -71,12 +71,6 @@ pub struct AgentProfile {
     pub delegation_limits: Option<TaskLimits>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Formation {
-    pub id: FormationId,
-    pub name: String,
-    pub agents: Vec<AgentId>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: ArtifactId,
     pub producer: TaskId,

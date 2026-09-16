@@ -16,7 +16,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo bench -p voff-storage --bench large_history
-cargo build --locked --release -p voff-cli
+cargo build --locked --release -p voff
 cargo deny check
 ```
 

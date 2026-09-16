@@ -36,7 +36,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build locked release binary
-        run: cargo build --locked --release -p voff-cli --target "${{ matrix.target }}"
+        run: cargo build --locked --release -p voff --target "${{ matrix.target }}"
       - name: Package binary
         shell: bash
         run: |

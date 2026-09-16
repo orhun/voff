@@ -10,16 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
-use voff_core::{ArtifactId, TaskId, ToolCallId};
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ToolProposal {
-    pub id: ToolCallId,
-    pub task_id: TaskId,
-    pub name: String,
-    pub version: String,
-    pub arguments_json: String,
-    pub reason: String,
-}
+use voff_core::{ArtifactId, TaskId};
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("workspace path is outside the authorized root")]

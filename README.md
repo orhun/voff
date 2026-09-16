@@ -20,9 +20,9 @@ and a keyboard-driven Ratatui interface.
 git clone https://github.com/voffsh/voff.git
 cd voff
 ollama pull qwen3:4b
-cargo run -p voff-cli -- init
-cargo run -p voff-cli -- doctor
-cargo run -p voff-cli -- run --objective "Inspect this repository and suggest the next safe improvement"
+cargo run -p voff -- init
+cargo run -p voff -- doctor
+cargo run -p voff -- run --objective "Inspect this repository and suggest the next safe improvement"
 ```
 
 `voff init` asks for a `solo` or `team` template, `ollama` or `openai`, and
@@ -31,7 +31,7 @@ a model, then creates
 repeatable setup, use `--provider`, `--model`, and `--output`:
 
 ```bash
-cargo run -p voff-cli -- init \
+cargo run -p voff -- init \
   --template team \
   --provider ollama \
   --model qwen3:4b \
@@ -45,14 +45,14 @@ new run.
 List stored sessions and resume a specific one:
 
 ```bash
-cargo run -p voff-cli -- sessions
-cargo run -p voff-cli -- run --session ses_...
+cargo run -p voff -- sessions
+cargo run -p voff -- run --session ses_...
 ```
 
 Export the newest session as a redacted diagnostic bundle:
 
 ```bash
-cargo run -p voff-cli -- export \
+cargo run -p voff -- export \
   --config .voff/heterogeneous.example.toml \
   --output .voff/diagnostic.json
 ```
@@ -74,8 +74,8 @@ export OPENAI_API_KEY="$(security find-generic-password -a "$USER" -s "voff-open
 Then validate and run the example formation:
 
 ```bash
-cargo run -p voff-cli -- doctor --config .voff/heterogeneous.example.toml
-cargo run -p voff-cli -- run \
+cargo run -p voff -- doctor --config .voff/heterogeneous.example.toml
+cargo run -p voff -- run \
   --config .voff/heterogeneous.example.toml \
   --objective "Analyze the project; delegate implementation and review to suitable agents"
 ```
