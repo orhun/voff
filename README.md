@@ -64,7 +64,20 @@ before sharing it because repository/model content is untrusted input.
 
 ## Heterogeneous OpenAI + Ollama team
 
-Keep credentials outside TOML files. On macOS, store the API key in Keychain:
+Keep credentials outside TOML files. Create an optional `.env` in the directory where you invoke
+voff (no parent directories are searched):
+
+```dotenv
+OPENAI_API_KEY=YOUR_API_KEY
+```
+
+Existing process environment variables override `.env`. OpenAI defaults to
+`OPENAI_API_KEY`; a custom `api_key_env` name works identically. Ollama needs
+no token. Never commit `.env`; it is ignored by Git. Malformed or unreadable
+files stop startup with a redacted error. Existing TOML configurations need
+no migration.
+
+Alternatively, on macOS, store the API key in Keychain:
 
 ```bash
 security add-generic-password -U -a "$USER" -s "voff-openai" -w "YOUR_API_KEY"

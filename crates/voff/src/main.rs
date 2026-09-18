@@ -1,4 +1,5 @@
 mod config;
+mod environment;
 mod tui;
 
 use crate::config::{
@@ -89,8 +90,12 @@ enum InitTemplate {
     Solo,
     Team,
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    environment::load()?;
+    tokio::runtime::Runtime::new()?.block_on(application())
+}
+
+async fn application() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
@@ -743,6 +748,73 @@ mod tests {
     use super::*;
     use voff_core::{Task, TaskLimits};
     use voff_storage::InMemoryRepository;
+
+    // Re-execute only this test in a clean subprocess: no shared environment
+    // mutation, developer .env discovery, network calls, or runtime workers.
+    #[test]
+    fn environment_child() {
+        let Ok(expected) = std::env::var("VOFF_TEST_EXPECT_TOKEN") else {
+            return;
+        };
+        environment::load().unwrap();
+        if expected == "missing" {
+            assert!(std::env::var("OPENAI_API_KEY").is_err());
+            let result = provider(&ProviderConfig::Openai {
+                model: "fake-test-model".into(),
+                api_key_env: "OPENAI_API_KEY".into(),
+            });
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "OpenAI credential environment variable OPENAI_API_KEY is missing"
+            );
+            return;
+        }
+        assert_eq!(std::env::var("OPENAI_API_KEY").ok(), Some(expected));
+        provider(&ProviderConfig::Openai {
+            model: "fake-test-model".into(),
+            api_key_env: "OPENAI_API_KEY".into(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn environment_loading_and_precedence() {
+        for (file, process, expected) in [
+            (None, "", "missing"),
+            (None, "fake-process-token", "fake-process-token"),
+            (
+                Some("OPENAI_API_KEY=fake-file-token\n"),
+                "",
+                "fake-file-token",
+            ),
+            (
+                Some("OPENAI_API_KEY=fake-file-token\n"),
+                "fake-process-token",
+                "fake-process-token",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            if let Some(contents) = file {
+                std::fs::write(directory.path().join(".env"), contents).unwrap();
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "tests::environment_child"])
+                .current_dir(directory.path())
+                .env_clear()
+                .env("VOFF_TEST_EXPECT_TOKEN", expected);
+            if !process.is_empty() {
+                child.env("OPENAI_API_KEY", process);
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "isolated environment test failed");
+            for stream in [&output.stdout, &output.stderr] {
+                let text = String::from_utf8_lossy(stream);
+                assert!(!text.contains("fake-file-token"));
+                assert!(!text.contains("fake-process-token"));
+            }
+        }
+    }
 
     #[test]
     fn run_resume_is_explicit() {
