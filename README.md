@@ -41,9 +41,10 @@ models are discovered locally when Ollama is running.
 
 The workspace field opens a directory-only `ratatui-explorer` picker. Navigate
 with the arrow keys or `hjkl`, press `/` and type to filter directory names,
-and press Enter to choose the displayed folder. Right/`l` opens the highlighted
-directory; Left/`h` returns to its parent. Press Esc to finish or clear a
-filter, then again to return without changing the workspace.
+and press Enter to choose the highlighted folder. Right/`l` opens the
+highlighted directory; Left/`h` returns to its parent, and Space chooses the
+currently displayed directory. Press Esc to finish or clear a filter, then
+again to return without changing the workspace.
 
 If the selected team uses OpenAI and no credential is configured, the builder
 offers an optional masked token field. Press Enter to skip it: a missing API

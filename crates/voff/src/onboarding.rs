@@ -494,7 +494,16 @@ impl Wizard {
                     self.step = Step::Basics;
                 }
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
+                if let Some(explorer) = &self.workspace_explorer {
+                    self.working_directory = explorer.current().path.clone();
+                }
+                self.workspace_explorer = None;
+                self.workspace_filter.clear();
+                self.workspace_filtering = false;
+                self.step = Step::Basics;
+            }
+            KeyCode::Char(' ') => {
                 if let Some(explorer) = &self.workspace_explorer {
                     self.working_directory = explorer.cwd().clone();
                 }
@@ -1155,14 +1164,14 @@ fn footer_text(wizard: &Wizard) -> String {
         Step::WorkspacePicker => {
             if wizard.workspace_filtering {
                 format!(
-                    "Filter: {}█ · type to refine · ↑/↓ move · Enter select folder · Esc finish filter",
+                    "Filter: {}█ · type to refine · ↑/↓ move · Enter highlighted · Esc finish",
                     wizard.workspace_filter
                 )
             } else if wizard.workspace_filter.is_empty() {
-                "/ type filter · ↑↓/jk move · ←→/hl browse · Enter select folder · Esc back".into()
+                "/ filter · ↑↓/jk move · ←→/hl browse · Enter highlighted · Space current".into()
             } else {
                 format!(
-                    "Filter: {} · ↑↓/jk move · ←→/hl browse · Enter select folder · Esc clear",
+                    "Filter: {} · ↑↓/jk move · Enter highlighted · Space current · Esc clear",
                     wizard.workspace_filter
                 )
             }
@@ -1390,8 +1399,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_picker_enter_selects_the_displayed_directory() {
+    fn workspace_picker_enter_selects_the_highlighted_directory() {
         let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("calculator");
+        std::fs::create_dir(&child).unwrap();
         let mut wizard = Wizard {
             basics_field: BasicsField::WorkingDirectory,
             working_directory: directory.path().into(),
@@ -1403,11 +1414,30 @@ mod tests {
         assert_eq!(wizard.step, Step::WorkspacePicker);
         assert_eq!(wizard.workspace_explorer.as_ref().unwrap().cwd(), &expected);
 
+        wizard.handle_key(key(KeyCode::Down));
         wizard.handle_key(key(KeyCode::Enter));
 
         assert_eq!(wizard.step, Step::Basics);
-        assert_eq!(wizard.working_directory, expected);
+        assert_eq!(wizard.working_directory, child.canonicalize().unwrap());
         assert!(wizard.workspace_explorer.is_none());
+    }
+
+    #[test]
+    fn workspace_picker_space_selects_the_displayed_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wizard = Wizard {
+            basics_field: BasicsField::WorkingDirectory,
+            working_directory: directory.path().into(),
+            ..Wizard::default()
+        };
+
+        wizard.handle_key(key(KeyCode::Enter));
+        wizard.handle_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            wizard.working_directory,
+            directory.path().canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -1443,7 +1473,6 @@ mod tests {
         );
 
         wizard.handle_key(key(KeyCode::Down));
-        wizard.handle_key(key(KeyCode::Right));
         wizard.handle_key(key(KeyCode::Enter));
 
         assert_eq!(wizard.step, Step::Basics);
@@ -1464,7 +1493,7 @@ mod tests {
         wizard.handle_key(key(KeyCode::Enter));
         wizard.handle_key(key(KeyCode::Char('j')));
         wizard.handle_key(key(KeyCode::Char('l')));
-        wizard.handle_key(key(KeyCode::Enter));
+        wizard.handle_key(key(KeyCode::Char(' ')));
 
         assert_eq!(wizard.working_directory, child.canonicalize().unwrap());
     }

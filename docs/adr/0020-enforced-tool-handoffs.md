@@ -27,6 +27,13 @@ recorded but cannot replace `WaitingApproval` with `Failed`. Authentication,
 authorization, transport, cancellation, and other provider failures keep their
 normal failure semantics.
 
+The resilience adapter treats an invalid terminal frame after an emitted
+structured tool proposal as useful output for circuit-health accounting. It
+still returns the error so the engine can audit the malformed tail, but resets
+consecutive failures because the proposal was already delivered. This prevents
+successful approval workflows from opening a shared provider circuit before a
+delegated child can run.
+
 Scheduler waves contain only root tasks created, or child tasks delegated, in
 the active session. Historical queued tasks remain persisted for inspection but
 are not executed by a later session.

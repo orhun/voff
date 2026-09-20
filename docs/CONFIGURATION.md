@@ -29,10 +29,10 @@ workspace file access, process execution, and the local `.voff/voff.db`; the
 main Team Lead bar shows its resolved path while voff is running.
 Interactive setup selects it through a directory-only `ratatui-explorer`
 picker. Arrow keys and `hjkl` navigate, `/` starts a typed directory-name
-filter, and Enter accepts the displayed directory. Right/`l` opens the
-highlighted directory, while Left/`h` returns to its parent. Esc first
-finishes or clears an active filter and then preserves the previous workspace
-selection.
+filter, and Enter accepts the highlighted directory. Right/`l` opens the
+highlighted directory, Left/`h` returns to its parent, and Space accepts the
+currently displayed directory. Esc first finishes or clears an active filter
+and then preserves the previous workspace selection.
 
 ## 2. Example
 
