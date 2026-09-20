@@ -133,6 +133,20 @@ Merge configuration using documented precedence, validate once, then persist a r
 
 ## 6. Secret handling
 
+At executable startup, voff loads an optional `.env` from the current working
+directory only, before configuration and authentication resolution. Existing
+process variables take precedence; a missing file is harmless. Malformed or
+unreadable files fail with a safe error. Never commit `.env`.
+
+OpenAI uses `OPENAI_API_KEY` by default, or the name configured in
+`api_key_env`; Ollama requires no token. Minimal placeholder example:
+
+```dotenv
+OPENAI_API_KEY=YOUR_API_KEY
+```
+
+No TOML migration is required.
+
 - Config stores only environment variable names or secret-store references.
 - The UI displays whether a credential is available, never its value.
 - Export removes resolved secrets and sensitive transient headers.

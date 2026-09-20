@@ -14,6 +14,7 @@ voff-provider = { path = "crates/voff-provider", version = "=0.1.0-beta.1" }
 voff-storage = { path = "crates/voff-storage", version = "=0.1.0-beta.1" }
 voff-engine = { path = "crates/voff-engine", version = "=0.1.0-beta.1" }
 async-trait = "0.1"
+dotenvy = "0.15.7"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
