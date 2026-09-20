@@ -44,7 +44,7 @@ Phase 2 exit gate is complete: Qwen3/Ollama structured tool proposals enter dura
 - CLI composition persists all formation agents and selects the configured entry agent; each task uses its owner profile's prompt and tools.
 - Structured `task.delegate`/`review.request` proposals enforce enabled and allowed targets plus inherited depth/child limits.
 - Parent/child graph, cycle-safe dependencies, bounded wave scheduler, child result/evidence handoff and integration ordering: `voff-engine` acceptance tests.
-- Durable tasks, results and dependencies with SQLite schema migration 3 and reopen test: `voff-storage`.
+- Durable tasks, results, dependencies and local credentials with SQLite schema migration 4 and reopen tests: `voff-storage`.
 - TUI displays formation agents, indented task trees and delegation/dependency/result events; approved delegation starts the bounded scheduler.
 
 Phase 3 exit gate is complete: a lead can dispatch bounded structured work to interchangeable enabled agents, two independent workers run in one bounded wave, a dependent integration/review task runs afterward, results are handed back to the parent, and the graph survives SQLite reopen.
@@ -57,7 +57,7 @@ Phase 3 exit gate is complete: a lead can dispatch bounded structured work to in
 - Health snapshots expose circuit state, consecutive failures, retry count and the last error.
 - Contract tests cover recovery, no retry after streaming and open-circuit fail-fast behavior.
 - CLI-created mock, Ollama and OpenAI providers are wrapped by the same resilience boundary.
-- The OpenAI Responses API adapter maps canonical messages, SSE text, strict function calls and usage without engine changes; credentials remain environment-only (ADR 0011).
+- The OpenAI Responses API adapter maps canonical messages, SSE text, strict function calls and usage without engine changes; configuration retains only a credential lookup name (ADRs 0011 and 0018).
 - Adapter tests share the canonical streaming/cancellation/error vocabulary and include OpenAI text, usage and function-call mapping.
 - `doctor` reports discovered provider capabilities and connectivity or actionable credential/endpoint failures.
 - User-supplied per-million token rates drive explicitly labelled TUI cost estimates; absent rates remain visibly unconfigured.
@@ -88,12 +88,30 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
 
 ## Phase 5 progress
 
+- First interactive launch now builds an arbitrary 1–32 developer formation,
+  using one page for team size/token defaults and suggested names and roles to
+  minimize input. Provider and model selection exists only on each developer.
+  OpenAI tokens are offered as an optional masked setup field and can be added
+  after launch with `a`; missing credentials never block the workspace. Values
+  are stored in the workspace-local SQLite database rather than project
+  configuration (temporary plaintext-at-rest tradeoff, ADR 0019). The model
+  catalog also supplies provider-qualified per-agent cost estimates, with
+  explicit manual-rate overrides and honest unknown/partial states.
+  Existing configs and scripted `voff init` usage remain compatible.
+- A `ratatui-textarea` composer sends plain text to the entry Team Lead as a
+  persisted root task; `/tasks` focuses the current task list without provider
+  I/O.
+- The workspace presents developers as status-rich cards connected by their
+  explicit delegation relationships. Static permission routes stay faint;
+  persisted cross-owner child tasks become directional, objective-labelled
+  routes with an animated work marker. Running cards show their current task
+  and a `ratatui-spinner` activity glyph. Cards support mouse selection and
+  dragging while all workflow controls remain keyboard-accessible.
 - Root README now provides local and heterogeneous-team onboarding, secure
   credential setup, TUI controls, and contributor quality commands.
 - `voff init` interactively creates a validated solo Ollama or OpenAI
   configuration, supports non-interactive arguments, keeps credentials
-  environment-only, and refuses accidental overwrite.
-- CI enforces the checked-in `cargo-deny` dependency policy.
+  outside project files, and refuses accidental overwrite.
 - Tag-triggered release CI builds locked Linux x86-64 and macOS Intel/Apple
   Silicon archives, generates SHA-256 checksums, and publishes them only for
   version tags. The maintainer procedure is documented in `docs/RELEASING.md`.

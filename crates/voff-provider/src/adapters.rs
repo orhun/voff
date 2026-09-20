@@ -8,12 +8,12 @@ use rig_core::{
         CompletionError, CompletionModel, CompletionRequest as RigCompletionRequest,
         ToolDefinition as RigToolDefinition,
     },
-    message::{AssistantContent, Message, Text, UserContent},
+    message::{AssistantContent, Message, Text, ToolChoice as RigToolChoice, UserContent},
     model::{ModelList, ModelListingError},
     providers::{ollama, openai},
     streaming::StreamedAssistantContent,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -164,7 +164,14 @@ impl ModelProvider for OllamaProvider {
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
-    client: openai::Client,
+    base_url: String,
+    api_key: OpenAiApiKey,
+}
+
+#[derive(Clone)]
+enum OpenAiApiKey {
+    Static(String),
+    Dynamic(Arc<dyn Fn() -> Option<String> + Send + Sync>),
 }
 
 impl OpenAiProvider {
@@ -188,12 +195,47 @@ impl OpenAiProvider {
                 retryable: false,
             });
         }
-        let client = openai::Client::builder()
+        Ok(Self {
+            base_url,
+            api_key: OpenAiApiKey::Static(api_key),
+        })
+    }
+
+    /// Create an OpenAI adapter whose credential can become available after startup.
+    pub fn new_deferred(
+        base_url: impl Into<String>,
+        api_key: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Result<Self, ProviderError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if base_url != "https://api.openai.com" {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Authorization,
+                message: "OpenAI endpoint must be https://api.openai.com".into(),
+                retryable: false,
+            });
+        }
+        Ok(Self {
+            base_url,
+            api_key: OpenAiApiKey::Dynamic(api_key),
+        })
+    }
+
+    fn client(&self) -> Result<openai::Client, ProviderError> {
+        let api_key = match &self.api_key {
+            OpenAiApiKey::Static(value) => Some(value.clone()),
+            OpenAiApiKey::Dynamic(resolve) => resolve(),
+        }
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ProviderError {
+            kind: ProviderErrorKind::Authentication,
+            message: "OpenAI API key is missing".into(),
+            retryable: false,
+        })?;
+        openai::Client::builder()
             .api_key(api_key)
-            .base_url(format!("{base_url}/v1"))
+            .base_url(format!("{}/v1", self.base_url))
             .build()
-            .map_err(client_configuration_error)?;
-        Ok(Self { client })
+            .map_err(client_configuration_error)
     }
 }
 
@@ -208,7 +250,7 @@ impl ModelProvider for OpenAiProvider {
     }
 
     async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
-        self.client
+        self.client()?
             .list_models()
             .await
             .map(model_descriptors)
@@ -221,10 +263,8 @@ impl ModelProvider for OpenAiProvider {
         sink: ProviderEventSink,
         cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError> {
-        let model = self
-            .client
-            .completion_model(&request.model)
-            .with_strict_tools();
+        let client = self.client()?;
+        let model = client.completion_model(&request.model).with_strict_tools();
         stream_model(&model, request, sink, cancellation, ToolNames::OpenAi).await
     }
 }
@@ -252,6 +292,7 @@ async fn stream_model<M: CompletionModel>(
     };
     let mut completion = None;
     let mut last_error = None;
+    let mut saw_tool_call = false;
     loop {
         let item = tokio::select! {
             () = cancellation.cancelled() => {
@@ -268,6 +309,7 @@ async fn stream_model<M: CompletionModel>(
                 send(&sink, ProviderEvent::TextDelta(text.text), &cancellation).await?;
             }
             Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                saw_tool_call = true;
                 let name = match tool_names {
                     ToolNames::Canonical => tool_call.function.name,
                     ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
@@ -308,7 +350,22 @@ async fn stream_model<M: CompletionModel>(
                 | StreamedAssistantContent::ReasoningDelta { .. },
             ) => {}
             Err(error) => {
-                last_error = Some(completion_error(error));
+                let error = completion_error(error);
+                if saw_tool_call && error.kind == ProviderErrorKind::InvalidResponse {
+                    send(
+                        &sink,
+                        ProviderEvent::Warning(
+                            "provider terminal event could not be decoded; preserving the completed structured tool proposal"
+                                .into(),
+                        ),
+                        &cancellation,
+                    )
+                    .await?;
+                    send(&sink, ProviderEvent::Completed, &cancellation).await?;
+                    completion = Some(ProviderCompletion { usage: None });
+                    break;
+                }
+                last_error = Some(error);
             }
         }
     }
@@ -329,6 +386,18 @@ fn rig_request(
     request: CanonicalRequest,
     tool_names: ToolNames,
 ) -> Result<RigCompletionRequest, ProviderError> {
+    let tool_choice = match request.tool_choice {
+        ToolChoice::Auto => RigToolChoice::Auto,
+        ToolChoice::Specific(function_names) => RigToolChoice::Specific {
+            function_names: function_names
+                .into_iter()
+                .map(|name| match tool_names {
+                    ToolNames::Canonical => name,
+                    ToolNames::OpenAi => openai_tool_name(&name),
+                })
+                .collect(),
+        },
+    };
     let chat_history = request
         .messages
         .into_iter()
@@ -379,7 +448,7 @@ fn rig_request(
         tools,
         temperature: None,
         max_tokens: request.max_output_tokens,
-        tool_choice: None,
+        tool_choice: Some(tool_choice),
         additional_params: matches!(tool_names, ToolNames::OpenAi)
             .then(|| serde_json::json!({"store": false})),
         output_schema: None,
@@ -520,6 +589,9 @@ mod tests {
     #[derive(Clone)]
     struct RigFixtureModel;
 
+    #[derive(Clone)]
+    struct RigToolThenJsonErrorModel;
+
     impl CompletionModel for RigFixtureModel {
         async fn completion(
             &self,
@@ -558,6 +630,36 @@ mod tests {
         }
     }
 
+    impl CompletionModel for RigToolThenJsonErrorModel {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            Err(CompletionError::ResponseError(
+                "fixture only supports streaming".into(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+            let items = vec![
+                Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+                    "call-1",
+                    "task__delegate".into(),
+                    serde_json::json!({"target_agent": "Developer", "objective": "work"}),
+                ))),
+                Err(CompletionError::JsonError(json_error)),
+            ];
+            Ok(StreamingCompletionResponse::stream(
+                "fixture",
+                Box::pin(futures_util::stream::iter(items)),
+            ))
+        }
+    }
+
     fn request() -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
@@ -568,6 +670,7 @@ mod tests {
                 content: "hello".into(),
             }],
             tools: vec![],
+            tool_choice: ToolChoice::Auto,
             max_output_tokens: Some(10),
         }
     }
@@ -647,6 +750,34 @@ mod tests {
         assert_eq!(completion.usage.unwrap().output_tokens, 3);
     }
 
+    #[tokio::test]
+    async fn preserves_a_structured_tool_call_when_only_the_terminal_frame_is_invalid() {
+        let (sink, mut events) = tokio::sync::mpsc::channel(16);
+        let completion = stream_model(
+            &RigToolThenJsonErrorModel,
+            request(),
+            sink,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
+        .unwrap();
+        let mut received = Vec::new();
+        while let Some(event) = events.recv().await {
+            received.push(event);
+        }
+
+        assert!(completion.usage.is_none());
+        assert!(matches!(
+            &received[0],
+            ProviderEvent::ToolRequest(tool) if tool.name == "task.delegate"
+        ));
+        assert!(
+            matches!(&received[1], ProviderEvent::Warning(message) if message.contains("terminal event"))
+        );
+        assert_eq!(received[2], ProviderEvent::Completed);
+    }
+
     #[test]
     fn maps_requests_to_rig_without_exposing_rig_to_the_engine() {
         let mut request = request();
@@ -663,10 +794,17 @@ mod tests {
             description: "patch a file".into(),
             input_schema: r#"{"type":"object"}"#.into(),
         });
+        request.tool_choice = ToolChoice::Specific(vec!["file.patch".into()]);
         let mapped = rig_request(request, ToolNames::OpenAi).unwrap();
         assert_eq!(mapped.chat_history.len(), 2);
         assert_eq!(mapped.tools[0].name, "file__patch");
         assert_eq!(mapped.max_tokens, Some(10));
+        assert_eq!(
+            mapped.tool_choice,
+            Some(RigToolChoice::Specific {
+                function_names: vec!["file__patch".into()]
+            })
+        );
         assert_eq!(mapped.additional_params.unwrap()["store"], false);
     }
 
@@ -687,5 +825,22 @@ mod tests {
     fn maps_openai_tool_names_both_directions() {
         assert_eq!(openai_tool_name("task.delegate"), "task__delegate");
         assert_eq!(canonical_tool_name("review__request"), "review.request");
+    }
+
+    #[test]
+    fn deferred_openai_credential_can_be_added_after_startup() {
+        let credential = Arc::new(std::sync::RwLock::new(None::<String>));
+        let source = Arc::clone(&credential);
+        let provider = OpenAiProvider::new_deferred(
+            "https://api.openai.com",
+            Arc::new(move || source.read().ok().and_then(|value| value.clone())),
+        )
+        .unwrap();
+
+        let error = provider.client().err().unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Authentication);
+
+        *credential.write().unwrap() = Some("sk-test-not-real".into());
+        assert!(provider.client().is_ok());
     }
 }

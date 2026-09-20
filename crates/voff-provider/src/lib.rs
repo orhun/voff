@@ -53,7 +53,17 @@ pub struct CanonicalRequest {
     pub model: String,
     pub messages: Vec<CanonicalMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
     pub max_output_tokens: Option<u64>,
+}
+/// Provider-neutral control over whether a model may or must call tools.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ToolChoice {
+    /// Let the model choose between text and any available tool.
+    #[default]
+    Auto,
+    /// Require one of the named tools. A single name forces that exact tool.
+    Specific(Vec<String>),
 }
 #[derive(Clone, Debug)]
 pub struct ToolDefinition {
@@ -334,6 +344,7 @@ pub mod contract {
                 content: "provider contract probe".into(),
             }],
             tools: vec![],
+            tool_choice: ToolChoice::Auto,
             max_output_tokens: Some(32),
         }
     }
@@ -482,6 +493,7 @@ mod tests {
             model: "x".into(),
             messages: vec![],
             tools: vec![],
+            tool_choice: ToolChoice::Auto,
             max_output_tokens: None,
         }
     }

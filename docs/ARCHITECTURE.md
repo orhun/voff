@@ -177,6 +177,12 @@ Bottom: command input, shortcuts and status
 
 `CLI flags > environment references > workspace config > user config > built-in defaults`.
 
+Credential values use a narrower precedence: process/loaded `.env` value, then
+the workspace-local SQLite credential table. Configuration contains only the
+lookup name. The local database is mode `0600` on Unix, excluded from
+diagnostic exports, and is a temporary plaintext-at-rest compromise documented
+by ADR 0019.
+
 Secrets are resolved at runtime and are never serialized into a formation snapshot.
 
 ## 13. Error taxonomy

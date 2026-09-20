@@ -122,6 +122,12 @@ Formation-level policy fields:
 
 Default is `propose_only`, maximum depth 2 and explicit bounded budgets.
 
+When an enabled coordinating agent has both allowed targets and the
+`task.delegate` capability, the engine sets a provider-neutral specific-tool
+choice for `task.delegate`. Natural-language implementation output cannot
+substitute for the required structured proposal. Leaf implementation agents
+with `file.patch` are likewise required to produce a structured patch proposal.
+
 ## 9. Review protocol
 
 A review request references immutable artifacts/diffs and acceptance criteria. Reviewer returns findings with severity (`blocking`, `major`, `minor`, `note`), location, rationale and suggested resolution. Only the integrator or user applies resolutions.
@@ -139,6 +145,11 @@ A review request references immutable artifacts/diffs and acceptance criteria. R
 - Provider rate limits/timeouts may retry within policy using bounded exponential backoff and jitter.
 - Invalid structured output may receive one repair request with the validation errors.
 - Authentication, permission denial, budget exhaustion and user cancellation do not auto-retry.
+- If a fully validated tool proposal is already persisted for approval, an
+  invalid terminal stream frame is audited but does not overwrite the pending
+  approval with `Failed`.
+- Scheduler waves operate only on tasks created or delegated in the active
+  session; persisted queued tasks from older sessions are not resumed implicitly.
 - Every attempt retains an attempt number and correlation ID.
 - Retry never duplicates a non-idempotent side effect without reconciliation.
 

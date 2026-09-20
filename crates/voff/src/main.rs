@@ -1,16 +1,22 @@
 mod config;
+mod credential;
+mod model_catalog;
+mod onboarding;
 mod tui;
 
 use crate::config::{
-    Config, DelegationConfig, FormationAgentConfig, FormationConfig, ProviderConfig,
+    AgentConfig, Config, DelegationConfig, FormationAgentConfig, FormationConfig,
+    NamedProviderConfig, ProviderConfig,
 };
+use crate::model_catalog::ModelCatalog;
+use crate::onboarding::{DeveloperRole, ProviderChoice, SetupDraft};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     fs::OpenOptions,
-    io::{BufRead, BufWriter, Write},
+    io::{BufRead, BufWriter, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,10 +24,52 @@ use voff_core::{
     AgentId, AgentProfile, CanonicalEvent, CanonicalEventKind, EventId, FormationId, Session,
     SessionId, TaskStatus,
 };
+use voff_engine::DelegationProposal;
 use voff_provider::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
 use voff_tools::ScopedWorkspace;
+
+const DEFAULT_OBJECTIVE: &str = "Build a full-stack calculator using two required delegated workstreams. Delegate server.py to Backend Developer: use only the Python standard library, serve the frontend, and implement POST /api/calculate with add, subtract, multiply, divide, numeric-input validation, JSON responses, and division-by-zero errors. Delegate index.html to Frontend Developer: build an accessible calculator that calls /api/calculate and clearly displays loading, results, validation errors, and server errors. Both delegated tasks must be completed; the app must run with python3 server.py and require no external dependencies.";
+
+fn calculator_delegation_plan(objective: &str, agents: &[AgentProfile]) -> Vec<DelegationProposal> {
+    if objective != DEFAULT_OBJECTIVE {
+        return Vec::new();
+    }
+    let Some(backend) = agents
+        .iter()
+        .find(|agent| agent.role == "backend_developer")
+    else {
+        return Vec::new();
+    };
+    let Some(frontend) = agents
+        .iter()
+        .find(|agent| agent.role == "frontend_developer")
+    else {
+        return Vec::new();
+    };
+    vec![
+        DelegationProposal {
+            target_agent: backend.name.clone(),
+            objective: "Create server.py for the full-stack calculator. Use only the Python standard library, serve index.html, and implement POST /api/calculate for add, subtract, multiply, and divide with numeric-input validation, JSON responses, and division-by-zero errors. Own only server.py.".into(),
+            acceptance_criteria: vec![
+                "server.py is complete and runnable with python3 server.py".into(),
+                "POST /api/calculate returns JSON results for all four operations".into(),
+                "Invalid numbers, operations, JSON, and division by zero return clear errors".into(),
+            ],
+        },
+        DelegationProposal {
+            target_agent: frontend.name.clone(),
+            objective: "Create index.html for the full-stack calculator. Build an accessible browser interface that calls POST /api/calculate and clearly displays loading, results, client validation, and server errors. Own only index.html and do not implement arithmetic locally.".into(),
+            acceptance_criteria: vec![
+                "index.html provides inputs and controls for all four operations".into(),
+                "The interface calls /api/calculate and renders its JSON response".into(),
+                "Keyboard use, labels, loading state, and error feedback are present".into(),
+            ],
+        },
+    ]
+}
+
 #[derive(Parser)]
 #[command(
     name = "voff",
@@ -43,6 +91,9 @@ enum Command {
         provider: Option<InitProvider>,
         #[arg(long)]
         model: Option<String>,
+        /// Maximum output tokens generated per provider response.
+        #[arg(long)]
+        max_output_tokens: Option<u64>,
         #[arg(long, default_value = ".voff/config.toml")]
         output: PathBuf,
     },
@@ -51,7 +102,7 @@ enum Command {
         config: PathBuf,
         #[arg(
             long,
-            default_value = "Inspect the workspace and report the most important next action."
+            default_value = DEFAULT_OBJECTIVE
         )]
         objective: String,
         /// Resume the newest stored session instead of creating a clean session.
@@ -112,9 +163,11 @@ async fn application() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
         .init();
-    match Cli::parse().command.unwrap_or(Command::Run {
+    let cli = Cli::parse();
+    let first_launch = cli.command.is_none();
+    match cli.command.unwrap_or(Command::Run {
         config: ".voff/config.toml".into(),
-        objective: "Inspect the workspace and report the most important next action.".into(),
+        objective: DEFAULT_OBJECTIVE.into(),
         resume: false,
         session: None,
     }) {
@@ -122,26 +175,72 @@ async fn application() -> Result<()> {
             template,
             provider,
             model,
+            max_output_tokens,
             output,
-        } => init(template, provider, model, &output),
+        } => init(template, provider, model, max_output_tokens, &output),
         Command::Run {
             config,
             objective,
             resume,
             session,
-        } => run(&config, objective, resume, session).await,
+        } => {
+            if first_launch && !config.exists() {
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    anyhow::bail!(
+                        "first launch needs an interactive terminal; use 'voff init --template solo --provider ollama --model <MODEL>' for non-interactive setup"
+                    );
+                }
+                let state_path = Config::default().state_path();
+                let credential_lookup = async {
+                    if !state_path.exists() {
+                        return false;
+                    }
+                    let Ok(repository) = SqliteRepository::open(&state_path).await else {
+                        return false;
+                    };
+                    credential::resolve("OPENAI_API_KEY", &repository)
+                        .await
+                        .is_ok()
+                };
+                let (catalog, credential_available) =
+                    tokio::join!(setup_model_catalog(), credential_lookup);
+                let Some(draft) = onboarding::run(catalog, credential_available)? else {
+                    return Ok(());
+                };
+                let generated = config_from_setup(&draft)?;
+                if let Some(token) = draft.openai_token {
+                    let repository = SqliteRepository::open(&generated.state_path()).await?;
+                    credential::store("OPENAI_API_KEY", &token, &repository).await?;
+                }
+                write_config_new(&generated, &config)?;
+            }
+            run(&config, objective, resume, session).await
+        }
         Command::Doctor { config } => doctor(&config).await,
         Command::Export { config, output } => export(&config, &output).await,
         Command::Sessions { config } => list_sessions(&config).await,
     }
 }
 
+async fn setup_model_catalog() -> ModelCatalog {
+    let mut catalog = ModelCatalog::bundled().unwrap_or_default();
+    if let Ok(provider) = OllamaProvider::new("http://127.0.0.1:11434")
+        && let Ok(Ok(models)) =
+            tokio::time::timeout(std::time::Duration::from_millis(750), provider.models()).await
+    {
+        catalog.set_ollama_models(models);
+    }
+    catalog
+}
+
 fn init(
     template: Option<InitTemplate>,
     provider: Option<InitProvider>,
     model: Option<String>,
+    max_output_tokens: Option<u64>,
     output: &Path,
 ) -> Result<()> {
+    let interactive = template.is_none() || provider.is_none() || model.is_none();
     let template = match template {
         Some(template) => template,
         None => match prompt("Template [solo/team]", "solo")?.as_str() {
@@ -166,6 +265,13 @@ fn init(
         Some(model) => model,
         None => prompt("Model", default_model)?,
     };
+    let max_output_tokens = match max_output_tokens {
+        Some(value) => value,
+        None if interactive => prompt("Maximum output tokens", "4096")?
+            .parse()
+            .context("maximum output tokens must be a whole number")?,
+        None => 4096,
+    };
     let mut config = Config {
         provider: match provider {
             InitProvider::Ollama => ProviderConfig::Ollama {
@@ -179,6 +285,7 @@ fn init(
         },
         ..Config::default()
     };
+    config.agent.max_output_tokens = max_output_tokens;
     if matches!(template, InitTemplate::Team) {
         config.formation = Some(FormationConfig {
             name: "Lead, Implementer and Reviewer".into(),
@@ -186,18 +293,12 @@ fn init(
             max_parallel_tasks: 2,
         });
         config.agents = team_template();
+        for agent in &mut config.agents {
+            agent.max_output_tokens = max_output_tokens;
+        }
     }
     let config = Config::validate(config).context("generated configuration is invalid")?;
-    let encoded = toml::to_string_pretty(&config)?;
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-        .with_context(|| format!("refusing to overwrite configuration: {}", output.display()))?;
-    file.write_all(encoded.as_bytes())?;
+    write_config_new(&config, output)?;
     println!("[ok] configuration written to {}", output.display());
     match provider {
         InitProvider::Ollama => {
@@ -210,6 +311,120 @@ fn init(
     Ok(())
 }
 
+fn write_config_new(config: &Config, output: &Path) -> Result<()> {
+    let encoded = toml::to_string_pretty(config)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .with_context(|| format!("refusing to overwrite configuration: {}", output.display()))?;
+    file.write_all(encoded.as_bytes())?;
+    Ok(())
+}
+
+fn config_from_setup(setup: &SetupDraft) -> Result<Config> {
+    let first = setup
+        .developers
+        .first()
+        .context("the team must contain at least one developer")?;
+    let first_tools = tools_for(first.role, setup.developers.len() > 1);
+    let mut config = Config {
+        workspace: config::WorkspaceConfig {
+            root: setup.working_directory.clone(),
+            ..Config::default().workspace
+        },
+        provider: provider_from_choice(first.provider, &first.model),
+        agent: AgentConfig {
+            name: first.name.clone(),
+            role: first.role.config_role().into(),
+            system_prompt: first.role.prompt().into(),
+            tools: first_tools,
+            max_output_tokens: first.max_output_tokens,
+        },
+        ..Config::default()
+    };
+    if setup.developers.len() == 1 {
+        return Config::validate(config).context("generated configuration is invalid");
+    }
+
+    let ids = (1..=setup.developers.len())
+        .map(|index| format!("developer-{index}"))
+        .collect::<Vec<_>>();
+    let mut seen_providers = HashSet::new();
+    config.providers = setup
+        .developers
+        .iter()
+        .filter_map(|developer| {
+            let id = developer.provider.id().to_owned();
+            seen_providers
+                .insert(id.clone())
+                .then(|| NamedProviderConfig {
+                    id,
+                    config: provider_from_choice(developer.provider, &developer.model),
+                })
+        })
+        .collect();
+    config.agents = setup
+        .developers
+        .iter()
+        .enumerate()
+        .map(|(index, developer)| FormationAgentConfig {
+            id: ids[index].clone(),
+            name: developer.name.clone(),
+            role: developer.role.config_role().into(),
+            system_prompt: developer.role.prompt().into(),
+            tools: tools_for(developer.role, index == 0),
+            provider: Some(developer.provider.id().into()),
+            model: Some(developer.model.clone()),
+            max_output_tokens: developer.max_output_tokens,
+            delegation: if index == 0 {
+                DelegationConfig {
+                    allowed_targets: ids.iter().skip(1).cloned().collect(),
+                    max_depth: 2,
+                    max_children: u16::try_from(setup.developers.len().saturating_sub(1))
+                        .unwrap_or(u16::MAX),
+                }
+            } else {
+                DelegationConfig::default()
+            },
+        })
+        .collect();
+    config.formation = Some(FormationConfig {
+        name: format!("{}-developer custom team", setup.developers.len()),
+        entry_agent: ids[0].clone(),
+        max_parallel_tasks: setup.developers.len().min(4),
+    });
+    Config::validate(config).context("generated configuration is invalid")
+}
+
+fn provider_from_choice(provider: ProviderChoice, model: &str) -> ProviderConfig {
+    match provider {
+        ProviderChoice::Ollama => ProviderConfig::Ollama {
+            base_url: "http://127.0.0.1:11434".into(),
+            model: model.into(),
+        },
+        ProviderChoice::OpenAi => ProviderConfig::Openai {
+            model: model.into(),
+            api_key_env: "OPENAI_API_KEY".into(),
+        },
+    }
+}
+
+fn tools_for(role: DeveloperRole, entry: bool) -> Vec<String> {
+    let mut tools = role.tools();
+    if entry {
+        for tool in ["task.delegate", "review.request"] {
+            if !tools.iter().any(|configured| configured == tool) {
+                tools.push(tool.into());
+            }
+        }
+    }
+    tools
+}
+
 fn team_template() -> Vec<FormationAgentConfig> {
     vec![
         FormationAgentConfig {
@@ -220,6 +435,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             tools: vec!["file.read".into(), "search.text".into(), "task.delegate".into(), "review.request".into()],
             provider: None,
             model: None,
+            max_output_tokens: 4096,
             delegation: DelegationConfig { allowed_targets: vec!["implementer".into(), "reviewer".into()], max_depth: 2, max_children: 5 },
         },
         FormationAgentConfig {
@@ -230,6 +446,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             tools: vec!["file.read".into(), "search.text".into(), "file.patch".into(), "process.test".into()],
             provider: None,
             model: None,
+            max_output_tokens: 4096,
             delegation: DelegationConfig::default(),
         },
         FormationAgentConfig {
@@ -240,6 +457,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             tools: vec!["file.read".into(), "search.text".into(), "process.test".into()],
             provider: None,
             model: None,
+            max_output_tokens: 4096,
             delegation: DelegationConfig::default(),
         },
     ]
@@ -299,6 +517,7 @@ async fn run(
         value
     };
     let mut agent_profiles = Vec::new();
+    let mut agent_provider_kinds = HashMap::new();
     let owner = if let Some(formation) = &config.formation {
         let mut entry = None;
         let names = config
@@ -324,6 +543,7 @@ async fn run(
                     .unwrap_or_else(|| model_name(selected_provider)),
                 system_prompt: configured.system_prompt.clone(),
                 tools: configured.tools.clone(),
+                max_output_tokens: configured.max_output_tokens,
                 enabled: true,
                 allowed_targets: configured
                     .delegation
@@ -340,6 +560,7 @@ async fn run(
             if configured.id == formation.entry_agent {
                 entry = Some(profile.id);
             }
+            agent_provider_kinds.insert(profile.id, provider_name(selected_provider).into());
             repo.save_agent(profile.clone()).await?;
             agent_profiles.push(profile);
         }
@@ -353,11 +574,13 @@ async fn run(
             model: model_name(&config.provider),
             system_prompt: config.agent.system_prompt.clone(),
             tools: config.agent.tools.clone(),
+            max_output_tokens: config.agent.max_output_tokens,
             enabled: true,
             allowed_targets: vec![],
             delegation_limits: None,
         };
         let id = profile.id;
+        agent_provider_kinds.insert(profile.id, provider_name(&config.provider).into());
         repo.save_agent(profile.clone()).await?;
         agent_profiles.push(profile);
         id
@@ -381,7 +604,20 @@ async fn run(
         .into_iter()
         .filter(|artifact| task_ids.contains(&artifact.producer))
         .collect();
-    let providers = provider_registry(&config)?;
+    let credential_slots = credential_slots(&config, repo.as_ref()).await;
+    let credential_target = provider_routes(&config)
+        .into_iter()
+        .find_map(|(_, configured)| {
+            if let ProviderConfig::Openai { api_key_env, .. } = configured {
+                credential_slots
+                    .get(api_key_env)
+                    .cloned()
+                    .map(|slot| (api_key_env.clone(), slot))
+            } else {
+                None
+            }
+        });
+    let providers = provider_registry(&config, &credential_slots)?;
     let provider = Arc::clone(
         providers
             .get(&default_provider)
@@ -397,8 +633,15 @@ async fn run(
         .find(|a| a.id == owner)
         .map(|a| a.model.clone())
         .unwrap_or_else(|| model_name(&config.provider));
-    let workspace = ScopedWorkspace::new(&config.workspace.root, 256 * 1024)?;
+    let workspace_root = std::fs::canonicalize(&config.workspace.root).with_context(|| {
+        format!(
+            "working directory is unavailable: {}",
+            config.workspace.root.display()
+        )
+    })?;
+    let workspace = ScopedWorkspace::new(&workspace_root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
+    let delegation_plan = calculator_delegation_plan(&objective, &agent_profiles);
     tui::run_configured(tui::ConfiguredRun {
         repo,
         provider,
@@ -424,13 +667,14 @@ async fn run(
         agent_name,
         agent_profiles,
         objective,
+        delegation_plan,
         initial_tasks: tasks,
         initial_events: events,
         initial_approvals: approvals,
         initial_artifacts: artifacts,
         capacity: config.runtime.event_channel_capacity,
         workspace_context,
-        workspace_root: config.workspace.root,
+        workspace_root,
         max_parallel_tasks: config
             .formation
             .as_ref()
@@ -438,6 +682,9 @@ async fn run(
         input_cost_per_million: config.cost.input_per_million,
         output_cost_per_million: config.cost.output_per_million,
         cost_currency: config.cost.currency,
+        model_catalog: ModelCatalog::bundled().unwrap_or_default(),
+        agent_provider_kinds,
+        credential_target,
     })
     .await?;
     Ok(())
@@ -517,8 +764,9 @@ async fn doctor(path: &Path) -> Result<()> {
     );
     println!("[ok] scoped tools: {}", config.agent.tools.join(", "));
     println!("[ok] shell disabled; patch writes require digest check and explicit approval");
+    let slots = credential_slots(&config, &repo).await;
     for (id, configured) in provider_routes(&config) {
-        match provider(configured) {
+        match provider(configured, &slots) {
             Ok(selected) => {
                 let capabilities = selected.descriptor().capabilities;
                 println!(
@@ -546,7 +794,9 @@ async fn doctor(path: &Path) -> Result<()> {
             "[ok] estimated cost rates: {input}/{output} {} per 1M input/output tokens",
             config.cost.currency
         ),
-        _ => println!("[info] cost estimate disabled; configure both cost rates to enable"),
+        _ => println!(
+            "[ok] catalog cost estimates enabled where provider/model pricing is available"
+        ),
     }
     Ok(())
 }
@@ -613,7 +863,7 @@ async fn export(path: &Path, output: &Path) -> Result<()> {
             .collect(),
     };
     let mut value = serde_json::to_value(bundle)?;
-    redact_json(&mut value, &configured_secrets(&config));
+    redact_json(&mut value, &configured_secrets(&config, &repo).await);
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -632,15 +882,17 @@ async fn export(path: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn configured_secrets(config: &Config) -> Vec<String> {
-    provider_routes(config)
-        .into_iter()
-        .filter_map(|(_, provider)| match provider {
-            ProviderConfig::Openai { api_key_env, .. } => std::env::var(api_key_env).ok(),
-            _ => None,
-        })
-        .filter(|secret| !secret.is_empty())
-        .collect()
+async fn configured_secrets(config: &Config, repository: &SqliteRepository) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for (_, provider) in provider_routes(config) {
+        if let ProviderConfig::Openai { api_key_env, .. } = provider
+            && let Ok(secret) = credential::resolve(api_key_env, repository).await
+            && !secret.is_empty()
+        {
+            secrets.push(secret);
+        }
+    }
+    secrets
 }
 
 fn redact_json(value: &mut serde_json::Value, secrets: &[String]) {
@@ -709,10 +961,29 @@ fn provider_config<'a>(config: &'a Config, id: &str) -> Option<&'a ProviderConfi
         .find_map(|(candidate, provider)| (candidate == id).then_some(provider))
 }
 
-fn provider_registry(config: &Config) -> Result<HashMap<String, Arc<dyn ModelProvider>>> {
+async fn credential_slots(
+    config: &Config,
+    repository: &SqliteRepository,
+) -> HashMap<String, credential::CredentialSlot> {
+    let mut slots = HashMap::new();
+    for (_, configured) in provider_routes(config) {
+        if let ProviderConfig::Openai { api_key_env, .. } = configured
+            && !slots.contains_key(api_key_env)
+        {
+            let secret = credential::resolve(api_key_env, repository).await.ok();
+            slots.insert(api_key_env.clone(), credential::CredentialSlot::new(secret));
+        }
+    }
+    slots
+}
+
+fn provider_registry(
+    config: &Config,
+    credential_slots: &HashMap<String, credential::CredentialSlot>,
+) -> Result<HashMap<String, Arc<dyn ModelProvider>>> {
     provider_routes(config)
         .into_iter()
-        .map(|(id, configured)| Ok((id.to_owned(), provider(configured)?)))
+        .map(|(id, configured)| Ok((id.to_owned(), provider(configured, credential_slots)?)))
         .collect()
 }
 fn provider_name(value: &ProviderConfig) -> &'static str {
@@ -729,7 +1000,10 @@ fn model_name(value: &ProviderConfig) -> String {
         ProviderConfig::Openai { model, .. } => model.clone(),
     }
 }
-fn provider(value: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
+fn provider(
+    value: &ProviderConfig,
+    credential_slots: &HashMap<String, credential::CredentialSlot>,
+) -> Result<Arc<dyn ModelProvider>> {
     let inner: Arc<dyn ModelProvider> = match value {
         ProviderConfig::Mock => Arc::new(MockProvider::new(vec![
             MockStep::Event(voff_provider::ProviderEvent::TextDelta(
@@ -743,10 +1017,14 @@ fn provider(value: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
         ])),
         ProviderConfig::Ollama { base_url, .. } => Arc::new(OllamaProvider::new(base_url.clone())?),
         ProviderConfig::Openai { api_key_env, .. } => {
-            let api_key = std::env::var(api_key_env).with_context(|| {
-                format!("OpenAI credential environment variable {api_key_env} is missing")
-            })?;
-            Arc::new(OpenAiProvider::new("https://api.openai.com", api_key)?)
+            let slot = credential_slots
+                .get(api_key_env)
+                .cloned()
+                .unwrap_or_default();
+            Arc::new(OpenAiProvider::new_deferred(
+                "https://api.openai.com",
+                Arc::new(move || slot.get()),
+            )?)
         }
     };
     Ok(Arc::new(ResilientProvider::new(
@@ -777,6 +1055,68 @@ mod tests {
             cli.command,
             Some(Command::Run { resume: false, .. })
         ));
+    }
+
+    #[test]
+    fn default_calculator_requires_backend_and_frontend_handoffs() {
+        let cli = Cli::try_parse_from(["voff", "run"]).unwrap();
+        let Some(Command::Run { objective, .. }) = cli.command else {
+            panic!("run command expected");
+        };
+
+        assert_eq!(objective, DEFAULT_OBJECTIVE);
+        assert!(objective.contains("Delegate server.py to Backend Developer"));
+        assert!(objective.contains("Delegate index.html to Frontend Developer"));
+        assert!(objective.contains("Both delegated tasks must be completed"));
+        let profile = |name: &str, role: &str| AgentProfile {
+            id: AgentId::new(),
+            name: name.into(),
+            role: role.into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        let plan = calculator_delegation_plan(
+            &objective,
+            &[
+                profile("API Specialist", "backend_developer"),
+                profile("UI Specialist", "frontend_developer"),
+            ],
+        );
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].target_agent, "API Specialist");
+        assert_eq!(plan[1].target_agent, "UI Specialist");
+    }
+
+    #[tokio::test]
+    async fn openai_credential_slot_loads_from_local_sqlite() {
+        let repository = SqliteRepository::open_in_memory().await.unwrap();
+        repository
+            .save_credential("VOFF_TEST_LOCAL_OPENAI", "sk-test-local")
+            .await
+            .unwrap();
+        let config = Config {
+            provider: ProviderConfig::Openai {
+                model: "gpt-5-mini".into(),
+                api_key_env: "VOFF_TEST_LOCAL_OPENAI".into(),
+            },
+            ..Config::default()
+        };
+
+        let slots = credential_slots(&config, &repository).await;
+
+        assert_eq!(
+            slots
+                .get("VOFF_TEST_LOCAL_OPENAI")
+                .and_then(credential::CredentialSlot::get)
+                .as_deref(),
+            Some("sk-test-local")
+        );
     }
 
     #[tokio::test]
@@ -839,6 +1179,7 @@ mod tests {
             Some(InitTemplate::Solo),
             Some(InitProvider::Openai),
             Some("gpt-test".into()),
+            Some(8192),
             &output,
         )
         .unwrap();
@@ -850,6 +1191,7 @@ mod tests {
                 ref api_key_env
             } if model == "gpt-test" && api_key_env == "OPENAI_API_KEY"
         ));
+        assert_eq!(config.agent.max_output_tokens, 8192);
         let contents = std::fs::read_to_string(&output).unwrap();
         assert!(!contents.contains("sk-"));
         assert!(
@@ -857,6 +1199,7 @@ mod tests {
                 Some(InitTemplate::Solo),
                 Some(InitProvider::Ollama),
                 Some("qwen3:4b".into()),
+                None,
                 &output
             )
             .is_err()
@@ -871,12 +1214,101 @@ mod tests {
             Some(InitTemplate::Team),
             Some(InitProvider::Ollama),
             Some("qwen3:4b".into()),
+            Some(16_384),
             &output,
         )
         .unwrap();
         let config = Config::load(&output).unwrap();
         assert_eq!(config.agents.len(), 3);
+        assert!(
+            config
+                .agents
+                .iter()
+                .all(|agent| agent.max_output_tokens == 16_384)
+        );
         assert_eq!(config.formation.unwrap().entry_agent, "lead");
+    }
+
+    #[test]
+    fn guided_setup_preserves_each_developers_provider_model_and_role() {
+        let setup = SetupDraft {
+            developers: vec![
+                onboarding::DeveloperDraft::new(
+                    "Ada",
+                    DeveloperRole::Lead,
+                    ProviderChoice::OpenAi,
+                    "gpt-lead",
+                    16_384,
+                ),
+                onboarding::DeveloperDraft::new(
+                    "Linus",
+                    DeveloperRole::Backend,
+                    ProviderChoice::Ollama,
+                    "qwen-backend",
+                    8192,
+                ),
+                onboarding::DeveloperDraft::new(
+                    "Grace",
+                    DeveloperRole::Reviewer,
+                    ProviderChoice::OpenAi,
+                    "gpt-review",
+                    4096,
+                ),
+            ],
+            working_directory: "/tmp/voff-guided-team".into(),
+            openai_token: Some("sk-must-never-be-serialized".into()),
+        };
+
+        let config = config_from_setup(&setup).unwrap();
+
+        assert_eq!(config.providers.len(), 2);
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.agents[0].model.as_deref(), Some("gpt-lead"));
+        assert_eq!(config.agents[1].model.as_deref(), Some("qwen-backend"));
+        assert_eq!(config.agents[2].model.as_deref(), Some("gpt-review"));
+        assert_eq!(config.agents[0].max_output_tokens, 16_384);
+        assert_eq!(config.agents[1].max_output_tokens, 8192);
+        assert_eq!(config.agents[1].role, "backend_developer");
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/voff-guided-team")
+        );
+        assert_eq!(
+            config.agents[0].delegation.allowed_targets,
+            vec!["developer-2", "developer-3"]
+        );
+        assert!(config.agents[0].tools.contains(&"task.delegate".into()));
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("sk-must-never-be-serialized")
+        );
+    }
+
+    #[test]
+    fn guided_solo_setup_uses_the_same_safe_configuration_path() {
+        let setup = SetupDraft {
+            developers: vec![onboarding::DeveloperDraft::new(
+                "Solo",
+                DeveloperRole::FullStack,
+                ProviderChoice::Ollama,
+                "local-model",
+                2048,
+            )],
+            working_directory: ".".into(),
+            openai_token: None,
+        };
+
+        let config = config_from_setup(&setup).unwrap();
+
+        assert!(config.formation.is_none());
+        assert!(config.agents.is_empty());
+        assert_eq!(config.agent.name, "Solo");
+        assert_eq!(config.agent.max_output_tokens, 2048);
+        assert!(matches!(
+            config.provider,
+            ProviderConfig::Ollama { ref model, .. } if model == "local-model"
+        ));
     }
 
     #[test]

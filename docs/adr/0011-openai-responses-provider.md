@@ -8,7 +8,11 @@ Accepted
 
 The second network provider uses the OpenAI Responses API with SSE streaming. voff maps canonical messages and strict function tools at the adapter boundary, translates text, function-call and usage events back into provider-neutral events, and leaves the engine unchanged.
 
-The API key is read only from the configured environment-variable name (default `OPENAI_API_KEY`). It is never accepted as TOML data, persisted to SQLite, or included in diagnostics. The adapter permits only `https://api.openai.com`.
+The API key is resolved from the configured environment-variable name (default
+`OPENAI_API_KEY`). ADR 0019 extends that lookup with a lower-precedence
+workspace SQLite value. The value is never accepted as TOML data or included
+in diagnostics. The adapter permits only
+`https://api.openai.com`.
 
 HTTP 401/403 failures are not retried. Rate limits, timeouts and server failures use the shared bounded resilience policy. Retries stop after any streamed event to prevent duplicate output or tool effects.
 

@@ -10,7 +10,7 @@ voff supports a registry of named provider routes. Each persisted `AgentProfile`
 
 Configuration schema version 1 remains backward compatible: when `[[providers]]` is absent, the existing `[provider]` block is the only route. Heterogeneous formations declare named `[[providers]]` entries and set `provider` and optionally `model` on each `[[agents]]` entry. Provider IDs are validated before session startup.
 
-Each route receives its own resilience wrapper and therefore its own retry/circuit state. A provider failure marks only that route's task failed; bounded scheduler siblings are awaited and may complete normally. Credentials remain environment references and are never embedded in agent profiles.
+Each route receives its own resilience wrapper and therefore its own retry/circuit state. A provider failure marks only that route's task failed; bounded scheduler siblings are awaited and may complete normally. Credentials remain lookup references and are never embedded in agent profiles.
 
 ## Consequences
 

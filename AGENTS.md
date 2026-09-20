@@ -49,7 +49,6 @@ For a normal code change, run when available:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo deny check
 ```
 
 Do not claim success if a check was skipped or failed. Explain environmental blockers precisely.

@@ -55,7 +55,7 @@ impl ScopedWorkspace {
             max_file_bytes,
         })
     }
-    fn resolve(&self, relative: &Path) -> Result<PathBuf, ToolError> {
+    fn validate_relative(relative: &Path) -> Result<(), ToolError> {
         if relative.is_absolute()
             || relative
                 .components()
@@ -69,8 +69,25 @@ impl ScopedWorkspace {
         {
             return Err(ToolError::SensitivePath);
         }
+        Ok(())
+    }
+    fn resolve(&self, relative: &Path) -> Result<PathBuf, ToolError> {
+        Self::validate_relative(relative)?;
         let path = self.root.join(relative).canonicalize()?;
         if !path.starts_with(&self.root) {
+            return Err(ToolError::OutsideWorkspace);
+        }
+        Ok(path)
+    }
+    fn resolve_for_write(&self, relative: &Path) -> Result<PathBuf, ToolError> {
+        Self::validate_relative(relative)?;
+        let path = self.root.join(relative);
+        if path.exists() {
+            return self.resolve(relative);
+        }
+        let parent = path.parent().ok_or(ToolError::OutsideWorkspace)?;
+        let parent = parent.canonicalize()?;
+        if !parent.starts_with(&self.root) {
             return Err(ToolError::OutsideWorkspace);
         }
         Ok(path)
@@ -89,12 +106,22 @@ impl ScopedWorkspace {
         relative: &Path,
         replacement: String,
     ) -> Result<PatchProposal, ToolError> {
-        let current = self.read_text(relative)?;
+        if replacement.len() as u64 > self.max_file_bytes {
+            return Err(ToolError::TooLarge(self.max_file_bytes));
+        }
+        let path = self.resolve_for_write(relative)?;
+        let (current, base_digest) = if path.exists() {
+            let current = self.read_text(relative)?;
+            let base_digest = digest(current.as_bytes());
+            (current, base_digest)
+        } else {
+            (String::new(), ABSENT_FILE_DIGEST.into())
+        };
         Ok(PatchProposal {
             artifact_id: ArtifactId::new(),
             task_id,
             path: relative.to_path_buf(),
-            base_digest: digest(current.as_bytes()),
+            base_digest,
             preview: diff_preview(&current, &replacement),
             replacement,
         })
@@ -103,9 +130,13 @@ impl ScopedWorkspace {
         if !approved {
             return Err(ToolError::ApprovalRequired);
         }
-        let path = self.resolve(&proposal.path)?;
-        let current = fs::read(&path)?;
-        if digest(&current) != proposal.base_digest {
+        let path = self.resolve_for_write(&proposal.path)?;
+        let current_digest = if path.exists() {
+            digest(&fs::read(&path)?)
+        } else {
+            ABSENT_FILE_DIGEST.into()
+        };
+        if current_digest != proposal.base_digest {
             return Err(ToolError::PatchConflict);
         }
         let mut temporary = path.clone();
@@ -186,6 +217,7 @@ impl ScopedWorkspace {
         Ok(output)
     }
 }
+const ABSENT_FILE_DIGEST: &str = "absent";
 impl PatchProposal {
     #[must_use]
     pub fn artifact(&self) -> voff_core::Artifact {
@@ -304,5 +336,28 @@ mod tests {
             .unwrap();
         w.apply_patch(&proposal, true).unwrap();
         assert_eq!(fs::read_to_string(d.path().join("a.txt")).unwrap(), "new");
+    }
+    #[test]
+    fn approved_patch_can_create_a_new_file_and_detects_creation_conflicts() {
+        let d = tempfile::tempdir().unwrap();
+        let w = ScopedWorkspace::new(d.path(), 1024).unwrap();
+        let proposal = w
+            .propose_replacement(TaskId::new(), Path::new("index.html"), "calculator".into())
+            .unwrap();
+        assert_eq!(proposal.base_digest, ABSENT_FILE_DIGEST);
+        w.apply_patch(&proposal, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(d.path().join("index.html")).unwrap(),
+            "calculator"
+        );
+
+        let conflicting = w
+            .propose_replacement(TaskId::new(), Path::new("app.js"), "ours".into())
+            .unwrap();
+        fs::write(d.path().join("app.js"), "theirs").unwrap();
+        assert!(matches!(
+            w.apply_patch(&conflicting, true),
+            Err(ToolError::PatchConflict)
+        ));
     }
 }

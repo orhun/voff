@@ -14,6 +14,7 @@ fn migrations() -> Migrations<'static> {
             "../migrations/0002_approvals_and_artifacts.sql"
         )),
         M::up(include_str!("../migrations/0003_task_dependencies.sql")),
+        M::up(include_str!("../migrations/0004_credentials.sql")),
     ])
 }
 
@@ -197,6 +198,12 @@ impl SqliteRepository {
                 .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
         }
         let connection = tokio_rusqlite::Connection::open(path).await.map_err(db)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        }
         let repository = Self { connection };
         repository.initialize().await?;
         Ok(repository)
@@ -209,6 +216,47 @@ impl SqliteRepository {
         let repository = Self { connection };
         repository.initialize().await?;
         Ok(repository)
+    }
+
+    /// Store a provider credential in the workspace-local SQLite database.
+    pub async fn save_credential(
+        &self,
+        reference: &str,
+        secret: &str,
+    ) -> Result<(), RepositoryError> {
+        if reference.trim().is_empty() || secret.trim().is_empty() {
+            return Err(RepositoryError::Invariant(
+                "credential reference and value must not be empty".into(),
+            ));
+        }
+        let reference = reference.to_owned();
+        let secret = secret.to_owned();
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO credentials(reference,secret) VALUES(?1,?2)",
+                    rusqlite::params![reference, secret],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Resolve a provider credential from the workspace-local SQLite database.
+    pub async fn credential(&self, reference: &str) -> Result<Option<String>, RepositoryError> {
+        let reference = reference.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT secret FROM credentials WHERE reference=?1",
+                    [reference],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)
+        })
+        .await
     }
 
     async fn initialize(&self) -> Result<(), RepositoryError> {
@@ -675,7 +723,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[tokio::test]
@@ -720,7 +768,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         drop(r);
         let _ = std::fs::remove_file(path);
     }
@@ -750,6 +798,22 @@ mod tests {
             r.task(task.id).await.unwrap().unwrap().status,
             TaskStatus::Running
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_persists_workspace_credentials() {
+        let r = SqliteRepository::open_in_memory().await.unwrap();
+        assert_eq!(r.credential("OPENAI_API_KEY").await.unwrap(), None);
+
+        r.save_credential("OPENAI_API_KEY", "sk-test-not-real")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.credential("OPENAI_API_KEY").await.unwrap().as_deref(),
+            Some("sk-test-not-real")
+        );
+        assert!(r.save_credential("OPENAI_API_KEY", " ").await.is_err());
     }
     #[tokio::test]
     async fn sqlite_persists_approvals_and_artifacts() {

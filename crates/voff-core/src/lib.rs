@@ -48,6 +48,11 @@ typed_id!(ApprovalId, "apr");
 typed_id!(ArtifactId, "art");
 typed_id!(EventId, "evt");
 
+/// Backward-compatible per-response generation limit for agent profiles.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4096;
+/// Hard safety ceiling for one provider response.
+pub const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
@@ -64,11 +69,17 @@ pub struct AgentProfile {
     pub model: String,
     pub system_prompt: String,
     pub tools: Vec<String>,
+    /// Maximum tokens the model may generate for one provider response.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u64,
     pub enabled: bool,
     #[serde(default)]
     pub allowed_targets: Vec<String>,
     #[serde(default)]
     pub delegation_limits: Option<TaskLimits>,
+}
+const fn default_max_output_tokens() -> u64 {
+    DEFAULT_MAX_OUTPUT_TOKENS
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
@@ -402,6 +413,29 @@ impl TaskGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_agent_profiles_default_the_output_token_limit() {
+        let profile = AgentProfile {
+            id: AgentId::new(),
+            name: "Legacy".into(),
+            role: "developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "work".into(),
+            tools: vec![],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        let mut encoded = serde_json::to_value(profile).unwrap();
+        encoded.as_object_mut().unwrap().remove("max_output_tokens");
+
+        let restored: AgentProfile = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(restored.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    }
     #[test]
     fn transitions_validate() {
         let mut t = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());
