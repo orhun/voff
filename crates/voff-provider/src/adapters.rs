@@ -292,7 +292,7 @@ async fn stream_model<M: CompletionModel>(
     };
     let mut completion = None;
     let mut last_error = None;
-    let mut saw_tool_call = false;
+    let mut emitted_usable_output = false;
     loop {
         let item = tokio::select! {
             () = cancellation.cancelled() => {
@@ -306,10 +306,11 @@ async fn stream_model<M: CompletionModel>(
         };
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
+                emitted_usable_output |= !text.text.is_empty();
                 send(&sink, ProviderEvent::TextDelta(text.text), &cancellation).await?;
             }
             Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
-                saw_tool_call = true;
+                emitted_usable_output = true;
                 let name = match tool_names {
                     ToolNames::Canonical => tool_call.function.name,
                     ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
@@ -350,29 +351,28 @@ async fn stream_model<M: CompletionModel>(
                 | StreamedAssistantContent::ReasoningDelta { .. },
             ) => {}
             Err(error) => {
-                let error = completion_error(error);
-                if saw_tool_call && error.kind == ProviderErrorKind::InvalidResponse {
-                    send(
-                        &sink,
-                        ProviderEvent::Warning(
-                            "provider terminal event could not be decoded; preserving the completed structured tool proposal"
-                                .into(),
-                        ),
-                        &cancellation,
-                    )
-                    .await?;
-                    send(&sink, ProviderEvent::Completed, &cancellation).await?;
-                    completion = Some(ProviderCompletion { usage: None });
-                    break;
-                }
-                last_error = Some(error);
+                last_error = Some(completion_error(error));
             }
         }
     }
     if let Some(completion) = completion {
         Ok(completion)
     } else if let Some(error) = last_error {
-        Err(error)
+        if emitted_usable_output && error.kind == ProviderErrorKind::InvalidResponse {
+            send(
+                &sink,
+                ProviderEvent::Warning(
+                    "provider terminal event could not be decoded; preserving already streamed output with usage unavailable"
+                        .into(),
+                ),
+                &cancellation,
+            )
+            .await?;
+            send(&sink, ProviderEvent::Completed, &cancellation).await?;
+            Ok(ProviderCompletion { usage: None })
+        } else {
+            Err(error)
+        }
     } else {
         Err(ProviderError {
             kind: ProviderErrorKind::InvalidResponse,
@@ -592,6 +592,12 @@ mod tests {
     #[derive(Clone)]
     struct RigToolThenJsonErrorModel;
 
+    #[derive(Clone)]
+    struct RigTextThenJsonErrorModel;
+
+    #[derive(Clone)]
+    struct RigJsonErrorModel;
+
     impl CompletionModel for RigFixtureModel {
         async fn completion(
             &self,
@@ -653,6 +659,55 @@ mod tests {
                 ))),
                 Err(CompletionError::JsonError(json_error)),
             ];
+            Ok(StreamingCompletionResponse::stream(
+                "fixture",
+                Box::pin(futures_util::stream::iter(items)),
+            ))
+        }
+    }
+
+    impl CompletionModel for RigTextThenJsonErrorModel {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            Err(CompletionError::ResponseError(
+                "fixture only supports streaming".into(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+            let items = vec![
+                Ok(RawStreamingChoice::Message("complete review".into())),
+                Err(CompletionError::JsonError(json_error)),
+            ];
+            Ok(StreamingCompletionResponse::stream(
+                "fixture",
+                Box::pin(futures_util::stream::iter(items)),
+            ))
+        }
+    }
+
+    impl CompletionModel for RigJsonErrorModel {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            Err(CompletionError::ResponseError(
+                "fixture only supports streaming".into(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+            let items = vec![Err(CompletionError::JsonError(json_error))];
             Ok(StreamingCompletionResponse::stream(
                 "fixture",
                 Box::pin(futures_util::stream::iter(items)),
@@ -776,6 +831,51 @@ mod tests {
             matches!(&received[1], ProviderEvent::Warning(message) if message.contains("terminal event"))
         );
         assert_eq!(received[2], ProviderEvent::Completed);
+    }
+
+    #[tokio::test]
+    async fn preserves_streamed_text_when_only_the_terminal_frame_is_invalid() {
+        let (sink, mut events) = tokio::sync::mpsc::channel(16);
+        let completion = stream_model(
+            &RigTextThenJsonErrorModel,
+            request(),
+            sink,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
+        .unwrap();
+        let mut received = Vec::new();
+        while let Some(event) = events.recv().await {
+            received.push(event);
+        }
+
+        assert!(completion.usage.is_none());
+        assert_eq!(
+            received[0],
+            ProviderEvent::TextDelta("complete review".into())
+        );
+        assert!(
+            matches!(&received[1], ProviderEvent::Warning(message) if message.contains("preserving already streamed output"))
+        );
+        assert_eq!(received[2], ProviderEvent::Completed);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_invalid_stream_before_any_usable_output() {
+        let (sink, mut events) = tokio::sync::mpsc::channel(16);
+        let error = stream_model(
+            &RigJsonErrorModel,
+            request(),
+            sink,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+        assert!(events.recv().await.is_none());
     }
 
     #[test]

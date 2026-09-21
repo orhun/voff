@@ -1,5 +1,7 @@
 //! Responsive Ratatui shell and pure action reducer.
-use crate::model_catalog::ModelCatalog;
+mod team_flow;
+
+use crate::{model_catalog::ModelCatalog, onboarding::DeveloperRole};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -13,21 +15,29 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
-use ratatui_spinner::{FluxFrames, FluxSpinner};
 use ratatui_textarea::TextArea;
-use std::{collections::HashMap, io, panic, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io, panic,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tui_popup::{KnownSizeWrapper, Popup};
 use voff_core::{
-    AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEventKind, SessionId,
-    Task, TaskStatus,
+    AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
+    CanonicalEventKind, EventId, SessionId, Task, TaskStatus,
 };
 use voff_engine::{DelegationProposal, Engine, EngineEvent};
 use voff_provider::ProviderHealth;
 use voff_storage::{Repository, SqliteRepository};
+
+use self::team_flow::{TeamFlow, handoff_summary};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Panel {
@@ -52,23 +62,19 @@ pub enum Action {
     ToggleEvents,
     PageUp,
     PageDown,
+    FitTeam,
+    ZoomTeamIn,
+    ZoomTeamOut,
+    ResetTeamZoom,
+    AdjustTeam,
+    ShowTeam,
+    ShowTasks,
+    ShowDetails,
+    ShowEvents,
     Escape,
     Quit,
     Mouse(MouseEvent),
     None,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct AgentPosition {
-    x: i16,
-    y: i16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DragState {
-    index: usize,
-    column: u16,
-    row: u16,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -77,6 +83,28 @@ enum ComposerEvent {
     Consumed,
     Submit(String),
 }
+
+#[derive(Debug)]
+enum TeamAdjustmentEvent {
+    Ignored,
+    Consumed,
+    Save(Box<AgentProfile>),
+    Add(Box<AgentProfile>),
+}
+
+enum SavedTeamAdjustment {
+    Availability(AgentProfile, CanonicalEvent),
+    Added(AgentProfile, AgentProfile),
+}
+
+const ADDABLE_ROLES: [DeveloperRole; 6] = [
+    DeveloperRole::Backend,
+    DeveloperRole::Frontend,
+    DeveloperRole::FullStack,
+    DeveloperRole::Reviewer,
+    DeveloperRole::Tester,
+    DeveloperRole::DevOps,
+];
 
 pub struct AppModel {
     pub session: SessionId,
@@ -113,24 +141,29 @@ pub struct AppModel {
     composer_notice: Option<String>,
     composer_hitbox: Rect,
     selected_agent: usize,
-    agent_positions: Vec<AgentPosition>,
-    agent_hitboxes: Vec<Rect>,
-    dragging_agent: Option<DragState>,
+    approval_selected: usize,
+    team_lead: Option<AgentId>,
+    team_adjustment_open: bool,
+    team_adjustment_selected: usize,
+    team_role_picker: bool,
+    team_role_selected: usize,
+    team_adjustment_saving: bool,
+    team_adjustment_notice: Option<String>,
+    team_flow: TeamFlow,
     streaming_text: bool,
-    animation_tick: u64,
 }
 impl AppModel {
     #[must_use]
     pub fn new(session: SessionId) -> Self {
         let mut composer = TextArea::default();
         composer.set_cursor_line_style(Style::default());
-        composer.set_placeholder_text("Message the Team Lead, or type /tasks");
+        composer.set_placeholder_text("Message Team Lead · /task assign · /tasks list");
         Self {
             session,
             tasks: vec![],
             events: vec![],
             selected: 0,
-            panel: Panel::Tasks,
+            panel: Panel::Agents,
             help: false,
             quit: false,
             provider_label: "mock".into(),
@@ -160,14 +193,22 @@ impl AppModel {
             composer_notice: None,
             composer_hitbox: Rect::default(),
             selected_agent: 0,
-            agent_positions: vec![],
-            agent_hitboxes: vec![],
-            dragging_agent: None,
+            approval_selected: 0,
+            team_lead: None,
+            team_adjustment_open: false,
+            team_adjustment_selected: 0,
+            team_role_picker: false,
+            team_role_selected: 0,
+            team_adjustment_saving: false,
+            team_adjustment_notice: None,
+            team_flow: TeamFlow::default(),
             streaming_text: false,
-            animation_tick: 0,
         }
     }
     pub fn reduce(&mut self, action: Action) {
+        if self.navigate_approvals(action) {
+            return;
+        }
         match action {
             Action::Up => {
                 if self.event_viewer || self.panel == Panel::Events {
@@ -205,12 +246,30 @@ impl AppModel {
                     .min(self.event_scroll_limit());
                 self.event_follow = self.event_scroll == 0;
             }
+            Action::FitTeam if self.panel == Panel::Agents => self.team_flow.fit_view(),
+            Action::ZoomTeamIn if self.panel == Panel::Agents => self.team_flow.zoom_in(),
+            Action::ZoomTeamOut if self.panel == Panel::Agents => self.team_flow.zoom_out(),
+            Action::ResetTeamZoom if self.panel == Panel::Agents => self.team_flow.reset_zoom(),
+            Action::AdjustTeam => {
+                self.team_adjustment_open = true;
+                self.team_adjustment_selected =
+                    self.selected_agent.min(self.agents.len().saturating_sub(1));
+                self.team_role_picker = false;
+                self.team_adjustment_notice = None;
+            }
+            Action::ShowTeam => self.panel = Panel::Agents,
+            Action::ShowTasks => self.panel = Panel::Tasks,
+            Action::ShowDetails => self.panel = Panel::Details,
+            Action::ShowEvents => {
+                self.panel = Panel::Events;
+                self.follow_newest_event();
+            }
             Action::NextPanel => {
                 self.panel = match self.panel {
+                    Panel::Agents => Panel::Tasks,
                     Panel::Tasks => Panel::Details,
-                    Panel::Details => Panel::Agents,
-                    Panel::Agents => Panel::Events,
-                    Panel::Events => Panel::Tasks,
+                    Panel::Details => Panel::Events,
+                    Panel::Events => Panel::Agents,
                 };
                 if self.panel == Panel::Events {
                     self.follow_newest_event();
@@ -254,56 +313,189 @@ impl AppModel {
             }
             Action::Quit => self.quit = true,
             Action::Mouse(mouse) => self.handle_mouse(mouse),
-            Action::StartMock | Action::Cancel | Action::Approve | Action::Deny | Action::None => {}
+            Action::StartMock
+            | Action::Cancel
+            | Action::Approve
+            | Action::Deny
+            | Action::FitTeam
+            | Action::ZoomTeamIn
+            | Action::ZoomTeamOut
+            | Action::ResetTeamZoom
+            | Action::None => {}
         }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if self
-                    .composer_hitbox
-                    .contains((mouse.column, mouse.row).into())
-                {
-                    self.composer_active = true;
-                    self.composer_notice = None;
-                    self.dragging_agent = None;
-                    return;
-                }
-                if let Some((index, _)) = self
-                    .agent_hitboxes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, area)| area.contains((mouse.column, mouse.row).into()))
-                {
-                    self.selected_agent = index;
-                    self.panel = Panel::Agents;
-                    self.dragging_agent = Some(DragState {
-                        index,
-                        column: mouse.column,
-                        row: mouse.row,
-                    });
-                }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .composer_hitbox
+                .contains((mouse.column, mouse.row).into())
+        {
+            self.composer_active = true;
+            self.composer_notice = None;
+            return;
+        }
+        let interaction = self.team_flow.handle_mouse(mouse);
+        if interaction.handled {
+            self.panel = Panel::Agents;
+            if let Some(index) = interaction.selected {
+                self.selected_agent = index;
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(drag) = &mut self.dragging_agent
-                    && let Some(position) = self.agent_positions.get_mut(drag.index)
-                {
-                    let dx = i32::from(mouse.column) - i32::from(drag.column);
-                    let dy = i32::from(mouse.row) - i32::from(drag.row);
-                    position.x = (i32::from(position.x) + dx)
-                        .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
-                        as i16;
-                    position.y = (i32::from(position.y) + dy)
-                        .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
-                        as i16;
-                    drag.column = mouse.column;
-                    drag.row = mouse.row;
+        }
+    }
+
+    fn handle_team_adjustment_event(&mut self, event: &Event) -> TeamAdjustmentEvent {
+        if !self.team_adjustment_open {
+            return TeamAdjustmentEvent::Ignored;
+        }
+        if self.team_adjustment_saving {
+            return TeamAdjustmentEvent::Consumed;
+        }
+        let Event::Key(key) = event else {
+            return TeamAdjustmentEvent::Consumed;
+        };
+        if key.kind != KeyEventKind::Press {
+            return TeamAdjustmentEvent::Consumed;
+        }
+        if self.team_role_picker {
+            match key.code {
+                KeyCode::Esc => {
+                    self.team_role_picker = false;
+                    self.team_adjustment_notice = None;
                 }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.team_role_selected = self.team_role_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.team_role_selected =
+                        (self.team_role_selected + 1).min(ADDABLE_ROLES.len() - 1);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let Some(member) = self.new_team_member(ADDABLE_ROLES[self.team_role_selected])
+                    else {
+                        self.team_adjustment_notice =
+                            Some("The required Team Lead profile is unavailable.".into());
+                        return TeamAdjustmentEvent::Consumed;
+                    };
+                    self.team_adjustment_saving = true;
+                    self.team_adjustment_notice = Some("Adding specialist…".into());
+                    return TeamAdjustmentEvent::Add(Box::new(member));
+                }
+                _ => {}
             }
-            MouseEventKind::Up(MouseButton::Left) => self.dragging_agent = None,
+            return TeamAdjustmentEvent::Consumed;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('S') => {
+                self.team_adjustment_open = false;
+                self.team_adjustment_notice = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.team_adjustment_selected = self.team_adjustment_selected.saturating_sub(1);
+                self.team_adjustment_notice = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.team_adjustment_selected + 1 < self.agents.len() {
+                    self.team_adjustment_selected += 1;
+                }
+                self.team_adjustment_notice = None;
+            }
+            KeyCode::Char('n') => {
+                self.team_role_picker = true;
+                self.team_role_selected = 0;
+                self.team_adjustment_notice = None;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(agent) = self.agents.get(self.team_adjustment_selected) else {
+                    self.team_adjustment_notice = Some("No specialist is selected.".into());
+                    return TeamAdjustmentEvent::Consumed;
+                };
+                if Some(agent.id) == self.team_lead {
+                    self.team_adjustment_notice =
+                        Some("The Team Lead is required and cannot be disabled.".into());
+                    return TeamAdjustmentEvent::Consumed;
+                }
+                if self.agent_has_committed_work(agent) {
+                    self.team_adjustment_notice = Some(
+                        "Finish, cancel, or decide this specialist's active work before changing availability."
+                            .into(),
+                    );
+                    return TeamAdjustmentEvent::Consumed;
+                }
+                let mut updated = agent.clone();
+                updated.enabled = !updated.enabled;
+                self.team_adjustment_saving = true;
+                self.team_adjustment_notice = Some("Saving team adjustment…".into());
+                return TeamAdjustmentEvent::Save(Box::new(updated));
+            }
             _ => {}
         }
+        TeamAdjustmentEvent::Consumed
+    }
+
+    fn new_team_member(&self, role: DeveloperRole) -> Option<AgentProfile> {
+        let lead = self
+            .team_lead
+            .and_then(|id| self.agents.iter().find(|agent| agent.id == id))?;
+        let base_name = match role {
+            DeveloperRole::Backend => "Backend Developer",
+            DeveloperRole::Frontend => "Frontend Developer",
+            DeveloperRole::FullStack => "Full-stack Developer",
+            DeveloperRole::Reviewer => "Reviewer",
+            DeveloperRole::Tester => "Test Engineer",
+            DeveloperRole::DevOps => "DevOps Engineer",
+            DeveloperRole::Lead => return None,
+        };
+        let name = (1..)
+            .map(|index| {
+                if index == 1 {
+                    base_name.to_owned()
+                } else {
+                    format!("{base_name} {index}")
+                }
+            })
+            .find(|candidate| self.agents.iter().all(|agent| agent.name != *candidate))?;
+        let mut tools = role.tools();
+        tools.retain(|tool| !matches!(tool.as_str(), "task.delegate" | "review.request"));
+        let delegation_limits =
+            lead.delegation_limits
+                .as_ref()
+                .map(|limits| voff_core::TaskLimits {
+                    max_delegation_depth: 0,
+                    max_children: 0,
+                    max_duration_seconds: limits.max_duration_seconds,
+                });
+        Some(AgentProfile {
+            id: AgentId::new(),
+            name,
+            role: role.config_role().into(),
+            provider: lead.provider.clone(),
+            model: lead.model.clone(),
+            system_prompt: role.prompt().into(),
+            tools,
+            max_output_tokens: lead.max_output_tokens,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits,
+        })
+    }
+
+    fn agent_has_committed_work(&self, agent: &AgentProfile) -> bool {
+        self.tasks.iter().any(|task| {
+            task.owner == agent.id
+                && matches!(
+                    task.status,
+                    TaskStatus::Queued
+                        | TaskStatus::Ready
+                        | TaskStatus::Running
+                        | TaskStatus::WaitingApproval
+                )
+        }) || self.approvals.iter().any(|approval| {
+            approval.decision == ApprovalDecision::Pending
+                && matches!(approval.action.as_str(), "task.delegate" | "review.request")
+                && serde_json::from_str::<DelegationProposal>(&approval.reason)
+                    .is_ok_and(|proposal| proposal.target_agent == agent.name)
+        })
     }
 
     fn handle_credential_event(
@@ -479,9 +671,37 @@ impl AppModel {
         }
     }
     fn pending_approval(&self) -> Option<&Approval> {
+        let pending_count = self.pending_approval_count();
+        let selected = self.approval_selected.min(pending_count.saturating_sub(1));
         self.approvals
             .iter()
-            .find(|v| v.decision == ApprovalDecision::Pending)
+            .filter(|approval| approval.decision == ApprovalDecision::Pending)
+            .nth(selected)
+    }
+    fn pending_approval_count(&self) -> usize {
+        self.approvals
+            .iter()
+            .filter(|approval| approval.decision == ApprovalDecision::Pending)
+            .count()
+    }
+    fn navigate_approvals(&mut self, action: Action) -> bool {
+        let count = self.pending_approval_count();
+        if count == 0 {
+            self.approval_selected = 0;
+            return false;
+        }
+        self.approval_selected = self.approval_selected.min(count - 1);
+        match action {
+            Action::Up => {
+                self.approval_selected = self.approval_selected.saturating_sub(1);
+                true
+            }
+            Action::Down => {
+                self.approval_selected = (self.approval_selected + 1).min(count - 1);
+                true
+            }
+            _ => false,
+        }
     }
     fn push_event(&mut self, kind: &CanonicalEventKind) {
         if let CanonicalEventKind::TextDelta(delta) = kind {
@@ -548,6 +768,15 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('e') => Action::ToggleEvents,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
+        KeyCode::Char('f') => Action::FitTeam,
+        KeyCode::Char('+') | KeyCode::Char('=') => Action::ZoomTeamIn,
+        KeyCode::Char('-') => Action::ZoomTeamOut,
+        KeyCode::Char('0') => Action::ResetTeamZoom,
+        KeyCode::Char('S') => Action::AdjustTeam,
+        KeyCode::Char('1') => Action::ShowTeam,
+        KeyCode::Char('2') => Action::ShowTasks,
+        KeyCode::Char('3') => Action::ShowDetails,
+        KeyCode::Char('4') => Action::ShowEvents,
         KeyCode::Esc => Action::Escape,
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -603,8 +832,159 @@ fn format_event(kind: &CanonicalEventKind) -> String {
         CanonicalEventKind::TaskResultPublished { summary, .. } => {
             format!("result: {}", sanitize(summary))
         }
+        CanonicalEventKind::AgentAvailabilityChanged { name, enabled, .. } => format!(
+            "team: {} {}",
+            sanitize(name),
+            if *enabled { "enabled" } else { "disabled" }
+        ),
+        CanonicalEventKind::AgentAdded { name, role, .. } => {
+            format!("team: {} added as {}", sanitize(name), sanitize(role))
+        }
     }
 }
+
+fn delegation_plan_for_available_agents(
+    agents: &[AgentProfile],
+    team_lead: Option<AgentId>,
+    configured: &[DelegationProposal],
+) -> Vec<DelegationProposal> {
+    let Some(lead) = team_lead.and_then(|id| agents.iter().find(|agent| agent.id == id)) else {
+        return configured.to_vec();
+    };
+    let eligible = agents
+        .iter()
+        .filter(|agent| agent.enabled && agent.id != lead.id)
+        .filter(|agent| lead.allowed_targets.contains(&agent.name))
+        .collect::<Vec<_>>();
+    let eligible_names = eligible
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut plan = Vec::new();
+    for proposal in configured {
+        if eligible_names.contains(proposal.target_agent.as_str()) {
+            plan.push(proposal.clone());
+            continue;
+        }
+        let replacement = agents
+            .iter()
+            .find(|agent| agent.name == proposal.target_agent)
+            .and_then(|original| {
+                eligible.iter().find(|candidate| {
+                    candidate.role == original.role
+                        && plan.iter().all(|planned: &DelegationProposal| {
+                            planned.target_agent != candidate.name
+                        })
+                })
+            });
+        if let Some(replacement) = replacement {
+            let mut reassigned = proposal.clone();
+            reassigned.target_agent = replacement.name.clone();
+            plan.push(reassigned);
+        }
+    }
+    for (index, agent) in eligible.into_iter().enumerate() {
+        if plan
+            .iter()
+            .any(|proposal| proposal.target_agent == agent.name)
+        {
+            continue;
+        }
+        plan.push(supporting_delegation(agent, index + 1));
+    }
+    plan
+}
+
+fn supporting_delegation(agent: &AgentProfile, ordinal: usize) -> DelegationProposal {
+    let stem = agent
+        .name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let stem = if stem.is_empty() {
+        format!("specialist-{ordinal}")
+    } else {
+        stem
+    };
+    let (objective, acceptance_criteria) = match agent.role.as_str() {
+        "backend_developer" => {
+            let path = format!("{stem}-backend-assessment.md");
+            (
+                format!(
+                    "Independently assess the parent objective's backend contract and write only {path}. Do not modify another specialist-owned file. Record edge cases, interface risks, and concrete verification advice for the Team Lead."
+                ),
+                vec![
+                    format!("{path} contains a concrete backend assessment"),
+                    "No product implementation file is modified".into(),
+                ],
+            )
+        }
+        "frontend_developer" => {
+            let path = format!("{stem}-frontend-assessment.md");
+            (
+                format!(
+                    "Independently assess the parent objective's accessibility and client/interface behavior and write only {path}. Do not modify another specialist-owned file. Return actionable findings to the Team Lead."
+                ),
+                vec![
+                    format!("{path} covers accessibility, loading, and error states"),
+                    "No product implementation file is modified".into(),
+                ],
+            )
+        }
+        "code_reviewer" => (
+            "Review the current workspace and parent acceptance criteria without editing files. Return prioritized correctness, security, and integration findings to the Team Lead.".into(),
+            vec![
+                "Findings are concrete and prioritized".into(),
+                "The review identifies any blocking acceptance gap".into(),
+            ],
+        ),
+        "test_engineer" => (
+            "Design a reproducible validation matrix for the parent objective without editing specialist-owned files. Cover primary behavior, malformed input, accessibility, failure handling, and integration; return the evidence plan to the Team Lead.".into(),
+            vec![
+                "Validation covers success and failure paths".into(),
+                "Every check has reproducible steps and expected results".into(),
+            ],
+        ),
+        "devops_engineer" => {
+            let path = format!("{stem}-runbook.md");
+            (
+                format!(
+                    "Write only {path} with a dependency-minimal local runbook for starting, checking, and stopping the parent deliverable. Do not modify implementation files."
+                ),
+                vec![
+                    format!("{path} documents startup, health checking, and shutdown"),
+                    "The runbook states every runtime dependency explicitly".into(),
+                ],
+            )
+        }
+        _ => {
+            let path = format!("{stem}-integration-notes.md");
+            (
+                format!(
+                    "Write only {path} with an independent integration analysis for the parent objective. Do not modify another specialist's artifact."
+                ),
+                vec![
+                    format!("{path} identifies cross-layer risks and verification steps"),
+                    "No specialist-owned implementation file is modified".into(),
+                ],
+            )
+        }
+    };
+    DelegationProposal {
+        target_agent: agent.name.clone(),
+        objective,
+        acceptance_criteria,
+    }
+}
+
 fn sanitize(value: &str) -> String {
     let clean: String = value
         .chars()
@@ -671,6 +1051,7 @@ pub(crate) struct ConfiguredRun {
     pub model_catalog: ModelCatalog,
     pub agent_provider_kinds: HashMap<AgentId, String>,
     pub credential_target: Option<(String, crate::credential::CredentialSlot)>,
+    pub team_lead: AgentId,
 }
 pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError> {
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
@@ -681,6 +1062,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
         Engine::new(config.repo, config.provider, config.session, event_tx)
             .with_provider_registry(config.providers, config.default_provider)
             .with_formation_agents(&agent_profiles)
+            .with_team_lead(config.team_lead)
             .with_runtime(config.model_name, config.system_prompt)
             .with_workspace_context(config.workspace_context)
             .with_safe_workflow(&config.workspace_root)
@@ -691,7 +1073,6 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
     app.workspace_root = config.workspace_root.clone();
     app.provider_label = config.provider_label;
     app.agent_name = config.agent_name;
-    app.agent_positions = vec![AgentPosition::default(); agent_profiles.len()];
     app.agents = agent_profiles;
     app.model_label = model_label;
     app.input_cost_per_million = config.input_cost_per_million;
@@ -705,6 +1086,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
     app.model_catalog = config.model_catalog;
     app.agent_provider_kinds = config.agent_provider_kinds;
     app.credential_target = config.credential_target;
+    app.team_lead = Some(config.team_lead);
     if app.input_cost_per_million.is_some() && app.output_cost_per_million.is_some()
         || app.agents.iter().any(|agent| {
             app.agent_provider_kinds
@@ -769,10 +1151,59 @@ async fn terminal_loop<R: Repository + 'static>(
         }
     });
     let (credential_tx, mut credential_rx) = mpsc::channel(1);
+    let (team_adjustment_tx, mut team_adjustment_rx) =
+        mpsc::channel::<Result<SavedTeamAdjustment, String>>(1);
+    let (lead_submission_tx, mut lead_submission_rx) =
+        mpsc::channel::<Result<&'static str, String>>(8);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     while !model.quit {
         tokio::select! {
             Some(event)=input_rx.recv()=>{
+                let team_adjustment = model.handle_team_adjustment_event(&event);
+                if let TeamAdjustmentEvent::Save(profile) = team_adjustment {
+                    let profile = *profile;
+                    let team_adjustment_tx = team_adjustment_tx.clone();
+                    let repository = Arc::clone(&credential_repository);
+                    let session_id = model.session;
+                    tokio::spawn(async move {
+                        let audit = CanonicalEvent {
+                            id: EventId::new(),
+                            session_id,
+                            task_id: None,
+                            created_at: chrono::Utc::now(),
+                            kind: CanonicalEventKind::AgentAvailabilityChanged {
+                                agent_id: profile.id,
+                                name: profile.name.clone(),
+                                enabled: profile.enabled,
+                            },
+                        };
+                        let result = async {
+                            repository
+                                .save_agent(profile.clone())
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            repository
+                                .append_event(audit.clone())
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            Ok(SavedTeamAdjustment::Availability(profile, audit))
+                        }
+                        .await;
+                        let _ = team_adjustment_tx.send(result).await;
+                    });
+                } else if let TeamAdjustmentEvent::Add(profile) = team_adjustment {
+                    let profile = *profile;
+                    let engine = Arc::clone(&engine);
+                    let team_adjustment_tx = team_adjustment_tx.clone();
+                    tokio::spawn(async move {
+                        let result = engine
+                            .add_team_member(profile.clone())
+                            .await
+                            .map(|lead| SavedTeamAdjustment::Added(profile, lead))
+                            .map_err(|error| error.to_string());
+                        let _ = team_adjustment_tx.send(result).await;
+                    });
+                } else if matches!(team_adjustment, TeamAdjustmentEvent::Ignored) {
                 let (handled, submission) = model.handle_credential_event(&event);
                 if let Some((reference, slot, token)) = submission {
                     model.credential_saving = true;
@@ -790,20 +1221,72 @@ async fn terminal_loop<R: Repository + 'static>(
                         ComposerEvent::Submit(message) if message == "/tasks" => {
                             model.list_current_tasks();
                         }
+                        ComposerEvent::Submit(message) if message == "/task" => {
+                            model.composer_notice =
+                                Some("Use /task <objective> to assign work to the Team Lead.".into());
+                        }
+                        ComposerEvent::Submit(message) if message.starts_with("/task ") => {
+                            let objective = message[6..].trim().to_owned();
+                            if objective.is_empty() {
+                                model.composer_notice = Some(
+                                    "Use /task <objective> to assign work to the Team Lead.".into(),
+                                );
+                            } else {
+                                model.composer_notice = Some("Task sent to Team Lead.".into());
+                                model.push_ui_event(format!(
+                                    "you → Team Lead task: {}",
+                                    sanitize(&objective)
+                                ));
+                                let engine = Arc::clone(&engine);
+                                let lead_submission_tx = lead_submission_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = async {
+                                        let task = engine
+                                            .create_task(
+                                                owner,
+                                                objective,
+                                                vec![
+                                                    "Team Lead completes or delegates the requested work"
+                                                        .into(),
+                                                ],
+                                            )
+                                            .await?;
+                                        engine.mark_ready(task.id).await?;
+                                        engine.run_task(task.id).await
+                                    }
+                                    .await
+                                    .map(|()| "Task accepted by Team Lead.")
+                                    .map_err(|error| error.to_string());
+                                    let _ = lead_submission_tx.send(result).await;
+                                });
+                            }
+                        }
                         ComposerEvent::Submit(message) if message.starts_with('/') => {
                             model.composer_notice = Some(format!(
-                                "Unknown command: {message}. Try /tasks."
+                                "Unknown command: {message}. Try /task <objective> or /tasks."
                             ));
                         }
                         ComposerEvent::Submit(message) => {
                             model.composer_notice = Some("Sent to Team Lead.".into());
                             model.push_ui_event(format!("you → Team Lead: {}", sanitize(&message)));
-                            let engine=Arc::clone(&engine);
-                            tokio::spawn(async move{
-                                if let Ok(task)=engine.create_task(owner,message,vec!["Team Lead responds with a useful result".into()]).await{
-                                    let _=engine.mark_ready(task.id).await;
-                                    let _=engine.run_task(task.id).await;
+                            let engine = Arc::clone(&engine);
+                            let lead_submission_tx = lead_submission_tx.clone();
+                            tokio::spawn(async move {
+                                let result = async {
+                                    let task = engine
+                                        .create_task(
+                                            owner,
+                                            message,
+                                            vec!["Team Lead responds with a useful result".into()],
+                                        )
+                                        .await?;
+                                    engine.mark_ready(task.id).await?;
+                                    engine.run_conversation(task.id).await
                                 }
+                                .await
+                                .map(|()| "Team Lead replied.")
+                                .map_err(|error| error.to_string());
+                                let _ = lead_submission_tx.send(result).await;
                             });
                         }
                         ComposerEvent::Consumed => {}
@@ -813,7 +1296,11 @@ async fn terminal_loop<R: Repository + 'static>(
                                 Action::StartMock => {
                                     let engine = Arc::clone(&engine);
                                     let objective = objective.clone();
-                                    let plan = delegation_plan.clone();
+                                    let plan = delegation_plan_for_available_agents(
+                                        &model.agents,
+                                        model.team_lead,
+                                        &delegation_plan,
+                                    );
                                     tokio::spawn(async move {
                                         let criteria = if plan.is_empty() {
                                             vec!["Provider run completes".into()]
@@ -841,6 +1328,7 @@ async fn terminal_loop<R: Repository + 'static>(
                         }
                     }
                 }
+                }
             }
             Some(result)=credential_rx.recv()=>{
                 model.credential_saving = false;
@@ -853,9 +1341,65 @@ async fn terminal_loop<R: Repository + 'static>(
                     Err(error) => model.credential_error = Some(error),
                 }
             }
+            Some(result)=team_adjustment_rx.recv()=>{
+                model.team_adjustment_saving = false;
+                match result {
+                    Ok(SavedTeamAdjustment::Availability(profile, audit)) => {
+                        if let Some(agent) = model.agents.iter_mut().find(|agent| agent.id == profile.id) {
+                            *agent = profile.clone();
+                        }
+                        model.team_adjustment_notice = Some(format!(
+                            "{} is now {} for future Team Lead assignments.",
+                            profile.name,
+                            if profile.enabled { "enabled" } else { "disabled" }
+                        ));
+                        model.push_event(&audit.kind);
+                    }
+                    Ok(SavedTeamAdjustment::Added(profile, lead)) => {
+                        let provider_kind = model
+                            .team_lead
+                            .and_then(|id| model.agent_provider_kinds.get(&id))
+                            .cloned();
+                        if let Some(configured_lead) = model
+                            .agents
+                            .iter_mut()
+                            .find(|agent| agent.id == lead.id)
+                        {
+                            *configured_lead = lead;
+                        }
+                        if let Some(provider_kind) = provider_kind {
+                            model.agent_provider_kinds.insert(profile.id, provider_kind);
+                        }
+                        model.agents.push(profile.clone());
+                        model.team_adjustment_selected = model.agents.len() - 1;
+                        model.selected_agent = model.team_adjustment_selected;
+                        model.team_role_picker = false;
+                        model.team_adjustment_notice = Some(format!(
+                            "{} added and ready for Team Lead assignments.",
+                            profile.name
+                        ));
+                    }
+                    Err(error) => model.team_adjustment_notice = Some(format!(
+                        "Could not save the team adjustment: {}",
+                        sanitize(&error)
+                    )),
+                }
+            }
+            Some(result)=lead_submission_rx.recv()=>{
+                match result {
+                    Ok(notice) => model.composer_notice = Some(notice.into()),
+                    Err(error) => {
+                        let error = sanitize(&error);
+                        model.composer_notice = Some(format!(
+                            "Team Lead request failed: {error}"
+                        ));
+                        model.push_ui_event(format!("Team Lead request failed: {error}"));
+                    }
+                }
+            }
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
-                model.animation_tick = model.animation_tick.wrapping_add(1);
+                model.team_flow.tick(Duration::from_millis(100));
                 terminal.draw(|frame|render(frame,model))?;
             }
             else=>{model.quit=true}
@@ -901,6 +1445,12 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
             }
         })
         .unwrap_or_default();
+    let view = match app.panel {
+        Panel::Agents => "Team",
+        Panel::Tasks => "Tasks",
+        Panel::Details => "Details",
+        Panel::Events => "Events",
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -911,14 +1461,16 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
-                    "workspace · {} developers · session {}",
+                    "workspace · {}/{} developers enabled · {} view · session {}",
+                    app.agents.iter().filter(|agent| agent.enabled).count(),
                     app.agents.len(),
+                    view,
                     &session[..session.len().min(8)]
                 )),
             ]),
             Line::from(Span::styled(
                 format!(
-                    " {} · {} · circuit {:?} · {} retries · {cost}{credential}",
+                    " [1 Team] [2 Tasks] [3 Details] [4 Events] · {} · {} · circuit {:?} · {} retries · {cost}{credential}",
                     app.provider_label,
                     app.model_label,
                     app.provider_health.circuit,
@@ -935,25 +1487,19 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         rows[0],
     );
 
-    let horizontal = frame.area().width >= 100;
-    let body = Layout::default()
-        .direction(if horizontal {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(rows[1]);
-    render_team(frame, app, body[0]);
-    render_activity(frame, app, body[1]);
+    if app.panel == Panel::Agents {
+        render_team(frame, app, rows[1]);
+    } else {
+        render_activity(frame, app, rows[1]);
+    }
 
     let workspace = sanitize(&app.workspace_root.display().to_string());
     let composer_title = if app.composer_active {
         format!(" Team Lead · cwd {workspace} · Enter send · Shift+Enter newline · Esc keep draft ")
     } else if let Some(notice) = &app.composer_notice {
-        format!(" {notice} · cwd {workspace} · Enter message · /tasks list ")
+        format!(" {notice} · cwd {workspace} · /task assign · /tasks list ")
     } else {
-        format!(" Team Lead · cwd {workspace} · Enter message · /tasks list · t also focuses ")
+        format!(" Team Lead · cwd {workspace} · Enter message · /task assign · /tasks list ")
     };
     let composer_color = if app.composer_active {
         Color::LightCyan
@@ -975,92 +1521,92 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
 }
 
 fn render_activity(frame: &mut ratatui::Frame<'_>, app: &AppModel, area: Rect) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(32),
-            Constraint::Percentage(34),
-            Constraint::Percentage(34),
-        ])
-        .split(area);
-    let tasks = app
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            ListItem::new(format!(
-                "{} {}{} [{:?}]",
-                if i == app.selected { "▶" } else { " " },
-                "  ".repeat(usize::from(t.depth)),
-                t.objective,
-                t.status
-            ))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(tasks).block(panel("Tasks", app.panel == Panel::Tasks)),
-        sections[0],
-    );
-    let details = app.selected_task().map_or_else(
-        || "Your team is ready. Press r to start the configured objective.".into(),
-        |t| {
-            let artifact_text = app
-                .artifacts
+    match app.panel {
+        Panel::Tasks => {
+            let tasks = app
+                .tasks
                 .iter()
-                .filter(|a| a.producer == t.id)
-                .map(|a| {
-                    format!(
-                        "\n\nArtifact: {} ({})\n{}",
-                        a.location,
-                        a.kind,
-                        sanitize(&a.preview)
-                    )
+                .enumerate()
+                .map(|(i, task)| {
+                    ListItem::new(format!(
+                        "{} {}{} [{:?}]",
+                        if i == app.selected { "▶" } else { " " },
+                        "  ".repeat(usize::from(task.depth)),
+                        task.objective,
+                        task.status
+                    ))
                 })
-                .collect::<String>();
-            format!(
-                "Owner: {}\nStatus: {:?}\nObjective: {}\nCriteria:\n{}{}",
-                t.owner,
-                t.status,
-                t.objective,
-                t.acceptance_criteria.join("\n"),
-                artifact_text
-            )
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(details)
-            .wrap(Wrap { trim: true })
-            .block(panel("Task Details", app.panel == Panel::Details)),
-        sections[1],
-    );
-    let logs = app
-        .events
-        .iter()
-        .enumerate()
-        .rev()
-        .map(|(index, event)| format!("[{}] {event}", index + 1))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let event_title = if app.event_follow {
-        "Events · live (e: expand)"
-    } else {
-        "Events · paused (↑ to newest)"
-    };
-    frame.render_widget(
-        Paragraph::new(logs)
-            .wrap(Wrap { trim: false })
-            .scroll((app.event_scroll, 0))
-            .block(panel(event_title, app.panel == Panel::Events)),
-        sections[2],
-    );
+                .collect::<Vec<_>>();
+            frame.render_widget(List::new(tasks).block(panel("2 · Tasks", true)), area);
+        }
+        Panel::Details => {
+            let details = app.selected_task().map_or_else(
+                || "No task selected. Press 2 to choose a task or r to start work.".into(),
+                |task| {
+                    let artifact_text = app
+                        .artifacts
+                        .iter()
+                        .filter(|artifact| artifact.producer == task.id)
+                        .map(|artifact| {
+                            format!(
+                                "\n\nArtifact: {} ({})\n{}",
+                                artifact.location,
+                                artifact.kind,
+                                sanitize(&artifact.preview)
+                            )
+                        })
+                        .collect::<String>();
+                    format!(
+                        "Owner: {}\nStatus: {:?}\nObjective: {}\nCriteria:\n{}{}",
+                        task.owner,
+                        task.status,
+                        task.objective,
+                        task.acceptance_criteria.join("\n"),
+                        artifact_text
+                    )
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(details)
+                    .wrap(Wrap { trim: true })
+                    .block(panel("3 · Task Details", true)),
+                area,
+            );
+        }
+        Panel::Events => {
+            let logs = app
+                .events
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, event)| format!("[{}] {event}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let event_title = if app.event_follow {
+                "4 · Events · live"
+            } else {
+                "4 · Events · paused (↑ to newest)"
+            };
+            frame.render_widget(
+                Paragraph::new(logs)
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.event_scroll, 0))
+                    .block(panel(event_title, true)),
+                area,
+            );
+        }
+        Panel::Agents => {}
+    }
 }
 
 fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
     let handoff = handoff_summary(&app.tasks, &app.approvals);
     let title = if app.panel == Panel::Agents {
-        format!(" Team · {handoff} · selected · click & drag cards ")
+        format!(
+            " specialist → Lead → specialist · {handoff} · · available / ▶ live · S adjust · +/- zoom · f fit "
+        )
     } else {
-        format!(" Team · {handoff} · Tab select · drag cards ")
+        format!(" specialist → Lead → specialist · {handoff} · · available / ▶ live · S adjust ")
     };
     frame.render_widget(
         panel(&title, app.panel == Panel::Agents).border_type(BorderType::Rounded),
@@ -1077,689 +1623,16 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
         );
         return;
     }
-    if app.agent_positions.len() != app.agents.len() {
-        app.agent_positions = vec![AgentPosition::default(); app.agents.len()];
-    }
-    let cards = agent_layout(inner, app.agents.len(), &app.agent_positions);
-    draw_threads(
-        frame,
+    app.team_flow.sync(
         &app.agents,
         &app.tasks,
         &app.approvals,
-        &cards,
-        app.animation_tick,
+        app.team_lead,
+        app.selected_agent,
+        inner,
     );
-    app.agent_hitboxes = cards.clone();
-    for (index, (agent, card)) in app.agents.iter().zip(cards.iter().copied()).enumerate() {
-        if card.width < 4 || card.height < 3 {
-            continue;
-        }
-        let selected = index == app.selected_agent;
-        let pending = pending_delegation_for_target(&app.approvals, &agent.name);
-        let (status, status_color) = agent_status(&app.tasks, agent.id, pending.is_some());
-        let display_task = agent_display_task(&app.tasks, agent.id);
-        let color = role_color(&agent.role);
-        let title = format!(" {} {} ", role_icon(&agent.role), sanitize(&agent.name));
-        let status_line = || {
-            Line::from(vec![
-                Span::styled(
-                    format!("{} {status}", status_symbol(status)),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(
-                    format!("  {}", agent.provider),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        };
-        let mut lines = if card.height <= 3 {
-            vec![status_line()]
-        } else {
-            vec![
-                Line::from(Span::styled(
-                    human_role(&agent.role),
-                    Style::default().fg(Color::Gray),
-                )),
-                status_line(),
-            ]
-        };
-        if card.height >= 6 {
-            lines.push(Line::from(Span::styled(
-                agent.model.as_str(),
-                Style::default().fg(Color::LightCyan),
-            )));
-        }
-        if card.height >= 7 {
-            lines.push(Line::from(Span::styled(
-                if let Some(task) = display_task {
-                    format!(
-                        "{} {}",
-                        task_status_marker(task.status),
-                        truncate_label(&sanitize(&task.objective), card.width.saturating_sub(4))
-                    )
-                } else if let Some(proposal) = &pending {
-                    format!(
-                        "? {}",
-                        truncate_label(
-                            &sanitize(&proposal.objective),
-                            card.width.saturating_sub(4)
-                        )
-                    )
-                } else if agent.allowed_targets.is_empty() {
-                    format!("{} tokens · no delegation", agent.max_output_tokens)
-                } else {
-                    format!("{} tokens · delegation", agent.max_output_tokens)
-                },
-                Style::default().fg(if display_task.is_some() || pending.is_some() {
-                    status_color
-                } else {
-                    Color::DarkGray
-                }),
-            )));
-        }
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .title(title)
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(if selected {
-                            Style::default().fg(color).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
-                ),
-            card,
-        );
-        if status == "working" {
-            frame.render_widget(
-                FluxSpinner::new(app.animation_tick)
-                    .frames(FluxFrames::ORBIT)
-                    .color(status_color),
-                Rect::new(card.x.saturating_add(1), card.y.saturating_add(2), 1, 1),
-            );
-        }
-    }
-    draw_connection_ports(frame, &app.agents, &app.tasks, &app.approvals, &cards);
+    app.team_flow.render(frame, inner);
 }
-
-fn handoff_summary(tasks: &[Task], approvals: &[Approval]) -> String {
-    let delegated = tasks
-        .iter()
-        .filter(|task| task.parent.is_some())
-        .collect::<Vec<_>>();
-    let pending = approvals
-        .iter()
-        .filter(|approval| {
-            approval.action == "task.delegate"
-                && approval.decision == ApprovalDecision::Pending
-                && serde_json::from_str::<DelegationProposal>(&approval.reason).is_ok()
-        })
-        .count();
-    if delegated.is_empty() && pending == 0 {
-        return "no handoffs yet".into();
-    }
-    let active = delegated
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Queued
-                    | TaskStatus::Ready
-                    | TaskStatus::Running
-                    | TaskStatus::WaitingApproval
-            )
-        })
-        .count();
-    let completed = delegated
-        .iter()
-        .filter(|task| task.status == TaskStatus::Completed)
-        .count();
-    let failed = delegated
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Blocked | TaskStatus::Failed | TaskStatus::Cancelled
-            )
-        })
-        .count();
-    if active > 0 && pending > 0 {
-        format!("{active} active · {pending} awaiting approval")
-    } else if pending > 0 {
-        format!(
-            "{pending} handoff{} awaiting approval",
-            plural_suffix(pending)
-        )
-    } else if active > 0 {
-        format!("{active} handoff active")
-    } else if failed > 0 {
-        format!("{failed} handoff failed")
-    } else {
-        format!("{completed} handoff complete")
-    }
-}
-
-const fn plural_suffix(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
-}
-
-fn agent_layout(area: Rect, count: usize, positions: &[AgentPosition]) -> Vec<Rect> {
-    if count == 0 {
-        return vec![];
-    }
-    let columns = usize::from((area.width / 24).max(1)).min(count.max(1));
-    let worker_rows = count.saturating_sub(1).div_ceil(columns);
-    let total_rows = 1 + worker_rows;
-    let row_gaps = total_rows.saturating_sub(1);
-    let row_gap = if row_gaps > 0
-        && usize::from(area.height) >= total_rows.saturating_mul(4) + row_gaps.saturating_mul(3)
-    {
-        3
-    } else if row_gaps > 0 {
-        1
-    } else {
-        0
-    };
-    let used_by_gaps = row_gaps.saturating_mul(row_gap);
-    let card_height = (area
-        .height
-        .saturating_sub(u16::try_from(used_by_gaps).unwrap_or(u16::MAX))
-        / u16::try_from(total_rows).unwrap_or(u16::MAX))
-    .clamp(3, 7)
-    .min(area.height);
-    let column_width = area.width / u16::try_from(columns).unwrap_or(1).max(1);
-    let card_width = column_width.saturating_sub(2).clamp(8, 28).min(area.width);
-    (0..count)
-        .map(|index| {
-            let (base_x, base_y) = if index == 0 {
-                (area.x + area.width.saturating_sub(card_width) / 2, area.y)
-            } else {
-                let worker = index - 1;
-                let column = worker % columns;
-                let row = worker / columns + 1;
-                (
-                    area.x
-                        + u16::try_from(column).unwrap_or(0) * column_width
-                        + column_width.saturating_sub(card_width) / 2,
-                    area.y
-                        + u16::try_from(row).unwrap_or(u16::MAX).saturating_mul(
-                            card_height.saturating_add(u16::try_from(row_gap).unwrap_or(u16::MAX)),
-                        ),
-                )
-            };
-            let position = positions.get(index).copied().unwrap_or_default();
-            let max_x = area.right().saturating_sub(card_width);
-            let max_y = area.bottom().saturating_sub(card_height);
-            Rect::new(
-                offset(base_x, position.x).clamp(area.x, max_x),
-                offset(base_y, position.y).clamp(area.y, max_y),
-                card_width,
-                card_height,
-            )
-        })
-        .collect()
-}
-
-fn offset(value: u16, delta: i16) -> u16 {
-    (i32::from(value) + i32::from(delta)).clamp(0, i32::from(u16::MAX)) as u16
-}
-
-fn draw_threads(
-    frame: &mut ratatui::Frame<'_>,
-    agents: &[AgentProfile],
-    tasks: &[Task],
-    approvals: &[Approval],
-    cards: &[Rect],
-    tick: u64,
-) {
-    for (source_index, source) in agents.iter().enumerate() {
-        for (target_index, target) in agents.iter().enumerate() {
-            if source_index == target_index {
-                continue;
-            }
-            let delegated_task = delegated_task(tasks, source.id, target.id);
-            let pending = pending_delegation(approvals, tasks, source.id, &target.name);
-            if !source.allowed_targets.contains(&target.name)
-                && delegated_task.is_none()
-                && pending.is_none()
-            {
-                continue;
-            }
-            let Some((source_card, target_card)) =
-                cards.get(source_index).zip(cards.get(target_index))
-            else {
-                continue;
-            };
-            draw_thread(
-                frame,
-                source_card,
-                target_card,
-                delegated_task,
-                pending.as_ref(),
-                tick,
-            );
-        }
-    }
-}
-
-fn draw_thread(
-    frame: &mut ratatui::Frame<'_>,
-    source: &Rect,
-    target: &Rect,
-    task: Option<&Task>,
-    pending: Option<&DelegationProposal>,
-    tick: u64,
-) {
-    let (from, to, downward) = thread_endpoints(source, target);
-    let bend = from.1.min(to.1) + from.1.abs_diff(to.1) / 2;
-    draw_line(frame, from, (from.0, bend), Color::DarkGray, "┊", "┈");
-    draw_line(
-        frame,
-        (from.0, bend),
-        (to.0, bend),
-        Color::DarkGray,
-        "┊",
-        "┈",
-    );
-    draw_line(frame, (to.0, bend), to, Color::DarkGray, "┊", "┈");
-    let arrow_y = if downward {
-        to.1.saturating_sub(1)
-    } else {
-        to.1.saturating_add(1)
-    };
-    set_thread_cell(
-        frame,
-        to.0,
-        arrow_y,
-        if downward { "▼" } else { "▲" },
-        Color::DarkGray,
-    );
-
-    let (color, marker, objective, running) = if let Some(task) = task {
-        (
-            task_status_color(task.status),
-            match task.status {
-                TaskStatus::Running => "▶ working",
-                TaskStatus::WaitingApproval => "? approval",
-                TaskStatus::Completed => "✓ done",
-                TaskStatus::Failed | TaskStatus::Blocked => "! failed",
-                TaskStatus::Cancelled => "× cancelled",
-                TaskStatus::Queued | TaskStatus::Ready => "◇ queued",
-            },
-            task.objective.as_str(),
-            task.status == TaskStatus::Running,
-        )
-    } else if let Some(proposal) = pending {
-        (
-            Color::Yellow,
-            "? approval",
-            proposal.objective.as_str(),
-            false,
-        )
-    } else {
-        return;
-    };
-    draw_line(frame, from, (from.0, bend), color, "┃", "━");
-    draw_line(frame, (from.0, bend), (to.0, bend), color, "┃", "━");
-    draw_line(frame, (to.0, bend), to, color, "┃", "━");
-    set_thread_cell(
-        frame,
-        to.0,
-        arrow_y,
-        if downward { "▼" } else { "▲" },
-        color,
-    );
-    if running {
-        let route = orthogonal_route(from, (from.0, bend), (to.0, bend), to);
-        let route_len = u64::try_from(route.len()).unwrap_or(u64::MAX).max(1);
-        let pulse_index = usize::try_from((tick / 2) % route_len).unwrap_or(0);
-        if let Some(&(x, y)) = route.get(pulse_index) {
-            set_thread_cell(frame, x, y, "◆", Color::White);
-        }
-    }
-    draw_delegation_label(frame, from, to, bend, marker, objective, color);
-}
-
-fn thread_endpoints(source: &Rect, target: &Rect) -> ((u16, u16), (u16, u16), bool) {
-    let downward = source.y + source.height / 2 <= target.y + target.height / 2;
-    if downward {
-        (
-            (
-                source.x + source.width / 2,
-                source.bottom().saturating_sub(1),
-            ),
-            (target.x.saturating_add(1), target.y),
-            true,
-        )
-    } else {
-        (
-            (source.x.saturating_add(1), source.y),
-            (
-                target.x + target.width / 2,
-                target.bottom().saturating_sub(1),
-            ),
-            false,
-        )
-    }
-}
-
-fn draw_connection_ports(
-    frame: &mut ratatui::Frame<'_>,
-    agents: &[AgentProfile],
-    tasks: &[Task],
-    approvals: &[Approval],
-    cards: &[Rect],
-) {
-    for (source_index, source) in agents.iter().enumerate() {
-        for (target_index, target) in agents.iter().enumerate() {
-            if source_index == target_index {
-                continue;
-            }
-            let task = delegated_task(tasks, source.id, target.id);
-            let pending = pending_delegation(approvals, tasks, source.id, &target.name);
-            if !source.allowed_targets.contains(&target.name) && task.is_none() && pending.is_none()
-            {
-                continue;
-            }
-            let Some((source_card, target_card)) =
-                cards.get(source_index).zip(cards.get(target_index))
-            else {
-                continue;
-            };
-            let (source_port, target_port, _) = thread_endpoints(source_card, target_card);
-            let (symbol, color) = task.map_or_else(
-                || {
-                    if pending.is_some() {
-                        ("●", Color::Yellow)
-                    } else {
-                        ("○", Color::DarkGray)
-                    }
-                },
-                |task| ("●", task_status_color(task.status)),
-            );
-            set_thread_cell(frame, source_port.0, source_port.1, symbol, color);
-            set_thread_cell(frame, target_port.0, target_port.1, symbol, color);
-        }
-    }
-}
-
-fn draw_line(
-    frame: &mut ratatui::Frame<'_>,
-    from: (u16, u16),
-    to: (u16, u16),
-    color: Color,
-    vertical: &'static str,
-    horizontal: &'static str,
-) {
-    if from.0 == to.0 {
-        for y in from.1.min(to.1)..=from.1.max(to.1) {
-            set_thread_cell(frame, from.0, y, vertical, color);
-        }
-    } else if from.1 == to.1 {
-        for x in from.0.min(to.0)..=from.0.max(to.0) {
-            set_thread_cell(frame, x, from.1, horizontal, color);
-        }
-    }
-}
-
-fn set_thread_cell(
-    frame: &mut ratatui::Frame<'_>,
-    x: u16,
-    y: u16,
-    symbol: &'static str,
-    color: Color,
-) {
-    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-        cell.set_symbol(symbol).set_fg(color);
-    }
-}
-
-fn delegated_task(tasks: &[Task], source: AgentId, target: AgentId) -> Option<&Task> {
-    tasks
-        .iter()
-        .filter(|task| task.owner == target)
-        .filter(|task| {
-            task.parent.is_some_and(|parent_id| {
-                tasks
-                    .iter()
-                    .any(|parent| parent.id == parent_id && parent.owner == source)
-            })
-        })
-        .max_by(|left, right| {
-            task_priority(left.status)
-                .cmp(&task_priority(right.status))
-                .then_with(|| left.updated_at.cmp(&right.updated_at))
-        })
-}
-
-fn pending_delegation(
-    approvals: &[Approval],
-    tasks: &[Task],
-    source: AgentId,
-    target_name: &str,
-) -> Option<DelegationProposal> {
-    approvals.iter().rev().find_map(|approval| {
-        if approval.action != "task.delegate" || approval.decision != ApprovalDecision::Pending {
-            return None;
-        }
-        let parent_matches = tasks
-            .iter()
-            .any(|task| task.id == approval.task_id && task.owner == source);
-        if !parent_matches {
-            return None;
-        }
-        let proposal = serde_json::from_str::<DelegationProposal>(&approval.reason).ok()?;
-        (proposal.target_agent == target_name).then_some(proposal)
-    })
-}
-
-fn pending_delegation_for_target(
-    approvals: &[Approval],
-    target_name: &str,
-) -> Option<DelegationProposal> {
-    approvals.iter().rev().find_map(|approval| {
-        if approval.action != "task.delegate" || approval.decision != ApprovalDecision::Pending {
-            return None;
-        }
-        let proposal = serde_json::from_str::<DelegationProposal>(&approval.reason).ok()?;
-        (proposal.target_agent == target_name).then_some(proposal)
-    })
-}
-
-fn agent_display_task(tasks: &[Task], owner: AgentId) -> Option<&Task> {
-    tasks
-        .iter()
-        .filter(|task| task.owner == owner)
-        .max_by(|left, right| {
-            task_priority(left.status)
-                .cmp(&task_priority(right.status))
-                .then_with(|| left.updated_at.cmp(&right.updated_at))
-        })
-}
-
-const fn task_priority(status: TaskStatus) -> u8 {
-    match status {
-        TaskStatus::Running => 7,
-        TaskStatus::WaitingApproval => 6,
-        TaskStatus::Ready => 5,
-        TaskStatus::Queued => 4,
-        TaskStatus::Blocked => 3,
-        TaskStatus::Failed => 2,
-        TaskStatus::Completed => 1,
-        TaskStatus::Cancelled => 0,
-    }
-}
-
-const fn task_status_color(status: TaskStatus) -> Color {
-    match status {
-        TaskStatus::Running => Color::LightGreen,
-        TaskStatus::WaitingApproval => Color::Yellow,
-        TaskStatus::Ready => Color::LightCyan,
-        TaskStatus::Queued => Color::Gray,
-        TaskStatus::Blocked => Color::LightRed,
-        TaskStatus::Failed => Color::Red,
-        TaskStatus::Completed => Color::Green,
-        TaskStatus::Cancelled => Color::DarkGray,
-    }
-}
-
-fn orthogonal_route(
-    from: (u16, u16),
-    first_bend: (u16, u16),
-    second_bend: (u16, u16),
-    to: (u16, u16),
-) -> Vec<(u16, u16)> {
-    let mut route = Vec::new();
-    append_segment(&mut route, from, first_bend);
-    append_segment(&mut route, first_bend, second_bend);
-    append_segment(&mut route, second_bend, to);
-    route.dedup();
-    route
-}
-
-fn append_segment(route: &mut Vec<(u16, u16)>, from: (u16, u16), to: (u16, u16)) {
-    if from.0 == to.0 {
-        if from.1 <= to.1 {
-            route.extend((from.1..=to.1).map(|y| (from.0, y)));
-        } else {
-            route.extend((to.1..=from.1).rev().map(|y| (from.0, y)));
-        }
-    } else if from.1 == to.1 {
-        if from.0 <= to.0 {
-            route.extend((from.0..=to.0).map(|x| (x, from.1)));
-        } else {
-            route.extend((to.0..=from.0).rev().map(|x| (x, from.1)));
-        }
-    }
-}
-
-fn draw_delegation_label(
-    frame: &mut ratatui::Frame<'_>,
-    from: (u16, u16),
-    to: (u16, u16),
-    bend: u16,
-    marker: &str,
-    objective: &str,
-    color: Color,
-) {
-    let frame_area = frame.area();
-    let horizontal_room = from.0.abs_diff(to.0).saturating_sub(1);
-    let (x, width) = if horizontal_room >= 6 {
-        (from.0.min(to.0).saturating_add(1), horizontal_room)
-    } else {
-        let x = from.0.min(to.0).saturating_add(1);
-        (x, frame_area.right().saturating_sub(x).saturating_sub(1))
-    };
-    let width = width.min(28);
-    if width < 3 || bend >= frame_area.bottom() {
-        return;
-    }
-    let label = truncate_label(&format!("{marker} · {}", sanitize(objective)), width);
-    frame.render_widget(
-        Paragraph::new(label).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Rect::new(x, bend, width, 1),
-    );
-}
-
-const fn task_status_marker(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Running => "▶",
-        TaskStatus::WaitingApproval => "?",
-        TaskStatus::Completed => "✓",
-        TaskStatus::Failed | TaskStatus::Blocked => "!",
-        TaskStatus::Cancelled => "×",
-        TaskStatus::Queued | TaskStatus::Ready => "◇",
-    }
-}
-
-fn truncate_label(value: &str, width: u16) -> String {
-    let width = usize::from(width);
-    if value.chars().count() <= width {
-        return value.to_owned();
-    }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    let mut shortened = value.chars().take(width - 1).collect::<String>();
-    shortened.push('…');
-    shortened
-}
-
-fn agent_status(tasks: &[Task], owner: AgentId, pending_delegation: bool) -> (&'static str, Color) {
-    let statuses = tasks
-        .iter()
-        .filter(|task| task.owner == owner)
-        .map(|task| task.status)
-        .collect::<Vec<_>>();
-    for (status, label, color) in [
-        (TaskStatus::WaitingApproval, "approval", Color::Yellow),
-        (TaskStatus::Running, "working", Color::LightGreen),
-        (TaskStatus::Ready, "ready", Color::LightCyan),
-        (TaskStatus::Queued, "queued", Color::Gray),
-        (TaskStatus::Blocked, "blocked", Color::LightRed),
-        (TaskStatus::Failed, "failed", Color::Red),
-        (TaskStatus::Completed, "complete", Color::Green),
-        (TaskStatus::Cancelled, "cancelled", Color::DarkGray),
-    ] {
-        if statuses.contains(&status) {
-            return (label, color);
-        }
-    }
-    if pending_delegation {
-        return ("approval", Color::Yellow);
-    }
-    ("idle", Color::DarkGray)
-}
-
-fn status_symbol(status: &str) -> &'static str {
-    match status {
-        "working" => "●",
-        "complete" => "✓",
-        "failed" | "blocked" => "!",
-        "approval" => "?",
-        _ => "○",
-    }
-}
-
-fn role_color(role: &str) -> Color {
-    match role {
-        "technical_lead" => Color::Magenta,
-        "frontend_developer" => Color::LightCyan,
-        "backend_developer" => Color::Blue,
-        "code_reviewer" => Color::Yellow,
-        "test_engineer" => Color::Green,
-        "devops_engineer" => Color::LightRed,
-        _ => Color::Cyan,
-    }
-}
-
-fn role_icon(role: &str) -> &'static str {
-    match role {
-        "technical_lead" => "◆",
-        "frontend_developer" => "▣",
-        "backend_developer" => "⬢",
-        "code_reviewer" => "◇",
-        "test_engineer" => "✓",
-        "devops_engineer" => "▲",
-        _ => "●",
-    }
-}
-
-fn human_role(role: &str) -> String {
-    role.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().collect::<String>() + chars.as_str()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
     if app.event_viewer {
         let area = frame.area();
@@ -1805,76 +1678,10 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             height: area.height / 2,
         };
         frame.render_widget(Clear, popup);
-        frame.render_widget(Paragraph::new("voff Help\n\nEnter/t  Message the Team Lead\nclick composer  Focus the Team Lead input\n/tasks  Focus the current task list\nShift+Enter  New line while composing\nmouse drag  Move a developer card\nclick card  Select a developer\nr  Start configured objective\na  Add a missing provider token locally\nc  Cancel selected active task\ne  Open full-screen events\n↑/↓, PgUp/PgDn  Navigate or scroll\nTab  Change panel\nq  Safe exit\nEsc  Close / keep draft\n?  Close help").wrap(Wrap { trim: false }).block(Block::default().title("Help").borders(Borders::ALL)),popup);
+        frame.render_widget(Paragraph::new("voff Help\n\nEnter/t  Message the Team Lead directly\n/task <objective>  Give executable work to the Team Lead\n/tasks  Focus the current task list\nclick composer  Focus the Team Lead input\nShift+Enter  New line while composing\nS  Add or adjust specialists\nmouse drag  Move a card / pan empty graph space\nclick card  Select a developer\n+/-/0/f  Zoom in / zoom out / reset / fit team\nr  Start configured objective\na  Add a missing provider token locally\nc  Cancel selected active task\ne  Open full-screen events\n↑/↓, PgUp/PgDn  Navigate or scroll\nTab  Change panel\nq  Safe exit\nEsc  Close / keep draft\n?  Close help").wrap(Wrap { trim: false }).block(Block::default().title("Help").borders(Borders::ALL)),popup);
     }
     if let Some(approval) = app.pending_approval() {
-        let area = frame.area();
-        let popup = if area.width >= 100 {
-            Rect {
-                x: area.x + area.width * 58 / 100,
-                y: area.y.saturating_add(4),
-                width: area.width * 42 / 100,
-                height: area.height.saturating_sub(7),
-            }
-        } else {
-            Rect {
-                x: area.x + area.width / 10,
-                y: area.y + area.height / 4,
-                width: area.width * 4 / 5,
-                height: area.height / 2,
-            }
-        };
-        frame.render_widget(Clear, popup);
-        let preview = app
-            .artifacts
-            .iter()
-            .find(|a| a.producer == approval.task_id)
-            .map(|a| format!("\n\nDiff preview:\n{}", sanitize(&a.preview)))
-            .unwrap_or_default();
-        let details = serde_json::from_str::<DelegationProposal>(&approval.reason)
-            .ok()
-            .filter(|_| approval.action == "task.delegate")
-            .map_or_else(
-                || format!("Reason: {}", sanitize(&approval.reason)),
-                |proposal| {
-                    let criteria = proposal
-                        .acceptance_criteria
-                        .iter()
-                        .map(|criterion| format!("- {}", sanitize(criterion)))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "Target: {}\nObjective: {}\nAcceptance:\n{}",
-                        sanitize(&proposal.target_agent),
-                        sanitize(&proposal.objective),
-                        criteria
-                    )
-                },
-            );
-        let pending_count = app
-            .approvals
-            .iter()
-            .filter(|candidate| candidate.decision == ApprovalDecision::Pending)
-            .count();
-        let title = format!("Approval required · {pending_count} pending");
-        frame.render_widget(
-            Paragraph::new(format!(
-                "Action: {}\nTask: {}\nWorking directory: {}\n{}{}\n\n[y] Approve once    [n] Deny",
-                sanitize(&approval.action),
-                approval.task_id,
-                sanitize(&approval.working_directory),
-                details,
-                preview
-            ))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            ),
-            popup,
-        );
+        render_approval_popup(frame, app, approval);
     }
     if let Some(input) = &app.credential_input {
         let area = frame.area();
@@ -1913,7 +1720,203 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             popup,
         );
     }
+    if app.team_adjustment_open {
+        render_team_adjustment_popup(frame, app);
+    }
 }
+
+fn render_team_adjustment_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Every assignment and delegation decision routes through the Team Lead.",
+            Style::default().fg(Color::LightMagenta),
+        )),
+        Line::from("Specialists never dispatch work to one another."),
+        Line::from(""),
+    ];
+    if app.team_role_picker {
+        lines.push(Line::from(Span::styled(
+            "Choose a specialist role. Provider, model, and token limit inherit from the Team Lead.",
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(""));
+        for (index, role) in ADDABLE_ROLES.iter().enumerate() {
+            let selected = index == app.team_role_selected;
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} {} {}",
+                    if selected { "›" } else { " " },
+                    role.icon(),
+                    role.label()
+                ),
+                if selected {
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "↑/↓ choose · Enter/Space add · Esc return to team",
+        ));
+    } else {
+        for (index, agent) in app.agents.iter().enumerate() {
+            let selected = index == app.team_adjustment_selected;
+            let is_lead = Some(agent.id) == app.team_lead;
+            let marker = if selected { "›" } else { " " };
+            let state = if is_lead {
+                "required"
+            } else if agent.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if agent.enabled {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{marker} [{}] {} · {}",
+                    if agent.enabled { "on " } else { "off" },
+                    sanitize(&agent.name),
+                    state
+                ),
+                style,
+            )));
+        }
+        lines.push(Line::from(""));
+        if let Some(notice) = &app.team_adjustment_notice {
+            lines.push(Line::from(Span::styled(
+                sanitize(notice),
+                Style::default().fg(if app.team_adjustment_saving {
+                    Color::Yellow
+                } else {
+                    Color::LightCyan
+                }),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(
+            "n add specialist · ↑/↓ select · Enter/Space toggle · S/Esc close",
+        ));
+    }
+    let area = frame.area();
+    let item_count = if app.team_role_picker {
+        ADDABLE_ROLES.len()
+    } else {
+        app.agents.len()
+    };
+    let popup = Popup::new(KnownSizeWrapper {
+        inner: Paragraph::new(lines).wrap(Wrap { trim: true }),
+        width: usize::from(area.width.saturating_sub(6).clamp(1, 76)),
+        height: usize::from(
+            area.height
+                .saturating_sub(6)
+                .min(u16::try_from(item_count.saturating_add(11)).unwrap_or(u16::MAX))
+                .max(1),
+        ),
+    })
+    .title(if app.team_role_picker {
+        " Add specialist · Team Lead remains coordinator "
+    } else {
+        " Adjust team · Team Lead remains required "
+    })
+    .style(Style::default().bg(Color::Black))
+    .border_set(ratatui::symbols::border::ROUNDED)
+    .border_style(Style::default().fg(Color::LightMagenta));
+    frame.render_widget(popup, area);
+}
+
+fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
+    let preview = app
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer == approval.task_id)
+        .map(|artifact| format!("\n\nDiff preview:\n{}", sanitize(&artifact.preview)))
+        .unwrap_or_default();
+    let details = serde_json::from_str::<DelegationProposal>(&approval.reason)
+        .ok()
+        .filter(|_| approval.action == "task.delegate")
+        .map_or_else(
+            || format!("Reason: {}", sanitize(&approval.reason)),
+            |proposal| {
+                let criteria = proposal
+                    .acceptance_criteria
+                    .iter()
+                    .map(|criterion| format!("- {}", sanitize(criterion)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "Target: {}\nObjective: {}\nAcceptance:\n{}",
+                    sanitize(&proposal.target_agent),
+                    sanitize(&proposal.objective),
+                    criteria
+                )
+            },
+        );
+    let pending_count = app.pending_approval_count();
+    let selected = app.approval_selected.min(pending_count.saturating_sub(1));
+    let navigation = if pending_count > 1 {
+        "[↑/↓] Select request    "
+    } else {
+        ""
+    };
+    let lead_name = app
+        .team_lead
+        .and_then(|id| app.agents.iter().find(|agent| agent.id == id))
+        .map_or("Team Lead", |agent| agent.name.as_str());
+    let task_owner = app
+        .tasks
+        .iter()
+        .find(|task| task.id == approval.task_id)
+        .and_then(|task| app.agents.iter().find(|agent| agent.id == task.owner))
+        .map_or(lead_name, |agent| agent.name.as_str());
+    let route = if task_owner == lead_name {
+        sanitize(lead_name)
+    } else {
+        format!(
+            "{} → {} → {}",
+            sanitize(lead_name),
+            sanitize(task_owner),
+            sanitize(lead_name)
+        )
+    };
+    let body = Paragraph::new(format!(
+        "User decision required · Team route: {route}\nAction: {}\nTask: {}\nWorking directory: {}\n{}{}\n\n{navigation}[y] Approve once    [n] Deny",
+        sanitize(&approval.action),
+        approval.task_id,
+        sanitize(&approval.working_directory),
+        details,
+        preview
+    ))
+    .wrap(Wrap { trim: true });
+    let area = frame.area();
+    let body_width = usize::from(area.width.saturating_sub(6).clamp(1, 76));
+    let body_height = usize::from(area.height.saturating_sub(6).clamp(1, 22));
+    let popup = Popup::new(KnownSizeWrapper {
+        inner: body,
+        width: body_width,
+        height: body_height,
+    })
+    .title(format!(
+        " Approval {} of {pending_count} ",
+        selected.saturating_add(1)
+    ))
+    .style(Style::default().bg(Color::Black))
+    .border_set(ratatui::symbols::border::ROUNDED)
+    .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(popup, area);
+}
+
 fn panel(title: &str, active: bool) -> Block<'_> {
     Block::default()
         .title(title)
@@ -1995,7 +1998,13 @@ mod tests {
         a.reduce(Action::Down);
         assert_eq!(a.selected, 0);
         a.reduce(Action::NextPanel);
+        assert_eq!(a.panel, Panel::Tasks);
+        a.reduce(Action::NextPanel);
         assert_eq!(a.panel, Panel::Details);
+        a.reduce(Action::NextPanel);
+        assert_eq!(a.panel, Panel::Events);
+        a.reduce(Action::NextPanel);
+        assert_eq!(a.panel, Panel::Agents);
         a.reduce(Action::ToggleHelp);
         assert!(a.help)
     }
@@ -2008,7 +2017,174 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('c')), Action::Cancel);
         assert_eq!(action_for_key(KeyCode::Char('q')), Action::Quit);
         assert_eq!(action_for_key(KeyCode::Char('y')), Action::Approve);
-        assert_eq!(action_for_key(KeyCode::Char('n')), Action::Deny)
+        assert_eq!(action_for_key(KeyCode::Char('n')), Action::Deny);
+        assert_eq!(action_for_key(KeyCode::Char('f')), Action::FitTeam);
+        assert_eq!(action_for_key(KeyCode::Char('+')), Action::ZoomTeamIn);
+        assert_eq!(action_for_key(KeyCode::Char('-')), Action::ZoomTeamOut);
+        assert_eq!(action_for_key(KeyCode::Char('0')), Action::ResetTeamZoom);
+        assert_eq!(action_for_key(KeyCode::Char('S')), Action::AdjustTeam);
+        assert_eq!(action_for_key(KeyCode::Char('1')), Action::ShowTeam);
+        assert_eq!(action_for_key(KeyCode::Char('2')), Action::ShowTasks);
+        assert_eq!(action_for_key(KeyCode::Char('3')), Action::ShowDetails);
+        assert_eq!(action_for_key(KeyCode::Char('4')), Action::ShowEvents);
+    }
+
+    #[test]
+    fn team_adjustment_keeps_the_lead_and_toggles_an_idle_specialist() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Team Lead", "technical_lead", vec!["Backend".into()]);
+        let specialist = agent("Backend", "backend_developer", vec![]);
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, specialist.clone()];
+        app.reduce(Action::AdjustTeam);
+
+        let enter = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.handle_team_adjustment_event(&enter),
+            TeamAdjustmentEvent::Consumed
+        ));
+        assert!(
+            app.team_adjustment_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("required"))
+        );
+
+        let down = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+        app.handle_team_adjustment_event(&down);
+        let TeamAdjustmentEvent::Save(updated) = app.handle_team_adjustment_event(&enter) else {
+            panic!("idle specialist should produce a persisted adjustment");
+        };
+        assert_eq!(updated.id, specialist.id);
+        assert!(!updated.enabled);
+        assert!(app.team_adjustment_saving);
+    }
+
+    #[test]
+    fn team_adjustment_adds_a_unique_non_delegating_backend_draft() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent(
+            "Team Lead",
+            "technical_lead",
+            vec!["Backend Developer".into()],
+        );
+        app.team_lead = Some(lead.id);
+        app.agents = vec![
+            lead.clone(),
+            agent("Backend Developer", "backend_developer", vec![]),
+        ];
+        app.reduce(Action::AdjustTeam);
+
+        let add = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.handle_team_adjustment_event(&add),
+            TeamAdjustmentEvent::Consumed
+        ));
+        assert!(app.team_role_picker);
+        let enter = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        let TeamAdjustmentEvent::Add(member) = app.handle_team_adjustment_event(&enter) else {
+            panic!("the selected backend role should create a specialist draft");
+        };
+
+        assert_eq!(member.name, "Backend Developer 2");
+        assert_eq!(member.role, "backend_developer");
+        assert_eq!(member.provider, lead.provider);
+        assert_eq!(member.model, lead.model);
+        assert!(member.allowed_targets.is_empty());
+        assert!(!member.tools.contains(&"task.delegate".into()));
+        assert!(!member.tools.contains(&"review.request".into()));
+    }
+
+    #[test]
+    fn configured_run_assigns_every_enabled_allowed_specialist_once() {
+        let lead = agent(
+            "Team Lead",
+            "technical_lead",
+            vec!["Backend".into(), "Reviewer".into(), "Disabled".into()],
+        );
+        let backend = agent("Backend", "backend_developer", vec![]);
+        let reviewer = agent("Reviewer", "code_reviewer", vec![]);
+        let mut disabled = agent("Disabled", "test_engineer", vec![]);
+        disabled.enabled = false;
+        let configured = vec![DelegationProposal {
+            target_agent: backend.name.clone(),
+            objective: "Own server.py".into(),
+            acceptance_criteria: vec!["API complete".into()],
+        }];
+
+        let plan = delegation_plan_for_available_agents(
+            &[lead.clone(), backend, reviewer, disabled],
+            Some(lead.id),
+            &configured,
+        );
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan.iter()
+                .map(|proposal| proposal.target_agent.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["Backend", "Reviewer"])
+        );
+        assert_eq!(plan[0].objective, "Own server.py");
+    }
+
+    #[test]
+    fn generated_support_artifacts_do_not_require_missing_directories() {
+        let specialist = agent("Full-stack Developer 6", "full_stack_developer", vec![]);
+
+        let proposal = supporting_delegation(&specialist, 1);
+
+        assert!(
+            proposal
+                .objective
+                .contains("full-stack-developer-6-integration-notes.md")
+        );
+        assert!(!proposal.objective.contains("docs/"));
+    }
+
+    #[test]
+    fn team_adjustment_refuses_to_disable_a_specialist_with_active_work() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Team Lead", "technical_lead", vec!["Backend".into()]);
+        let specialist = agent("Backend", "backend_developer", vec![]);
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, specialist.clone()];
+        let mut task = Task::root(
+            specialist.id,
+            "bounded backend work",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        task.transition(TaskStatus::Ready).unwrap();
+        app.tasks.push(task);
+        app.reduce(Action::AdjustTeam);
+        app.team_adjustment_selected = 1;
+
+        let enter = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.handle_team_adjustment_event(&enter),
+            TeamAdjustmentEvent::Consumed
+        ));
+        assert!(
+            app.team_adjustment_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("active work"))
+        );
+        assert!(!app.team_adjustment_saving);
     }
 
     #[test]
@@ -2218,11 +2394,9 @@ mod tests {
     fn team_graph_renders_developer_cards_and_delegation_threads() {
         let mut app = AppModel::new(SessionId::new());
         app.workspace_root = "/workspaces/voff-demo".into();
-        app.agents = vec![
-            agent("Ada", "technical_lead", vec!["Linus".into()]),
-            agent("Linus", "backend_developer", vec![]),
-        ];
-        app.agent_positions = vec![AgentPosition::default(); 2];
+        let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, agent("Linus", "backend_developer", vec![])];
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2236,7 +2410,13 @@ mod tests {
         assert!(rendered.contains("Linus"));
         assert!(rendered.contains("qwen-test"));
         assert!(rendered.contains("4096 tokens"));
-        assert!(rendered.contains('┈'));
+        assert_eq!(app.team_flow.edges().len(), 1);
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .all(|edge| edge.label.is_none())
+        );
         assert!(rendered.contains("cwd /workspaces/voff-demo"));
     }
 
@@ -2250,6 +2430,9 @@ mod tests {
         );
         let backend_agent = agent("Backend", "backend_developer", vec![]);
         let frontend_agent = agent("Frontend", "frontend_developer", vec![]);
+        let backend_id = backend_agent.id;
+        let frontend_id = frontend_agent.id;
+        app.team_lead = Some(lead.id);
         let mut root = Task::root(
             lead.id,
             "Build full-stack calculator",
@@ -2286,7 +2469,6 @@ mod tests {
             .collect();
         app.tasks = vec![root];
         app.agents = vec![lead, backend_agent, frontend_agent];
-        app.agent_positions = vec![AgentPosition::default(); 3];
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2301,16 +2483,96 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("Backend"), "{rendered}");
-        assert!(rendered.contains("Frontend"), "{rendered}");
-        assert!(rendered.matches("approval").count() >= 3, "{rendered}");
-        assert!(rendered.matches('●').count() >= 2, "{rendered}");
+        assert!(app.agents.iter().any(|agent| agent.name == "Frontend"));
+        assert!(rendered.contains("Approval 1 of 2"), "{rendered}");
+        assert_eq!(app.team_flow.edges().len(), 2);
+        let lead_id = app.team_lead.unwrap().to_string();
+        let backend_id = backend_id.to_string();
+        let frontend_id = frontend_id.to_string();
+        for specialist_id in [backend_id.as_str(), frontend_id.as_str()] {
+            assert!(
+                app.team_flow.edges().iter().any(|edge| {
+                    edge.source == lead_id && edge.target.as_str() == specialist_id
+                })
+            );
+        }
+        assert!(app.team_flow.edges().iter().all(|edge| {
+            !((edge.source == backend_id && edge.target == frontend_id)
+                || (edge.source == frontend_id && edge.target == backend_id))
+        }));
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .all(|edge| edge.label.is_none())
+        );
     }
 
     #[test]
-    fn live_delegation_labels_the_edge_and_spins_on_working_roles() {
+    fn approval_popup_navigates_one_pending_request_at_a_time() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = AgentId::new();
+        let task = Task::root(
+            owner,
+            "Coordinate implementation",
+            vec!["Work is delegated".into()],
+            voff_core::TaskLimits::default(),
+        );
+        let proposals = [
+            DelegationProposal {
+                target_agent: "Backend".into(),
+                objective: "Create calculator API".into(),
+                acceptance_criteria: vec!["API responds".into()],
+            },
+            DelegationProposal {
+                target_agent: "Frontend".into(),
+                objective: "Create calculator interface".into(),
+                acceptance_criteria: vec!["UI calls API".into()],
+            },
+        ];
+        app.approvals = proposals
+            .iter()
+            .map(|proposal| Approval {
+                id: voff_core::ApprovalId::new(),
+                task_id: task.id,
+                tool_call_id: voff_core::ToolCallId::new(),
+                action: "task.delegate".into(),
+                working_directory: ".".into(),
+                reason: serde_json::to_string(proposal).unwrap(),
+                decision: ApprovalDecision::Pending,
+                created_at: chrono::Utc::now(),
+            })
+            .collect();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_overlays(frame, &app)).unwrap();
+        let first = terminal.backend().buffer();
+        let first = (0..first.area.height)
+            .flat_map(|y| (0..first.area.width).map(move |x| first[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(first.contains("Approval 1 of 2"), "{first}");
+        assert!(first.contains("Target: Backend"), "{first}");
+        assert!(!first.contains("Target: Frontend"), "{first}");
+
+        app.reduce(Action::Down);
+        terminal.draw(|frame| render_overlays(frame, &app)).unwrap();
+        let second = terminal.backend().buffer();
+        let second = (0..second.area.height)
+            .flat_map(|y| (0..second.area.width).map(move |x| second[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(second.contains("Approval 2 of 2"), "{second}");
+        assert!(second.contains("Target: Frontend"), "{second}");
+        assert!(!second.contains("Target: Backend"), "{second}");
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn live_delegation_animates_the_edge_and_spins_on_working_roles() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
         let implementer = agent("Linus", "backend_developer", vec![]);
+        app.team_lead = Some(lead.id);
         let mut parent = Task::root(
             lead.id,
             "Build the calculator",
@@ -2337,7 +2599,7 @@ mod tests {
 
         app.agents = vec![lead, implementer];
         app.tasks = tasks;
-        app.animation_tick = 3;
+        app.team_flow.tick(Duration::from_millis(300));
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -2349,11 +2611,24 @@ mod tests {
         assert!(rendered.contains("Build the calculator"));
         assert!(rendered.contains("Implement calculator"));
         assert!(rendered.contains('▶'));
-        assert!(rendered.contains('━'));
         assert!(
-            FluxFrames::ORBIT
+            ["◒", "◐", "◓", "◑"]
                 .iter()
                 .any(|frame| rendered.contains(*frame))
+        );
+        assert_eq!(
+            app.team_flow
+                .edges()
+                .iter()
+                .filter(|edge| edge.animated)
+                .count(),
+            1
+        );
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .all(|edge| edge.label.is_none())
         );
     }
 
@@ -2362,6 +2637,7 @@ mod tests {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
         let implementer = agent("Linus", "backend_developer", vec![]);
+        app.team_lead = Some(lead.id);
         let mut parent = Task::root(
             lead.id,
             "Build the calculator",
@@ -2400,10 +2676,13 @@ mod tests {
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
         assert!(rendered.contains("1 handoff complete"));
-        assert!(rendered.contains("✓ done"), "{rendered}");
         assert!(rendered.contains("⬢ Linus"), "{rendered}");
-        assert!(rendered.contains('━'));
-        assert!(rendered.contains('●'));
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .all(|edge| edge.label.is_none())
+        );
         assert!(rendered.matches("complete").count() >= 3);
     }
 
@@ -2411,28 +2690,72 @@ mod tests {
     fn mouse_drag_moves_and_selects_a_developer_card() {
         let mut app = AppModel::new(SessionId::new());
         app.agents = vec![agent("Ada", "technical_lead", vec![])];
-        app.agent_positions = vec![AgentPosition::default()];
-        app.agent_hitboxes = vec![Rect::new(10, 5, 20, 7)];
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let before = app.team_flow.node_position(0).unwrap();
+        let (left, top, right, bottom) = app.team_flow.node_terminal_rect(0).unwrap();
+        let x = u16::try_from((left + right) / 2).unwrap();
+        let y = u16::try_from((top + bottom) / 2).unwrap();
 
         app.reduce(Action::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            12,
-            6,
+            x,
+            y,
         )));
         app.reduce(Action::Mouse(mouse(
             MouseEventKind::Drag(MouseButton::Left),
-            17,
-            9,
+            x + 5,
+            y + 3,
         )));
         app.reduce(Action::Mouse(mouse(
             MouseEventKind::Up(MouseButton::Left),
-            17,
-            9,
+            x + 5,
+            y + 3,
         )));
 
         assert_eq!(app.panel, Panel::Agents);
         assert_eq!(app.selected_agent, 0);
-        assert_eq!(app.agent_positions[0], AgentPosition { x: 5, y: 3 });
-        assert!(app.dragging_agent.is_none());
+        let after = app.team_flow.node_position(0).unwrap();
+        assert!(after.x > before.x);
+        assert!(after.y > before.y);
+    }
+
+    #[test]
+    fn mouse_selecting_a_role_highlights_its_lead_connections_in_yellow() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
+        let specialist = agent("Linus", "backend_developer", vec![]);
+        let specialist_id = specialist.id;
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, specialist];
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (left, top, right, bottom) = app.team_flow.node_terminal_rect(1).unwrap();
+        let x = u16::try_from((left + right) / 2).unwrap();
+        let y = u16::try_from((top + bottom) / 2).unwrap();
+
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+        )));
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            y,
+        )));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(app.team_flow.mouse_highlight(), Some(specialist_id));
+        let buffer = terminal.backend().buffer();
+        let yellow_route_cells = (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |column| &buffer[(column, row)]))
+            .filter(|cell| {
+                cell.fg == Color::Yellow && matches!(cell.symbol(), "·" | "◆" | "▲" | "△" | "●")
+            })
+            .count();
+        assert!(yellow_route_cells > 0);
     }
 }

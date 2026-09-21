@@ -279,6 +279,16 @@ pub enum CanonicalEventKind {
         summary: String,
         evidence: Vec<ArtifactId>,
     },
+    AgentAvailabilityChanged {
+        agent_id: AgentId,
+        name: String,
+        enabled: bool,
+    },
+    AgentAdded {
+        agent_id: AgentId,
+        name: String,
+        role: String,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CanonicalEvent {

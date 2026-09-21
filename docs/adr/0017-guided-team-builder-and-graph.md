@@ -1,5 +1,7 @@
 # ADR 0017: Guided team builder and interactive developer graph
 
+The graph-rendering implementation in this decision is superseded by ADR 0021.
+
 ## Context
 
 The configuration schema already supports arbitrary formations and per-agent

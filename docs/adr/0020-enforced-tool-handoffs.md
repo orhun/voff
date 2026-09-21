@@ -27,12 +27,12 @@ recorded but cannot replace `WaitingApproval` with `Failed`. Authentication,
 authorization, transport, cancellation, and other provider failures keep their
 normal failure semantics.
 
-The resilience adapter treats an invalid terminal frame after an emitted
-structured tool proposal as useful output for circuit-health accounting. It
-still returns the error so the engine can audit the malformed tail, but resets
-consecutive failures because the proposal was already delivered. This prevents
-successful approval workflows from opening a shared provider circuit before a
-delegated child can run.
+The transport adapter treats an invalid terminal frame after usable text or a
+structured tool proposal as a completed stream with unknown usage. It emits an
+auditable warning before `Completed`; a terminal decode failure before any
+usable output remains an error. The resilience boundary therefore counts the
+preserved response as success, preventing a good response with a malformed
+tail from failing a task or opening a shared provider circuit.
 
 Scheduler waves contain only root tasks created, or child tasks delegated, in
 the active session. Historical queued tasks remain persisted for inspection but
@@ -65,7 +65,8 @@ a conflict if another actor creates the path before application.
   denying them retains the same semantics as a model-proposed delegation.
 - Empty workspaces can receive a first runnable file without granting general
   shell access.
-- A malformed terminal stream event cannot discard a valid pending proposal,
-  but it remains visible in the audit events and may omit usage data.
+- A malformed terminal stream event cannot discard valid streamed text or a
+  pending proposal, but it remains visible in the audit events and omits usage
+  data.
 - Abandoned queued tasks require explicit recovery rather than being picked up
   by an unrelated later session.

@@ -30,7 +30,7 @@ use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
 use voff_tools::ScopedWorkspace;
 
-const DEFAULT_OBJECTIVE: &str = "Build a full-stack calculator using two required delegated workstreams. Delegate server.py to Backend Developer: use only the Python standard library, serve the frontend, and implement POST /api/calculate with add, subtract, multiply, divide, numeric-input validation, JSON responses, and division-by-zero errors. Delegate index.html to Frontend Developer: build an accessible calculator that calls /api/calculate and clearly displays loading, results, validation errors, and server errors. Both delegated tasks must be completed; the app must run with python3 server.py and require no external dependencies.";
+const DEFAULT_OBJECTIVE: &str = "Build a full-stack calculator through the Team Lead. Give every enabled specialist one explicit, non-overlapping delegated task. Backend Developer owns server.py: use only the Python standard library, serve the frontend, and implement POST /api/calculate with add, subtract, multiply, divide, numeric-input validation, JSON responses, and division-by-zero errors. Frontend Developer owns index.html: build an accessible calculator that calls /api/calculate and clearly displays loading, results, validation errors, and server errors. Other enabled specialists contribute role-appropriate review, validation, integration, or operational evidence without overlapping those files. Every delegated task must complete; the app must run with python3 server.py and require no external dependencies.";
 
 fn calculator_delegation_plan(objective: &str, agents: &[AgentProfile]) -> Vec<DelegationProposal> {
     if objective != DEFAULT_OBJECTIVE {
@@ -330,7 +330,20 @@ fn config_from_setup(setup: &SetupDraft) -> Result<Config> {
         .developers
         .first()
         .context("the team must contain at least one developer")?;
-    let first_tools = tools_for(first.role, setup.developers.len() > 1);
+    anyhow::ensure!(
+        first.role == DeveloperRole::Lead,
+        "guided setup requires the first developer to be the Team Lead"
+    );
+    anyhow::ensure!(
+        setup
+            .developers
+            .iter()
+            .skip(1)
+            .all(|developer| developer.role != DeveloperRole::Lead),
+        "guided setup permits exactly one Team Lead"
+    );
+    let has_specialists = setup.developers.len() > 1;
+    let first_tools = tools_for(first.role, true, has_specialists);
     let mut config = Config {
         workspace: config::WorkspaceConfig {
             root: setup.working_directory.clone(),
@@ -340,7 +353,12 @@ fn config_from_setup(setup: &SetupDraft) -> Result<Config> {
         agent: AgentConfig {
             name: first.name.clone(),
             role: first.role.config_role().into(),
-            system_prompt: first.role.prompt().into(),
+            system_prompt: if has_specialists {
+                first.role.prompt().into()
+            } else {
+                "Act as the required Team Lead and sole developer. Make explicit decisions, implement scoped changes directly, and return verified evidence."
+                    .into()
+            },
             tools: first_tools,
             max_output_tokens: first.max_output_tokens,
         },
@@ -376,7 +394,7 @@ fn config_from_setup(setup: &SetupDraft) -> Result<Config> {
             name: developer.name.clone(),
             role: developer.role.config_role().into(),
             system_prompt: developer.role.prompt().into(),
-            tools: tools_for(developer.role, index == 0),
+            tools: tools_for(developer.role, index == 0, has_specialists),
             provider: Some(developer.provider.id().into()),
             model: Some(developer.model.clone()),
             max_output_tokens: developer.max_output_tokens,
@@ -413,10 +431,19 @@ fn provider_from_choice(provider: ProviderChoice, model: &str) -> ProviderConfig
     }
 }
 
-fn tools_for(role: DeveloperRole, entry: bool) -> Vec<String> {
+fn tools_for(role: DeveloperRole, team_lead: bool, has_specialists: bool) -> Vec<String> {
     let mut tools = role.tools();
-    if entry {
+    if team_lead && has_specialists {
         for tool in ["task.delegate", "review.request"] {
+            if !tools.iter().any(|configured| configured == tool) {
+                tools.push(tool.into());
+            }
+        }
+    } else {
+        tools.retain(|tool| !matches!(tool.as_str(), "task.delegate" | "review.request"));
+    }
+    if team_lead && !has_specialists {
+        for tool in ["file.patch", "process.test"] {
             if !tools.iter().any(|configured| configured == tool) {
                 tools.push(tool.into());
             }
@@ -585,6 +612,7 @@ async fn run(
         agent_profiles.push(profile);
         id
     };
+    agent_profiles.sort_by_key(|agent| agent.id != owner);
     recover_interrupted(repo.as_ref(), session.id).await?;
     let events = repo.events(session.id).await?;
     let task_ids = events
@@ -685,6 +713,7 @@ async fn run(
         model_catalog: ModelCatalog::bundled().unwrap_or_default(),
         agent_provider_kinds,
         credential_target,
+        team_lead: owner,
     })
     .await?;
     Ok(())
@@ -1058,16 +1087,17 @@ mod tests {
     }
 
     #[test]
-    fn default_calculator_requires_backend_and_frontend_handoffs() {
+    fn default_calculator_requires_all_enabled_specialist_handoffs() {
         let cli = Cli::try_parse_from(["voff", "run"]).unwrap();
         let Some(Command::Run { objective, .. }) = cli.command else {
             panic!("run command expected");
         };
 
         assert_eq!(objective, DEFAULT_OBJECTIVE);
-        assert!(objective.contains("Delegate server.py to Backend Developer"));
-        assert!(objective.contains("Delegate index.html to Frontend Developer"));
-        assert!(objective.contains("Both delegated tasks must be completed"));
+        assert!(objective.contains("every enabled specialist"));
+        assert!(objective.contains("Backend Developer owns server.py"));
+        assert!(objective.contains("Frontend Developer owns index.html"));
+        assert!(objective.contains("Every delegated task must complete"));
         let profile = |name: &str, role: &str| AgentProfile {
             id: AgentId::new(),
             name: name.into(),
@@ -1290,7 +1320,7 @@ mod tests {
         let setup = SetupDraft {
             developers: vec![onboarding::DeveloperDraft::new(
                 "Solo",
-                DeveloperRole::FullStack,
+                DeveloperRole::Lead,
                 ProviderChoice::Ollama,
                 "local-model",
                 2048,
@@ -1305,10 +1335,51 @@ mod tests {
         assert!(config.agents.is_empty());
         assert_eq!(config.agent.name, "Solo");
         assert_eq!(config.agent.max_output_tokens, 2048);
+        assert!(config.agent.tools.contains(&"file.patch".into()));
+        assert!(config.agent.tools.contains(&"process.test".into()));
+        assert!(!config.agent.tools.contains(&"task.delegate".into()));
         assert!(matches!(
             config.provider,
             ProviderConfig::Ollama { ref model, .. } if model == "local-model"
         ));
+    }
+
+    #[test]
+    fn guided_setup_rejects_missing_or_duplicate_team_leads() {
+        let specialist_only = SetupDraft {
+            developers: vec![onboarding::DeveloperDraft::new(
+                "Backend",
+                DeveloperRole::Backend,
+                ProviderChoice::Ollama,
+                "local-model",
+                2048,
+            )],
+            working_directory: ".".into(),
+            openai_token: None,
+        };
+        assert!(config_from_setup(&specialist_only).is_err());
+
+        let duplicate = SetupDraft {
+            developers: vec![
+                onboarding::DeveloperDraft::new(
+                    "Lead One",
+                    DeveloperRole::Lead,
+                    ProviderChoice::Ollama,
+                    "local-model",
+                    2048,
+                ),
+                onboarding::DeveloperDraft::new(
+                    "Lead Two",
+                    DeveloperRole::Lead,
+                    ProviderChoice::Ollama,
+                    "local-model",
+                    2048,
+                ),
+            ],
+            working_directory: ".".into(),
+            openai_token: None,
+        };
+        assert!(config_from_setup(&duplicate).is_err());
     }
 
     #[test]

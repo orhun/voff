@@ -25,10 +25,14 @@ credentials to a reliable encrypted store without changing provider or core
 domain types.
 
 The main workspace adds a `ratatui-textarea` composer. Plain text creates a
-persisted root task owned by the configured entry agent and immediately runs
-it through the normal engine. `/tasks` focuses the in-memory current-session
-task list without provider I/O. The composer is handled on the responsive TUI
-event loop, while provider and SQLite work remains asynchronous.
+persisted root task owned by the configured entry agent and runs it as a
+tool-free conversation, allowing a direct Team Lead response without forcing
+a delegation call. `/task <objective>` creates executable root work through the
+normal engine, retaining the Team Lead's delegation policy. `/tasks` focuses
+the in-memory current-session task list without provider I/O. The composer is
+handled on the responsive TUI event loop, while provider and SQLite work
+remains asynchronous. Completion or failure is returned to the composer rather
+than being silently discarded by a detached task.
 
 The first-launch defaults page contains developer count, an existing working
 directory (default `.`), and the shared maximum output-token limit. Provider
@@ -51,6 +55,7 @@ than accepting an unvalidated free-form path.
 - Interactive credentials work without desktop services or a restart.
 - A copied workspace database can expose the token; this limitation must stay
   visible until encrypted storage replaces it.
-- Team Lead messages appear in the same task and event history as other work.
+- Team Lead conversations and executable assignments appear in the same task
+  and event history as other work.
 - Ratatui and Crossterm move to their 0.30 and 0.29 compatible releases so the
   maintained `ratatui-textarea` crate can be used directly.

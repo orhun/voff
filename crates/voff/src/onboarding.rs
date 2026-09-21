@@ -65,16 +65,6 @@ pub enum DeveloperRole {
 }
 
 impl DeveloperRole {
-    const ALL: [Self; 7] = [
-        Self::Lead,
-        Self::FullStack,
-        Self::Frontend,
-        Self::Backend,
-        Self::Reviewer,
-        Self::Tester,
-        Self::DevOps,
-    ];
-
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -118,25 +108,25 @@ impl DeveloperRole {
     pub const fn prompt(self) -> &'static str {
         match self {
             Self::Lead => {
-                "Plan bounded work, delegate every required specialty as an explicit child task, and integrate verified results."
+                "Own every team decision. Plan bounded work, delegate every required specialty as an explicit child task, prevent overlapping ownership, and integrate only verified results."
             }
             Self::FullStack => {
-                "Implement small end-to-end changes, follow repository rules, and return test evidence."
+                "Implement small end-to-end changes, follow repository rules, and return test evidence to the Team Lead without coordinating peers directly."
             }
             Self::Frontend => {
-                "Build accessible user-facing changes, preserve established patterns, and verify behavior."
+                "Build accessible user-facing changes, preserve established patterns, verify behavior, and return the result to the Team Lead."
             }
             Self::Backend => {
-                "Implement reliable backend changes with clear boundaries and verifiable tests."
+                "Implement reliable backend changes within Team Lead-assigned boundaries and return verifiable tests."
             }
             Self::Reviewer => {
-                "Review artifacts against acceptance criteria and report concrete blocking findings."
+                "Review Team Lead-routed artifacts against acceptance criteria and return concrete blocking findings."
             }
             Self::Tester => {
-                "Design focused checks, exercise failure paths, and return reproducible evidence."
+                "Design focused checks, exercise failure paths, and return reproducible evidence to the Team Lead."
             }
             Self::DevOps => {
-                "Improve build and runtime workflows without broadening permissions or hiding risk."
+                "Improve Team Lead-assigned build and runtime workflows without broadening permissions or hiding risk."
             }
         }
     }
@@ -158,8 +148,21 @@ impl DeveloperRole {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    fn cycle(self, delta: isize) -> Self {
-        cycle(Self::ALL, self, delta)
+    fn cycle_specialist(self, delta: isize) -> Self {
+        const SPECIALISTS: [DeveloperRole; 6] = [
+            DeveloperRole::FullStack,
+            DeveloperRole::Frontend,
+            DeveloperRole::Backend,
+            DeveloperRole::Reviewer,
+            DeveloperRole::Tester,
+            DeveloperRole::DevOps,
+        ];
+        let current = if self == Self::Lead {
+            Self::FullStack
+        } else {
+            self
+        };
+        cycle(SPECIALISTS, current, delta)
     }
 
     fn color(self) -> Color {
@@ -729,7 +732,12 @@ impl Wizard {
         let developer = &mut self.developers[index];
         match self.field {
             Field::Role => {
-                developer.role = developer.role.cycle(delta);
+                if index == 0 {
+                    developer.role = DeveloperRole::Lead;
+                    developer.name = suggested_name(developer.role, index);
+                    return;
+                }
+                developer.role = developer.role.cycle_specialist(delta);
                 developer.name = suggested_name(developer.role, index);
             }
             Field::Provider => {
@@ -749,7 +757,7 @@ impl Wizard {
 
 fn suggested_role(index: usize, count: usize) -> DeveloperRole {
     if count == 1 {
-        return DeveloperRole::FullStack;
+        return DeveloperRole::Lead;
     }
     match index {
         0 => DeveloperRole::Lead,
@@ -1006,9 +1014,13 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
     let form = vec![
         form_line(
             "Type",
-            developer.role.label(),
+            if index == 0 {
+                "Technical lead · required"
+            } else {
+                developer.role.label()
+            },
             wizard.field == Field::Role,
-            true,
+            index != 0,
         ),
         Line::from(""),
         form_line(
@@ -1078,7 +1090,7 @@ fn form_line<'a>(label: &'a str, value: &'a str, selected: bool, choice: bool) -
 
 fn render_review(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect) {
     let title = Paragraph::new(format!(
-        "Your {}-developer team is ready in {}. The first card is the entry developer; the workspace will connect delegated work with live threads.",
+        "Your {}-developer team is ready in {}. The required Team Lead is the sole decision and delegation route; specialists return isolated results for integration.",
         wizard.developers.len(),
         wizard.working_directory.display()
     ))
@@ -1139,9 +1151,9 @@ fn render_preview_card(
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(if entry {
-            "● entry developer"
+            "◆ required Team Lead"
         } else {
-            "○ specialist"
+            "○ specialist · via lead"
         }),
     ]);
     frame.render_widget(
@@ -1176,8 +1188,12 @@ fn footer_text(wizard: &Wizard) -> String {
                 )
             }
         }
+        Step::Developer(0) => {
+            "Team Lead is required · Enter accepts · Tab fields · ←/→ provider/model · Esc back"
+                .into()
+        }
         Step::Developer(_) => {
-            "Enter accepts this developer · Tab fields · ←/→ choices · Esc back".into()
+            "Enter accepts this specialist · Tab fields · ←/→ choices · Esc back".into()
         }
         Step::Credential => "paste token (optional) · Enter continue · Esc back".into(),
         Step::Review => "Enter save & launch · Esc edit · q cancel".into(),
@@ -1239,6 +1255,36 @@ mod tests {
         assert_eq!(wizard.developers[1].role, DeveloperRole::Backend);
         assert_eq!(wizard.developers[2].role, DeveloperRole::Frontend);
         assert_eq!(wizard.developers[3].role, DeveloperRole::Reviewer);
+    }
+
+    #[test]
+    fn setup_keeps_exactly_one_required_team_lead() {
+        let mut wizard = Wizard::default();
+        wizard.handle_key(key(KeyCode::Enter));
+
+        wizard.field = Field::Role;
+        wizard.handle_key(key(KeyCode::Right));
+        assert_eq!(wizard.developers[0].role, DeveloperRole::Lead);
+
+        wizard.handle_key(key(KeyCode::Enter));
+        wizard.field = Field::Role;
+        for _ in 0..12 {
+            wizard.handle_key(key(KeyCode::Right));
+            assert_ne!(wizard.developers[1].role, DeveloperRole::Lead);
+        }
+    }
+
+    #[test]
+    fn solo_setup_still_requires_a_team_lead() {
+        let mut wizard = Wizard {
+            count_input: "1".into(),
+            ..Wizard::default()
+        };
+
+        wizard.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(wizard.developers.len(), 1);
+        assert_eq!(wizard.developers[0].role, DeveloperRole::Lead);
     }
 
     #[test]

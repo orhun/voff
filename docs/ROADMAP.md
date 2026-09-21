@@ -32,7 +32,8 @@ Phase 1 exit gate is complete: a configured Ollama agent can run and cancel a ta
 - Structured test executor without a shell, command allowlist, workspace boundary, timeout/output bounds and consumed approval grant: `voff-tools` executor tests.
 - Approval/artifact domain events and SQLite migration: `voff-core`, `voff-storage` contract tests.
 - Provider tool requests enter `WaitingApproval`; approval and denial are persisted and projected to the TUI: `voff-engine` integration test.
-- Approval dialog (`y` once / `n` deny), restored pending approvals and task-local artifact diff preview: `voff` TUI module.
+- Queued `tui-popup` approval dialog (`Up`/`Down` inspect, `y` once / `n` deny),
+  restored pending approvals and task-local artifact diff preview: `voff` TUI module.
 - Terminal control sanitization and basic credential redaction: `voff` TUI tests.
 - Scoped Phase 2 capabilities are explicit in configuration: `file.patch` and `process.test`; arbitrary shell remains rejected.
 
@@ -90,7 +91,8 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
 
 - First interactive launch now builds an arbitrary 1–32 developer formation,
   using one page for team size/token defaults and suggested names and roles to
-  minimize input. Provider and model selection exists only on each developer.
+  minimize input. Exactly one Team Lead is required and generated teams grant
+  delegation authority only to that entry agent. Provider and model selection exists only on each developer.
   OpenAI tokens are offered as an optional masked setup field and can be added
   after launch with `a`; missing credentials never block the workspace. Values
   are stored in the workspace-local SQLite database rather than project
@@ -99,14 +101,35 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   explicit manual-rate overrides and honest unknown/partial states.
   Existing configs and scripted `voff init` usage remain compatible.
 - A `ratatui-textarea` composer sends plain text to the entry Team Lead as a
-  persisted root task; `/tasks` focuses the current task list without provider
-  I/O.
+  persisted, tool-free conversation task; `/task <objective>` submits
+  executable work with delegation enabled, and `/tasks` focuses the current
+  task list without provider I/O. Background submission failures return to the
+  composer visibly.
 - The workspace presents developers as status-rich cards connected by their
-  explicit delegation relationships. Static permission routes stay faint;
-  persisted cross-owner child tasks become directional, objective-labelled
-  routes with an animated work marker. Running cards show their current task
-  and a `ratatui-spinner` activity glyph. Cards support mouse selection and
-  dragging while all workflow controls remain keyboard-accessible.
+  explicit Team Lead-mediated delegation relationships. Each specialist has
+  one connector to the lead for assignments, requests, and results, so a
+  cross-role relationship is shown only through the shared Lead hub.
+  The engine rejects specialist-originated root or delegation decisions and
+  never renders direct peer edges. Static permission routes stay faint;
+  persisted cross-owner child tasks become directional routes with a double-line
+  animated live state. Objectives and status remain on owner cards; connector
+  lines carry no text. `rataflow` owns route rendering, node
+  dragging, selection, pan, zoom, and fit-view while voff supplies the
+  provider-neutral card and handoff projections. Cards support mouse selection
+  and dragging while all workflow controls remain keyboard-accessible.
+- `S` opens a `tui-popup` runtime team editor that enables or disables idle
+  specialists or adds safe role presets inheriting the lead's provider/model.
+  It keeps the Team Lead immutable, refuses availability changes around active
+  or approval-pending work, strips peer-delegation authority, and persists team
+  audit events. Rataflow immediately projects the updated lead routing.
+- The Rataflow team canvas is the default fullscreen center view. `1`–`4` open
+  Team, Tasks, Task Details, and Events respectively, while `Tab` cycles them.
+  Connector routes carry no text; card state, marker shape, color, line style,
+  and animation communicate delegation without collision-prone labels.
+- Starting the configured objective builds its delegation plan from the live
+  formation: every enabled Team Lead target receives exactly one task, disabled
+  agents are skipped, runtime additions are included, and role-specific support
+  artifacts use unique ownership paths to avoid writer clashes.
 - Root README now provides local and heterogeneous-team onboarding, secure
   credential setup, TUI controls, and contributor quality commands.
 - `voff init` interactively creates a validated solo Ollama or OpenAI

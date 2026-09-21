@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use voff_core::*;
 use voff_provider::*;
@@ -41,6 +41,8 @@ pub enum EngineError {
     InvalidOutputTokenLimit(u64),
     #[error("invalid delegation plan: {0}")]
     InvalidDelegationPlan(String),
+    #[error("team coordination must go through the configured Team Lead")]
+    TeamLeadRequired,
 }
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
@@ -53,7 +55,8 @@ pub enum EngineEvent {
 pub struct Engine<R: Repository> {
     repo: Arc<R>,
     providers: HashMap<String, Arc<dyn ModelProvider>>,
-    formation_agents: HashMap<String, AgentId>,
+    formation_agents: RwLock<HashMap<String, AgentId>>,
+    team_lead: Option<AgentId>,
     default_provider: String,
     session: SessionId,
     events: mpsc::Sender<EngineEvent>,
@@ -63,6 +66,12 @@ pub struct Engine<R: Repository> {
     workspace_context: Option<String>,
     workspace: Option<ScopedWorkspace>,
     executor: Option<ControlledExecutor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunMode {
+    Work,
+    Conversation,
 }
 #[derive(Deserialize)]
 struct PatchArguments {
@@ -99,7 +108,8 @@ impl<R: Repository + 'static> Engine<R> {
         Self {
             repo,
             providers,
-            formation_agents: HashMap::new(),
+            formation_agents: RwLock::new(HashMap::new()),
+            team_lead: None,
             default_provider: provider_id,
             session,
             events,
@@ -139,10 +149,69 @@ impl<R: Repository + 'static> Engine<R> {
     /// Bind configured formation names to the exact profiles visible in this run.
     #[must_use]
     pub fn with_formation_agents(mut self, agents: &[AgentProfile]) -> Self {
-        self.formation_agents = agents
-            .iter()
-            .map(|agent| (agent.name.clone(), agent.id))
-            .collect();
+        self.formation_agents = RwLock::new(
+            agents
+                .iter()
+                .map(|agent| (agent.name.clone(), agent.id))
+                .collect(),
+        );
+        self
+    }
+    /// Persist and route one validated runtime specialist through the Team Lead.
+    pub async fn add_team_member(&self, agent: AgentProfile) -> Result<AgentProfile, EngineError> {
+        let team_lead = self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
+        if agent.name.trim().is_empty()
+            || !agent.enabled
+            || agent
+                .tools
+                .iter()
+                .any(|tool| matches!(tool.as_str(), "task.delegate" | "review.request"))
+            || !agent.allowed_targets.is_empty()
+        {
+            return Err(EngineError::InvalidDelegationPlan(
+                "runtime team members must be non-delegating specialists".into(),
+            ));
+        }
+        if self.formation_agents.read().await.contains_key(&agent.name) {
+            return Err(EngineError::InvalidDelegationPlan(format!(
+                "formation agent name already exists: {}",
+                agent.name
+            )));
+        }
+        let mut lead = self
+            .repo
+            .agent(team_lead)
+            .await?
+            .ok_or(EngineError::TaskNotFound)?;
+        if !lead.allowed_targets.contains(&agent.name) {
+            lead.allowed_targets.push(agent.name.clone());
+        }
+        if let Some(limits) = &mut lead.delegation_limits {
+            limits.max_children = limits
+                .max_children
+                .max(u16::try_from(lead.allowed_targets.len()).unwrap_or(u16::MAX));
+        }
+        self.repo.save_agent(agent.clone()).await?;
+        self.repo.save_agent(lead.clone()).await?;
+        self.formation_agents
+            .write()
+            .await
+            .insert(agent.name.clone(), agent.id);
+        self.record(
+            None,
+            CanonicalEventKind::AgentAdded {
+                agent_id: agent.id,
+                name: agent.name,
+                role: agent.role,
+            },
+        )
+        .await?;
+        Ok(lead)
+    }
+    /// Restrict root work and all delegation decisions to one coordinating agent.
+    #[must_use]
+    pub fn with_team_lead(mut self, team_lead: AgentId) -> Self {
+        self.team_lead = Some(team_lead);
         self
     }
     #[must_use]
@@ -156,6 +225,7 @@ impl<R: Repository + 'static> Engine<R> {
         objective: impl Into<String>,
         criteria: Vec<String>,
     ) -> Result<Task, EngineError> {
+        self.require_team_lead(owner)?;
         let limits = self
             .repo
             .agent(owner)
@@ -176,6 +246,7 @@ impl<R: Repository + 'static> Engine<R> {
         proposals: &[DelegationProposal],
     ) -> Result<Vec<Approval>, EngineError> {
         let task = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
+        self.require_team_lead(task.owner)?;
         if task.status != TaskStatus::Ready {
             return Err(EngineError::NotRunnable(task.status));
         }
@@ -378,7 +449,45 @@ impl<R: Repository + 'static> Engine<R> {
         self.transition(id, TaskStatus::Ready).await
     }
     pub async fn run_task(&self, id: TaskId) -> Result<(), EngineError> {
+        self.run_task_with_mode(id, RunMode::Work).await
+    }
+    /// Run a persisted Team Lead message as a direct, tool-free conversation.
+    ///
+    /// Conversation tasks retain the normal ownership, event history,
+    /// cancellation, and result semantics, but cannot silently turn a user
+    /// message into delegation or a workspace side effect.
+    pub async fn run_conversation(&self, id: TaskId) -> Result<(), EngineError> {
+        self.run_task_with_mode(id, RunMode::Conversation).await
+    }
+    async fn run_task_with_mode(&self, id: TaskId, mode: RunMode) -> Result<(), EngineError> {
+        let result = self.execute_task_with_mode(id, mode).await;
+        if let Err(error) = &result {
+            if let Some(cancellation) = self.cancellations.lock().await.remove(&id) {
+                cancellation.cancel();
+            }
+            let still_running = self
+                .repo
+                .task(id)
+                .await?
+                .is_some_and(|task| task.status == TaskStatus::Running);
+            if still_running {
+                self.record(
+                    Some(id),
+                    CanonicalEventKind::ProviderFailed(format!(
+                        "task execution failed before reaching a terminal state: {error}"
+                    )),
+                )
+                .await?;
+                self.transition(id, TaskStatus::Failed).await?;
+            }
+        }
+        result
+    }
+    async fn execute_task_with_mode(&self, id: TaskId, mode: RunMode) -> Result<(), EngineError> {
         let task = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
+        if mode == RunMode::Conversation {
+            self.require_team_lead(task.owner)?;
+        }
         if task.status != TaskStatus::Ready {
             return Err(EngineError::NotRunnable(task.status));
         }
@@ -416,11 +525,18 @@ impl<R: Repository + 'static> Engine<R> {
         self.record(Some(id), CanonicalEventKind::ProviderStarted)
             .await?;
         let (tx, mut rx) = mpsc::channel(64);
-        let must_delegate = !agent.allowed_targets.is_empty()
+        let must_delegate = mode == RunMode::Work
+            && !agent.allowed_targets.is_empty()
             && agent.tools.iter().any(|tool| tool == "task.delegate");
-        let must_patch =
-            agent.allowed_targets.is_empty() && agent.tools.iter().any(|tool| tool == "file.patch");
-        let owner_prompt = if must_delegate {
+        let must_patch = mode == RunMode::Work
+            && agent.allowed_targets.is_empty()
+            && agent.tools.iter().any(|tool| tool == "file.patch");
+        let owner_prompt = if mode == RunMode::Conversation {
+            format!(
+                "{}\n\nRespond directly to the user's message as the coordinating Team Lead. Do not delegate work, propose tools, or modify the workspace in this conversation. Give a concise, useful answer grounded in the available workspace context.",
+                agent.system_prompt
+            )
+        } else if must_delegate {
             format!(
                 "{}\n\nYou are the coordinating lead. You must delegate every independently required workstream by calling task.delegate before doing any implementation. An objective may require multiple task.delegate calls to different agents; do not stop after the first when acceptance depends on more than one specialty. Do not return source code or implement the objective yourself. Every target_agent must be exactly one of: {}.",
                 agent.system_prompt,
@@ -442,7 +558,11 @@ impl<R: Repository + 'static> Engine<R> {
                 agent.allowed_targets.join(", ")
             )
         };
-        let tools = tool_definitions(&agent.tools, &agent.allowed_targets);
+        let tools = if mode == RunMode::Conversation {
+            Vec::new()
+        } else {
+            tool_definitions(&agent.tools, &agent.allowed_targets)
+        };
         let tool_choice = if must_delegate {
             ToolChoice::Specific(vec!["task.delegate".into()])
         } else if must_patch {
@@ -551,6 +671,19 @@ impl<R: Repository + 'static> Engine<R> {
                             command_spec(&args.command, Path::new("."))?;
                         }
                         "task.delegate" | "review.request" => {
+                            if self.require_team_lead(agent.id).is_err() {
+                                self.record(
+                                    Some(id),
+                                    CanonicalEventKind::ProviderFailed(
+                                        "delegation denied: route the decision through the Team Lead"
+                                            .into(),
+                                    ),
+                                )
+                                .await?;
+                                self.transition(id, TaskStatus::Blocked).await?;
+                                waiting_approval = true;
+                                continue;
+                            }
                             let args: DelegationProposal =
                                 serde_json::from_str(&request.arguments_json)?;
                             let target_exists = self
@@ -858,6 +991,7 @@ impl<R: Repository + 'static> Engine<R> {
                     .task(approval.task_id)
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
+                self.require_team_lead(parent.owner)?;
                 let delegator = self
                     .repo
                     .agent(parent.owner)
@@ -1085,8 +1219,8 @@ impl<R: Repository + 'static> Engine<R> {
     }
 
     async fn delegation_target(&self, name: &str) -> Result<Option<AgentProfile>, EngineError> {
-        if let Some(id) = self.formation_agents.get(name) {
-            return Ok(self.repo.agent(*id).await?);
+        if let Some(id) = self.formation_agents.read().await.get(name).copied() {
+            return Ok(self.repo.agent(id).await?);
         }
         Ok(self
             .repo
@@ -1094,6 +1228,14 @@ impl<R: Repository + 'static> Engine<R> {
             .await?
             .into_iter()
             .find(|agent| agent.name == name))
+    }
+
+    fn require_team_lead(&self, owner: AgentId) -> Result<(), EngineError> {
+        if self.team_lead.is_some_and(|team_lead| team_lead != owner) {
+            Err(EngineError::TeamLeadRequired)
+        } else {
+            Ok(())
+        }
     }
     pub async fn run_ready_bounded(
         self: &Arc<Self>,
@@ -1107,21 +1249,38 @@ impl<R: Repository + 'static> Engine<R> {
         let mut set = tokio::task::JoinSet::new();
         for task in ready {
             let engine = Arc::clone(self);
-            set.spawn(async move { engine.run_task(task.id).await });
+            set.spawn(async move { (task.id, engine.run_task(task.id).await) });
         }
+        let mut first_unsettled_error = None;
         while let Some(result) = set.join_next().await {
             match result {
-                Ok(Ok(())) | Ok(Err(EngineError::Provider(_))) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    return Err(ProviderError {
-                        kind: ProviderErrorKind::Internal,
-                        message: error.to_string(),
-                        retryable: false,
+                Ok((_, Ok(()))) => {}
+                Ok((task_id, Err(error))) => {
+                    let settled = self
+                        .repo
+                        .task(task_id)
+                        .await?
+                        .is_some_and(|task| task.status.is_terminal());
+                    if !settled && first_unsettled_error.is_none() {
+                        first_unsettled_error = Some(error);
                     }
-                    .into());
+                }
+                Err(error) => {
+                    if first_unsettled_error.is_none() {
+                        first_unsettled_error = Some(
+                            ProviderError {
+                                kind: ProviderErrorKind::Internal,
+                                message: error.to_string(),
+                                retryable: false,
+                            }
+                            .into(),
+                        );
+                    }
                 }
             }
+        }
+        if let Some(error) = first_unsettled_error {
+            return Err(error);
         }
         Ok(ids)
     }
@@ -1277,6 +1436,7 @@ mod tests {
     struct RequestRecorder {
         max_output_tokens: Arc<Mutex<Option<u64>>>,
         tool_choice: Arc<Mutex<Option<ToolChoice>>>,
+        tools: Arc<Mutex<Option<Vec<ToolDefinition>>>>,
     }
 
     #[async_trait::async_trait]
@@ -1304,6 +1464,7 @@ mod tests {
         ) -> Result<ProviderCompletion, ProviderError> {
             *self.max_output_tokens.lock().await = request.max_output_tokens;
             *self.tool_choice.lock().await = Some(request.tool_choice);
+            *self.tools.lock().await = Some(request.tools);
             let _ = sink.send(ProviderEvent::Completed).await;
             Ok(ProviderCompletion { usage: None })
         }
@@ -1322,6 +1483,142 @@ mod tests {
         );
         assert!(tools[0].description.contains("Local Implementer"));
     }
+
+    #[tokio::test]
+    async fn configured_team_lead_owns_root_and_delegation_decisions() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let lead_id = AgentId::new();
+        let specialist = AgentProfile {
+            id: AgentId::new(),
+            name: "Specialist".into(),
+            role: "backend_developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "implement only assigned work".into(),
+            tools: vec!["task.delegate".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec!["Peer".into()],
+            delegation_limits: Some(TaskLimits::default()),
+        };
+        repo.save_agent(specialist.clone()).await.unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        )
+        .with_team_lead(lead_id);
+
+        assert!(matches!(
+            engine
+                .create_task(specialist.id, "direct work", vec![])
+                .await,
+            Err(EngineError::TeamLeadRequired)
+        ));
+
+        let mut specialist_task = Task::root(
+            specialist.id,
+            "delegate directly",
+            vec![],
+            TaskLimits::default(),
+        );
+        specialist_task.transition(TaskStatus::Ready).unwrap();
+        repo.save_task(specialist_task.clone()).await.unwrap();
+        assert!(matches!(
+            engine
+                .propose_delegation_plan(
+                    specialist_task.id,
+                    &[DelegationProposal {
+                        target_agent: "Peer".into(),
+                        objective: "overlapping peer work".into(),
+                        acceptance_criteria: vec![],
+                    }],
+                )
+                .await,
+            Err(EngineError::TeamLeadRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_specialist_is_persisted_and_routed_only_from_team_lead() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let lead = AgentProfile {
+            id: AgentId::new(),
+            name: "Team Lead".into(),
+            role: "technical_lead".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "coordinate".into(),
+            tools: vec!["task.delegate".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: Some(TaskLimits {
+                max_delegation_depth: 2,
+                max_children: 0,
+                max_duration_seconds: 300,
+            }),
+        };
+        repo.save_agent(lead.clone()).await.unwrap();
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("unused")),
+            session,
+            tx,
+        )
+        .with_formation_agents(std::slice::from_ref(&lead))
+        .with_team_lead(lead.id);
+        let specialist = AgentProfile {
+            id: AgentId::new(),
+            name: "Backend Developer".into(),
+            role: "backend_developer".into(),
+            provider: lead.provider.clone(),
+            model: lead.model.clone(),
+            system_prompt: "implement assigned backend work".into(),
+            tools: vec!["file.patch".into(), "process.test".into()],
+            max_output_tokens: lead.max_output_tokens,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: Some(TaskLimits::default()),
+        };
+
+        let updated_lead = engine.add_team_member(specialist.clone()).await.unwrap();
+
+        assert_eq!(updated_lead.allowed_targets, vec![specialist.name.clone()]);
+        assert_eq!(
+            updated_lead
+                .delegation_limits
+                .as_ref()
+                .map(|limits| limits.max_children),
+            Some(1)
+        );
+        assert_eq!(
+            repo.agent(specialist.id).await.unwrap().unwrap().name,
+            specialist.name
+        );
+        assert!(
+            repo.events(session)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    CanonicalEventKind::AgentAdded { agent_id, .. } if agent_id == specialist.id
+                ))
+        );
+        assert!(
+            engine
+                .delegation_target(&specialist.name)
+                .await
+                .unwrap()
+                .is_some_and(|agent| agent.id == specialist.id)
+        );
+    }
+
     #[tokio::test]
     async fn records_provider_events() {
         let repo = Arc::new(InMemoryRepository::default());
@@ -1371,6 +1668,7 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = Arc::new(RequestRecorder {
             max_output_tokens: Arc::clone(&recorded),
             tool_choice: Arc::new(Mutex::new(None)),
+            tools: Arc::new(Mutex::new(None)),
         });
         let (tx, _rx) = mpsc::channel(16);
         let engine = Engine::new(repo, provider, SessionId::new(), tx);
@@ -1417,6 +1715,7 @@ mod tests {
             let provider: Arc<dyn ModelProvider> = Arc::new(RequestRecorder {
                 max_output_tokens: Arc::new(Mutex::new(None)),
                 tool_choice: Arc::clone(&recorded_choice),
+                tools: Arc::new(Mutex::new(None)),
             });
             let (tx, _rx) = mpsc::channel(16);
             let engine = Engine::new(repo, provider, SessionId::new(), tx);
@@ -1427,6 +1726,50 @@ mod tests {
 
             assert_eq!(*recorded_choice.lock().await, Some(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn team_lead_conversation_answers_directly_without_tools() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let lead = AgentProfile {
+            id: AgentId::new(),
+            name: "Team Lead".into(),
+            role: "technical_lead".into(),
+            provider: "recording".into(),
+            model: "test-model".into(),
+            system_prompt: "coordinate the team".into(),
+            tools: vec!["task.delegate".into(), "review.request".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec!["Backend Developer".into()],
+            delegation_limits: None,
+        };
+        repo.save_agent(lead.clone()).await.unwrap();
+        let recorded_choice = Arc::new(Mutex::new(None));
+        let recorded_tools = Arc::new(Mutex::new(None));
+        let provider: Arc<dyn ModelProvider> = Arc::new(RequestRecorder {
+            max_output_tokens: Arc::new(Mutex::new(None)),
+            tool_choice: Arc::clone(&recorded_choice),
+            tools: Arc::clone(&recorded_tools),
+        });
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(repo, provider, SessionId::new(), tx).with_team_lead(lead.id);
+        let task = engine
+            .create_task(lead.id, "What is the current status?", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_conversation(task.id).await.unwrap();
+
+        assert_eq!(*recorded_choice.lock().await, Some(ToolChoice::Auto));
+        assert!(
+            recorded_tools
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[tokio::test]
@@ -1450,6 +1793,7 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = Arc::new(RequestRecorder {
             max_output_tokens: Arc::clone(&recorded),
             tool_choice: Arc::new(Mutex::new(None)),
+            tools: Arc::new(Mutex::new(None)),
         });
         let (tx, _rx) = mpsc::channel(16);
         let engine = Engine::new(repo.clone(), provider, SessionId::new(), tx);
@@ -1555,6 +1899,96 @@ mod tests {
             }
         )));
         while rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn invalid_patch_path_fails_instead_of_leaking_a_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let session = SessionId::new();
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "file.patch".into(),
+                arguments_json: "{\"path\":\"missing/report.md\",\"replacement\":\"evidence\"}"
+                    .into(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let task = engine
+            .create_task(AgentId::new(), "write report", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        assert!(matches!(
+            engine.run_task(task.id).await,
+            Err(EngineError::Tool(ToolError::Io(_)))
+        ));
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        assert!(repo.events(session).await.unwrap().iter().any(|event| {
+            matches!(
+                &event.kind,
+                CanonicalEventKind::ProviderFailed(message)
+                    if message.contains("before reaching a terminal state")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn scheduler_reconciles_parent_after_a_tool_proposal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let provider = MockProvider::new(vec![MockStep::Event(ProviderEvent::ToolRequest(
+            StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "file.patch".into(),
+                arguments_json: "{\"path\":\"missing/report.md\",\"replacement\":\"evidence\"}"
+                    .into(),
+            },
+        ))]);
+        let engine = Arc::new(
+            Engine::new(repo.clone(), Arc::new(provider), SessionId::new(), tx)
+                .with_safe_workflow(dir.path())
+                .unwrap(),
+        );
+        let parent = engine
+            .create_task(AgentId::new(), "coordinate", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(parent.id).await.unwrap();
+        engine
+            .transition(parent.id, TaskStatus::Running)
+            .await
+            .unwrap();
+        let child = engine
+            .delegate_task(
+                parent.id,
+                AgentId::new(),
+                "write support evidence".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        engine.run_until_idle_bounded(1).await.unwrap();
+
+        assert_eq!(
+            repo.task(child.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
     }
 
     #[tokio::test]

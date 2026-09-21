@@ -14,7 +14,16 @@ terminal team builder asks for the developer count, an existing working
 directory (`.` by default), and one default output-token limit. It then offers
 an automatic name and role plus a
 provider/model selection for each developer, so accepting the suggested team
-requires only Enter. OpenAI
+requires only Enter. The first developer is a required Technical Lead and
+cannot be changed to a specialist; later developers cannot select the lead
+role. Generated delegation policy is a mediated hub topology: only the lead
+receives delegation tools and allowed targets, so specialists return requests
+and results to the lead instead of dispatching directly to peers. The graph
+shows one connector per Lead/specialist relationship, making cross-role work
+visible through the shared Lead hub without granting peer authority. A
+one-developer setup still uses the required Team Lead, but gives it scoped
+patch/test tools instead of delegation tools so
+the solo team remains useful. OpenAI
 choices are filtered to text/tool-capable offerings from the bundled
 models.dev snapshot. Ollama choices come from the models installed on the
 loopback runtime when it responds within the bounded discovery window; an
@@ -33,6 +42,22 @@ filter, and Enter accepts the highlighted directory. Right/`l` opens the
 highlighted directory, Left/`h` returns to its parent, and Space accepts the
 currently displayed directory. Esc first finishes or clears an active filter
 and then preserves the previous workspace selection.
+
+After launch, `S` opens a modal team adjustment surface. It changes an idle
+specialist's enabled state for future assignments in the active runtime, and
+`n` adds another specialist from the safe Backend, Frontend, Full-stack,
+Reviewer, Tester, or DevOps presets. Added specialists inherit the Team Lead's
+provider, model, and token limit, receive role-appropriate tools, and have no
+delegation targets. The required Team Lead cannot be disabled, and active or
+approval-pending work blocks availability changes. Accepted changes update
+persisted agent profiles and append audit events. Runtime additions apply to the
+active run; durable membership/provider/model customization still requires a
+validated configuration update and a new run.
+
+When the configured objective starts with `r`, its live plan includes every
+enabled specialist currently allowed by the Team Lead. Required named
+workstreams are preserved or reassigned to an enabled agent of the same role;
+remaining specialists receive unique role-appropriate support ownership.
 
 ## 2. Example
 
@@ -211,8 +236,11 @@ No TOML migration is required.
 The workspace footer is a `ratatui-textarea` input. Press Enter or `t` to focus
 it, Enter to send, Shift+Enter for a newline, and Esc to keep the draft. Plain
 text creates a persisted root task owned by the formation entry agent (the
-Team Lead). `/tasks` focuses the current session's live task list without
-calling a provider.
+Team Lead) and requests a direct, tool-free answer. `/task <objective>` creates
+executable work for the Team Lead, retaining its configured delegation policy.
+`/tasks` focuses the current session's live task list without calling a
+provider. Submission failures are reported in the composer instead of being
+discarded by a background task.
 
 ## 8. Formation examples
 

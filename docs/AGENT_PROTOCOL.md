@@ -66,6 +66,11 @@ Required payload:
 Validation:
 
 - Target exists and is enabled.
+- When a Team Lead is bound for the run, the sender is that Team Lead; a
+  specialist cannot originate a root or delegation decision.
+- Cross-specialist input is requested through the Team Lead. The lead decides
+  whether to create a separate persisted task for the target specialist; a
+  specialist never addresses or dispatches directly to that peer.
 - Sender may propose or dispatch to target.
 - Parent is not above depth/child/budget limits.
 - Requested tools are a subset of target and session permissions.
@@ -145,9 +150,15 @@ A review request references immutable artifacts/diffs and acceptance criteria. R
 - Provider rate limits/timeouts may retry within policy using bounded exponential backoff and jitter.
 - Invalid structured output may receive one repair request with the validation errors.
 - Authentication, permission denial, budget exhaustion and user cancellation do not auto-retry.
+- A tool-proposal error before approval emits failure evidence and transitions
+  an already-running task to `Failed`; it cannot remain indefinitely active.
 - If a fully validated tool proposal is already persisted for approval, an
   invalid terminal stream frame is audited but does not overwrite the pending
   approval with `Failed`.
+- If usable text or a structured tool proposal was streamed and only the
+  terminal frame is undecodable, preserve the output, record a warning, and
+  complete with unknown usage. The same decode failure before usable output is
+  terminal.
 - Scheduler waves operate only on tasks created or delegated in the active
   session; persisted queued tasks from older sessions are not resumed implicitly.
 - Every attempt retains an attempt number and correlation ID.

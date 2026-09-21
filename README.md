@@ -28,14 +28,19 @@ cargo run -p voff -- run --objective "Build a full-stack calculator. Delegate a 
 The built-in calculator demo is intentionally full-stack: the Backend
 Developer owns a standard-library `server.py` JSON API and the Frontend
 Developer owns an accessible `index.html` client. The Team Lead is instructed
-to create both persisted child tasks before the objective can complete.
+to create both persisted child tasks before the objective can complete. Every
+other enabled specialist also receives one role-appropriate, non-overlapping
+review, validation, integration, or operations task. Disabled specialists are
+skipped, and specialists added with `S` are included when `r` starts the run.
 
 On first launch, voff opens a quick team builder. One defaults page sets the
 developer count, working directory (`.` by default), and default output-token
 limit. Names and roles are
 suggested automatically; provider and model are selected only on each
-developer. Press Enter to accept a developer or adjust the role, provider, or
-model you care about. OpenAI models come from a
+developer. The first developer is always the required Team Lead, and later
+developers can select specialist roles but cannot create a competing lead.
+Press Enter to accept a developer or adjust the available role, provider, or
+model choices. OpenAI models come from a
 bundled models.dev catalog with context and price metadata; installed Ollama
 models are discovered locally when Ollama is running.
 
@@ -55,20 +60,45 @@ restarting. Values entered either way are stored in the workspace-local
 The workspace includes a `ratatui-textarea` composer at the bottom, with the
 resolved working directory always visible in its border. Click the composer or
 press Enter, type a message, and press Enter again to send it to the Team Lead.
-Type `/tasks` to focus the current task list. Team Lead messages become explicit,
-persisted root tasks, so their status and results remain inspectable.
+Plain text asks the Team Lead for a direct, tool-free response. Type
+`/task <objective>` to give executable work that the lead may delegate, or
+`/tasks` to focus the current task list. Both conversations and assignments
+become explicit, persisted root tasks, so their status and results remain
+inspectable.
 
-The workspace renders every developer as a live status card. Faint connecting
-threads show who may delegate to whom. Once a persisted child task crosses a
-thread, it becomes a bright directional route labelled with the objective and
-an animated work marker. Running roles also show their current objective and a
-spinner, so pressing `r` makes ownership visible immediately. Cards can be
-selected or repositioned with the mouse. The same status information remains
-available through text and symbols, so keyboard-only use and terminals without
-color remain supported.
+Risky requests appear in one centered approval popup. When several requests are
+pending, use Up/Down to inspect them one at a time; `y` approves only the visible
+request once and `n` denies only that request.
+
+The workspace uses `rataflow` to render every developer as a live status card.
+Every root-work and delegation decision is enforced through the Team Lead;
+specialists cannot dispatch work directly to one another. Every specialist has
+one relationship connector to the Lead, representing assignments out and
+requests/results back through the same coordination hub. Cross-role
+collaboration is therefore specialist → Lead → specialist, never a direct peer
+edge. Once a persisted child task crosses a route, its connector becomes bright
+and animates while work is running. Connectors
+intentionally carry no text so parallel routes
+remain scannable; the task objective and status stay inside the owning developer
+card. Running roles use a pulsing border, activity
+glyph, and `LIVE` status, so pressing `r` makes ownership
+visible immediately. Cards can be selected or repositioned with the mouse;
+clicking a role highlights its Team Lead-mediated connector in yellow. Drag
+empty graph space to pan, use `+`/`-` to zoom, `0` to reset zoom, and `f`
+to fit the team. Press `S` after setup to open the team popup. `n` adds another
+Backend, Frontend, Full-stack, Reviewer, Tester, or DevOps specialist using the
+Team Lead's provider/model defaults; Enter enables or disables the selected idle
+specialist. The Team Lead cannot be disabled, and a specialist with queued,
+running, or pending-approved work must finish or cancel it before availability
+changes. New specialists have no peer-delegation authority. The same status information remains available through text
+and symbols, so keyboard-only use and terminals without color remain supported.
 Token usage is costed per task owner and model from the same catalog. Explicit
 `[cost]` rates override catalog prices; unknown local prices stay visibly
 unconfigured rather than being treated as free.
+
+The Rataflow team view owns the full workspace center by default. Press `1` for
+Team, `2` for Tasks, `3` for Task Details, or `4` for Events; `Tab` cycles the
+same fullscreen views while the header and Team Lead composer remain visible.
 
 Existing configurations skip the builder and open normally; there is no config
 migration. For scripts and repeatable setup, `voff init` remains available with
@@ -135,8 +165,9 @@ cargo run -p voff -- run \
 
 Delegations, patches, and test commands remain subject to explicit approval.
 Drag a developer card to arrange the team, click a card to select it, press `y`
-to approve once, `n` to deny, `e` to inspect events, `?` for help, and `q` to
-quit. All core actions remain keyboard-accessible.
+to approve once, `n` to deny, `S` to add or adjust specialists, `1`–`4` to
+switch fullscreen views, `f` to fit the team graph, `e` to inspect events, `?`
+for help, and `q` to quit. All core actions remain keyboard-accessible.
 
 ## Development checks
 
