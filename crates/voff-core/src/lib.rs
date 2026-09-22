@@ -149,10 +149,21 @@ impl TaskStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    #[must_use]
+    pub const fn can_retry(self) -> bool {
+        self.is_terminal() || matches!(self, Self::Blocked)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
+    /// One-based execution attempt number. Older persisted tasks deserialize as attempt one.
+    #[serde(default = "first_task_attempt")]
+    pub attempt: u16,
+    /// The immediately preceding attempt when this task was explicitly re-run.
+    #[serde(default)]
+    pub retry_of: Option<TaskId>,
     pub parent: Option<TaskId>,
     pub owner: AgentId,
     pub objective: String,
@@ -175,6 +186,8 @@ impl Task {
         let now = Utc::now();
         Self {
             id: TaskId::new(),
+            attempt: first_task_attempt(),
+            retry_of: None,
             parent: None,
             owner,
             objective: objective.into(),
@@ -225,9 +238,18 @@ impl Task {
     }
 }
 
+const fn first_task_attempt() -> u16 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CanonicalEventKind {
     TaskCreated,
+    TaskRetried {
+        previous: TaskId,
+        retry: TaskId,
+        attempt: u16,
+    },
     TaskTransition {
         from: TaskStatus,
         to: TaskStatus,
@@ -349,6 +371,8 @@ impl TaskGraph {
         let now = Utc::now();
         let task = Task {
             id: TaskId::new(),
+            attempt: first_task_attempt(),
+            retry_of: None,
             parent: Some(parent),
             owner,
             objective: objective.into(),
@@ -445,6 +469,20 @@ mod tests {
         let restored: AgentProfile = serde_json::from_value(encoded).unwrap();
 
         assert_eq!(restored.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn older_tasks_default_to_the_first_attempt() {
+        let task = Task::root(AgentId::new(), "legacy", vec![], TaskLimits::default());
+        let mut encoded = serde_json::to_value(task).unwrap();
+        let object = encoded.as_object_mut().unwrap();
+        object.remove("attempt");
+        object.remove("retry_of");
+
+        let restored: Task = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(restored.attempt, 1);
+        assert_eq!(restored.retry_of, None);
     }
     #[test]
     fn transitions_validate() {

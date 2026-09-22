@@ -36,6 +36,17 @@ with explicit flags.
 The selected working directory is written to `workspace.root`. It scopes
 workspace file access, process execution, and the local `.voff/voff.db`; the
 main Team Lead bar shows its resolved path while voff is running.
+The global `--workspace <DIR>` argument temporarily overrides this value for
+the current invocation and uses `<DIR>/.voff/voff.db` (or the configured
+relative `state_file`). It is accepted before or after a subcommand, applies to
+`run`, `sessions`, `doctor`, and `export`. For an already recognized workspace,
+the override does not rewrite configuration. On a bare launch, a missing
+workspace database marks the target as unrecognized and opens interactive
+setup rather than silently initializing state. A new `--workspace` target
+receives its own `.voff/config.toml`; if setup replaces an existing
+configuration because its database is missing, the prior file is preserved
+beside it as `config.toml.bak` (with a numeric suffix when needed). Explicit
+subcommands retain their non-interactive behavior.
 Interactive setup selects it through a directory-only `ratatui-explorer`
 picker. Arrow keys and `hjkl` navigate, `/` starts a typed directory-name
 filter, and Enter accepts the highlighted directory. Right/`l` opens the
@@ -54,10 +65,10 @@ persisted agent profiles and append audit events. Runtime additions apply to the
 active run; durable membership/provider/model customization still requires a
 validated configuration update and a new run.
 
-When the configured objective starts with `r`, its live plan includes every
-enabled specialist currently allowed by the Team Lead. Required named
-workstreams are preserved or reassigned to an enabled agent of the same role;
-remaining specialists receive unique role-appropriate support ownership.
+Launching or resuming a workspace creates no implicit task. Submit explicit work
+with `/task <objective>`, or press capital `R` for Quick Run. The Team Lead may
+then propose bounded delegation to enabled, allowed specialists through the
+normal approval flow.
 
 ## 2. Example
 
@@ -208,7 +219,7 @@ unreadable files fail with a safe error. Never commit `.env`.
 
 Interactive setup offers an optional field for the actual OpenAI API token if
 the selected team needs it and no credential already exists. Enter skips it,
-so credentials never block workspace launch. Press `a` in the running
+so credentials never block workspace launch. Press `A` in the running
 workspace to enter the token later without restarting. Input is masked and
 stored in the workspace-local SQLite database at `.voff/voff.db`. The value is
 never serialized to project configuration, prompts, logs, or exports. This is
@@ -227,20 +238,53 @@ No TOML migration is required.
 
 - Config stores only environment-variable/database lookup names.
 - The UI displays whether a credential is available, never its value, and
-  permits a missing OpenAI credential to be added with `a`.
+  permits a missing OpenAI credential to be added with `A`.
 - Export removes resolved secrets and sensitive transient headers.
 - Child processes receive only explicitly required variables.
 
 ## 7. Team Lead composer
 
-The workspace footer is a `ratatui-textarea` input. Press Enter or `t` to focus
-it, Enter to send, Shift+Enter for a newline, and Esc to keep the draft. Plain
-text creates a persisted root task owned by the formation entry agent (the
-Team Lead) and requests a direct, tool-free answer. `/task <objective>` creates
+The workspace footer is a `ratatui-textarea` input titled `Team Lead`. Press
+Enter or click the composer to start talking to the Team Lead. Once active,
+Enter sends, Shift+Enter inserts a newline and grows the composer, and Esc
+safely quits. The TUI requests modifier-aware keyboard reporting so Shift+Enter
+is distinguishable from Enter; Ctrl+J and Alt+Enter are newline fallbacks for
+terminals without that protocol. Long drafts soft-wrap and scroll; arrows,
+Home/End, Ctrl+arrows, Shift+arrows, Ctrl+W/Ctrl+K, and Ctrl+Z/Ctrl+Y provide
+navigation, selection, deletion, and undo/redo. Plain text
+creates a persisted root task owned by the formation entry agent (the Team
+Lead) and requests a direct, tool-free answer. `/task <objective>` creates
 executable work for the Team Lead, retaining its configured delegation policy.
 `/tasks` focuses the current session's live task list without calling a
-provider. Submission failures are reported in the composer instead of being
-discarded by a background task.
+provider. The resolved working directory stays on the bottom-right border.
+Submission failures are reported in the composer instead of being discarded by
+a background task.
+
+Capital `R` starts Quick Run only while the composer is inactive. It creates a
+persisted Team Lead root task with a predefined prompt to reconcile relevant
+Markdown requirements with the source, prioritize bounded tasks, delegate
+independent workstreams when specialists are available, execute approved work,
+and validate the results. The UI switches to Tasks immediately and marks the
+workflow `R QUICK RUN`; all delegation and side-effect approvals still apply.
+The inactive composer keeps a centered white `[R] Quick Run` label on its
+bottom border; the workspace header is reserved for view and runtime status.
+
+In the Tasks view, lowercase `r` creates and runs a new attempt for the selected
+completed, failed, cancelled, or blocked task. The new attempt retains its own
+task ID, attempt number, and link to the immediately preceding attempt; the
+prior terminal history is never reset or overwritten. Active and
+approval-pending tasks must be cancelled or resolved before they can be
+re-run.
+
+The task browser puts Team Lead roots first, orders peer tasks newest first, and
+keeps every delegated task directly beneath its parent. Each delegated task
+card, including its owner and objective, is indented by two columns per
+delegation depth; root owners have no hierarchy padding. Each owner uses the
+same colored Unicode role icon as the Team view. The session event viewer and
+role activity view stay flat and identify events with short task IDs. Event text
+uses semantic colors while retaining textual status: actions and approvals are
+yellow, failures red, completions green, task lifecycle events cyan, and usage
+magenta.
 
 ## 8. Formation examples
 

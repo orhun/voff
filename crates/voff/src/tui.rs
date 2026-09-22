@@ -5,7 +5,8 @@ use crate::{model_catalog::ModelCatalog, onboarding::DeveloperRole};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -13,12 +14,12 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{DataCursor, TextArea, WrapMode};
 use std::{
     collections::{HashMap, HashSet},
     io, panic,
@@ -28,7 +29,6 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tui_popup::{KnownSizeWrapper, Popup};
 use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
     CanonicalEventKind, EventId, SessionId, Task, TaskStatus,
@@ -37,14 +37,17 @@ use voff_engine::{DelegationProposal, Engine, EngineEvent};
 use voff_provider::ProviderHealth;
 use voff_storage::{Repository, SqliteRepository};
 
-use self::team_flow::{TeamFlow, handoff_summary};
+use self::team_flow::{TeamFlow, handoff_summary, role_color, role_icon};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Panel {
     Tasks,
-    Details,
     Agents,
-    Events,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskInspector {
+    Details,
+    RoleActivity,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -52,10 +55,10 @@ pub enum Action {
     Down,
     NextPanel,
     ToggleHelp,
-    Compose,
-    ComposeCommand,
+    FocusComposer,
+    QuickRun,
+    RetryTask,
     AddCredential,
-    StartMock,
     Cancel,
     Approve,
     Deny,
@@ -69,12 +72,18 @@ pub enum Action {
     AdjustTeam,
     ShowTeam,
     ShowTasks,
-    ShowDetails,
-    ShowEvents,
+    ShowTaskDetails,
+    ShowRoleActivity,
     Escape,
     Quit,
     Mouse(MouseEvent),
     None,
+}
+
+#[derive(Clone, Debug)]
+struct ScopedEvent {
+    task_id: Option<voff_core::TaskId>,
+    text: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -110,6 +119,7 @@ pub struct AppModel {
     pub session: SessionId,
     pub tasks: Vec<Task>,
     pub events: Vec<String>,
+    event_task_ids: Vec<Option<voff_core::TaskId>>,
     pub selected: usize,
     pub panel: Panel,
     pub help: bool,
@@ -118,6 +128,7 @@ pub struct AppModel {
     pub agent_name: String,
     pub model_label: String,
     pub agents: Vec<AgentProfile>,
+    known_agents: HashMap<AgentId, AgentProfile>,
     pub approvals: Vec<Approval>,
     pub artifacts: Vec<Artifact>,
     pub provider_health: ProviderHealth,
@@ -132,6 +143,11 @@ pub struct AppModel {
     pub event_viewer: bool,
     pub event_scroll: u16,
     event_follow: bool,
+    scoped_events: Vec<ScopedEvent>,
+    task_inspector: TaskInspector,
+    task_inspector_scroll: u16,
+    task_list_hitbox: Rect,
+    task_window_start: usize,
     credential_target: Option<(String, crate::credential::CredentialSlot)>,
     credential_input: Option<String>,
     credential_saving: bool,
@@ -140,6 +156,8 @@ pub struct AppModel {
     composer_active: bool,
     composer_notice: Option<String>,
     composer_hitbox: Rect,
+    quick_run_starting: bool,
+    retry_starting: bool,
     selected_agent: usize,
     approval_selected: usize,
     team_lead: Option<AgentId>,
@@ -157,11 +175,22 @@ impl AppModel {
     pub fn new(session: SessionId) -> Self {
         let mut composer = TextArea::default();
         composer.set_cursor_line_style(Style::default());
-        composer.set_placeholder_text("Message Team Lead · /task assign · /tasks list");
+        composer.set_cursor_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        composer.set_selection_style(Style::default().fg(Color::Black).bg(Color::LightBlue));
+        composer.set_wrap_mode(WrapMode::WordOrGlyph);
+        composer.set_tab_length(2);
+        composer.set_max_histories(200);
+        composer.set_placeholder_text("Press Enter to talk");
         Self {
             session,
             tasks: vec![],
             events: vec![],
+            event_task_ids: vec![],
             selected: 0,
             panel: Panel::Agents,
             help: false,
@@ -170,6 +199,7 @@ impl AppModel {
             agent_name: "Mock Agent".into(),
             model_label: "mock-v1".into(),
             agents: vec![],
+            known_agents: HashMap::new(),
             approvals: vec![],
             artifacts: vec![],
             provider_health: ProviderHealth::default(),
@@ -184,6 +214,11 @@ impl AppModel {
             event_viewer: false,
             event_scroll: 0,
             event_follow: true,
+            scoped_events: vec![],
+            task_inspector: TaskInspector::Details,
+            task_inspector_scroll: 0,
+            task_list_hitbox: Rect::default(),
+            task_window_start: 0,
             credential_target: None,
             credential_input: None,
             credential_saving: false,
@@ -192,6 +227,8 @@ impl AppModel {
             composer_active: false,
             composer_notice: None,
             composer_hitbox: Rect::default(),
+            quick_run_starting: false,
+            retry_starting: false,
             selected_agent: 0,
             approval_selected: 0,
             team_lead: None,
@@ -211,17 +248,18 @@ impl AppModel {
         }
         match action {
             Action::Up => {
-                if self.event_viewer || self.panel == Panel::Events {
+                if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
                     self.event_follow = self.event_scroll == 0;
                 } else if self.panel == Panel::Agents {
                     self.selected_agent = self.selected_agent.saturating_sub(1);
                 } else {
                     self.selected = self.selected.saturating_sub(1);
+                    self.task_inspector_scroll = 0;
                 }
             }
             Action::Down => {
-                if self.event_viewer || self.panel == Panel::Events {
+                if self.event_viewer {
                     self.event_scroll = self
                         .event_scroll
                         .saturating_add(1)
@@ -232,19 +270,28 @@ impl AppModel {
                         self.selected_agent += 1;
                     }
                 } else if self.selected + 1 < self.tasks.len() {
-                    self.selected += 1
+                    self.selected += 1;
+                    self.task_inspector_scroll = 0;
                 }
             }
             Action::PageUp => {
-                self.event_scroll = self.event_scroll.saturating_sub(10);
-                self.event_follow = self.event_scroll == 0;
+                if self.event_viewer {
+                    self.event_scroll = self.event_scroll.saturating_sub(10);
+                    self.event_follow = self.event_scroll == 0;
+                } else if self.panel == Panel::Tasks {
+                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(10);
+                }
             }
             Action::PageDown => {
-                self.event_scroll = self
-                    .event_scroll
-                    .saturating_add(10)
-                    .min(self.event_scroll_limit());
-                self.event_follow = self.event_scroll == 0;
+                if self.event_viewer {
+                    self.event_scroll = self
+                        .event_scroll
+                        .saturating_add(10)
+                        .min(self.event_scroll_limit());
+                    self.event_follow = self.event_scroll == 0;
+                } else if self.panel == Panel::Tasks {
+                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(10);
+                }
             }
             Action::FitTeam if self.panel == Panel::Agents => self.team_flow.fit_view(),
             Action::ZoomTeamIn if self.panel == Panel::Agents => self.team_flow.zoom_in(),
@@ -259,33 +306,26 @@ impl AppModel {
             }
             Action::ShowTeam => self.panel = Panel::Agents,
             Action::ShowTasks => self.panel = Panel::Tasks,
-            Action::ShowDetails => self.panel = Panel::Details,
-            Action::ShowEvents => {
-                self.panel = Panel::Events;
-                self.follow_newest_event();
+            Action::ShowTaskDetails => {
+                self.panel = Panel::Tasks;
+                self.task_inspector = TaskInspector::Details;
+                self.task_inspector_scroll = 0;
+            }
+            Action::ShowRoleActivity => {
+                self.panel = Panel::Tasks;
+                self.task_inspector = TaskInspector::RoleActivity;
+                self.task_inspector_scroll = 0;
             }
             Action::NextPanel => {
                 self.panel = match self.panel {
                     Panel::Agents => Panel::Tasks,
-                    Panel::Tasks => Panel::Details,
-                    Panel::Details => Panel::Events,
-                    Panel::Events => Panel::Agents,
+                    Panel::Tasks => Panel::Agents,
                 };
-                if self.panel == Panel::Events {
-                    self.follow_newest_event();
-                }
             }
             Action::ToggleHelp => self.help = !self.help,
-            Action::Compose => {
+            Action::FocusComposer => {
                 self.composer_active = true;
                 self.composer_notice = None;
-            }
-            Action::ComposeCommand => {
-                self.composer_active = true;
-                self.composer_notice = None;
-                if self.composer.lines() == [""] {
-                    self.composer.insert_str("/");
-                }
             }
             Action::AddCredential => {
                 if self
@@ -299,8 +339,9 @@ impl AppModel {
             }
             Action::ToggleEvents => {
                 self.event_viewer = !self.event_viewer;
-                self.panel = Panel::Events;
-                self.follow_newest_event();
+                if self.event_viewer {
+                    self.follow_newest_event();
+                }
             }
             Action::Escape => {
                 if self.event_viewer {
@@ -313,7 +354,8 @@ impl AppModel {
             }
             Action::Quit => self.quit = true,
             Action::Mouse(mouse) => self.handle_mouse(mouse),
-            Action::StartMock
+            Action::QuickRun
+            | Action::RetryTask
             | Action::Cancel
             | Action::Approve
             | Action::Deny
@@ -334,6 +376,40 @@ impl AppModel {
             self.composer_active = true;
             self.composer_notice = None;
             return;
+        }
+        if self.panel == Panel::Tasks {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self
+                        .task_list_hitbox
+                        .contains((mouse.column, mouse.row).into()) =>
+                {
+                    let row = usize::from(
+                        mouse
+                            .row
+                            .saturating_sub(self.task_list_hitbox.y.saturating_add(1)),
+                    );
+                    let index = self.task_window_start.saturating_add(row / 2);
+                    if index < self.tasks.len() {
+                        self.selected = index;
+                        self.task_inspector_scroll = 0;
+                    }
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.selected = self.selected.saturating_sub(1);
+                    self.task_inspector_scroll = 0;
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    if self.selected + 1 < self.tasks.len() {
+                        self.selected += 1;
+                    }
+                    self.task_inspector_scroll = 0;
+                    return;
+                }
+                _ => return,
+            }
         }
         let interaction = self.team_flow.handle_mouse(mouse);
         if interaction.handled {
@@ -565,13 +641,27 @@ impl AppModel {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => {
                     self.composer_active = false;
-                    self.composer_notice = Some("Draft kept. Press Enter to continue.".into());
+                    self.quit = true;
                     ComposerEvent::Consumed
                 }
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    self.composer.insert_newline();
+                    self.composer_notice = None;
+                    ComposerEvent::Consumed
+                }
+                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.composer.insert_newline();
+                    self.composer_notice = None;
+                    ComposerEvent::Consumed
+                }
+                KeyCode::Enter => {
                     let message = self.composer.lines().join("\n").trim().to_owned();
                     if message.is_empty() {
-                        self.composer_notice = Some("Type a message or /tasks first.".into());
+                        self.composer_notice = Some("Type a message or command first.".into());
                         ComposerEvent::Consumed
                     } else if message.len() > 8_000 {
                         self.composer_notice = Some("Keep messages under 8,000 bytes.".into());
@@ -582,11 +672,28 @@ impl AppModel {
                         ComposerEvent::Submit(message)
                     }
                 }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.composer.undo();
+                    ComposerEvent::Consumed
+                }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.composer.redo();
+                    ComposerEvent::Consumed
+                }
                 _ => {
                     self.composer.input(*key);
+                    self.composer_notice = None;
                     ComposerEvent::Consumed
                 }
             },
+            Event::Mouse(mouse)
+                if self
+                    .composer_hitbox
+                    .contains((mouse.column, mouse.row).into()) =>
+            {
+                self.composer.input(*mouse);
+                ComposerEvent::Consumed
+            }
             _ => ComposerEvent::Consumed,
         }
     }
@@ -601,13 +708,43 @@ impl AppModel {
             if self.tasks.len() == 1 { "" } else { "s" }
         ));
     }
+
+    fn quick_run_active(&self) -> bool {
+        self.quick_run_starting
+            || self.tasks.iter().any(|task| {
+                task.objective == QUICK_RUN_OBJECTIVE
+                    && matches!(
+                        task.status,
+                        TaskStatus::Queued
+                            | TaskStatus::Ready
+                            | TaskStatus::Running
+                            | TaskStatus::WaitingApproval
+                    )
+            })
+    }
     pub fn apply_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::TaskUpdated(task) => {
+                let is_new = !self.tasks.iter().any(|existing| existing.id == task.id);
+                if task.objective == QUICK_RUN_OBJECTIVE
+                    && matches!(
+                        task.status,
+                        TaskStatus::Blocked
+                            | TaskStatus::Completed
+                            | TaskStatus::Failed
+                            | TaskStatus::Cancelled
+                    )
+                {
+                    self.quick_run_starting = false;
+                }
                 if let Some(old) = self.tasks.iter_mut().find(|x| x.id == task.id) {
                     *old = task
                 } else {
-                    self.tasks.push(task)
+                    self.tasks.push(task);
+                }
+                self.sort_tasks_for_browser();
+                if is_new {
+                    self.selected = 0;
                 }
             }
             EngineEvent::Canonical(e) => {
@@ -623,7 +760,7 @@ impl AppModel {
                         self.cost_partial = true;
                     }
                 }
-                self.push_event(&e.kind)
+                self.push_scoped_event(e.task_id, &e.kind)
             }
             EngineEvent::ApprovalUpdated(approval) => {
                 if let Some(old) = self.approvals.iter_mut().find(|v| v.id == approval.id) {
@@ -642,7 +779,13 @@ impl AppModel {
             EngineEvent::ProviderHealth(health) => self.provider_health = health,
         }
         if self.events.len() > 500 {
-            self.events.drain(..self.events.len() - 500);
+            let drain = self.events.len() - 500;
+            self.events.drain(..drain);
+            self.event_task_ids
+                .drain(..drain.min(self.event_task_ids.len()));
+        }
+        if self.scoped_events.len() > 500 {
+            self.scoped_events.drain(..self.scoped_events.len() - 500);
         }
     }
     fn usage_cost(
@@ -704,26 +847,59 @@ impl AppModel {
         }
     }
     fn push_event(&mut self, kind: &CanonicalEventKind) {
+        self.push_scoped_event(None, kind);
+    }
+
+    fn push_scoped_event(&mut self, task_id: Option<voff_core::TaskId>, kind: &CanonicalEventKind) {
+        self.event_task_ids.resize(self.events.len(), None);
+        let was_streaming = self.streaming_text;
         if let CanonicalEventKind::TextDelta(delta) = kind {
             let clean = sanitize(delta);
-            if self.streaming_text {
+            if was_streaming {
                 if let Some(last) = self.events.last_mut() {
                     last.push_str(&clean);
                 }
             } else {
                 self.events.push(clean);
+                self.event_task_ids.push(task_id);
                 self.streaming_text = true;
             }
         } else {
             self.streaming_text = false;
             self.events.push(format_event(kind));
+            self.event_task_ids.push(task_id);
+        }
+        if let CanonicalEventKind::TextDelta(delta) = kind {
+            let clean = sanitize(delta);
+            if was_streaming
+                && self
+                    .scoped_events
+                    .last()
+                    .is_some_and(|event| event.task_id == task_id)
+            {
+                if let Some(last) = self.scoped_events.last_mut() {
+                    last.text.push_str(&clean);
+                }
+            } else {
+                self.scoped_events.push(ScopedEvent {
+                    task_id,
+                    text: clean,
+                });
+            }
+        } else {
+            self.scoped_events.push(ScopedEvent {
+                task_id,
+                text: format_event(kind),
+            });
         }
         self.on_events_changed();
     }
 
     fn push_ui_event(&mut self, message: String) {
+        self.event_task_ids.resize(self.events.len(), None);
         self.streaming_text = false;
         self.events.push(message);
+        self.event_task_ids.push(None);
         self.on_events_changed();
     }
 
@@ -743,6 +919,26 @@ impl AppModel {
     pub fn selected_task(&self) -> Option<&Task> {
         self.tasks.get(self.selected)
     }
+    fn sort_tasks_for_browser(&mut self) {
+        let selected_id = self.selected_task().map(|task| task.id);
+        let order = task_browser_order(&self.tasks, self.team_lead);
+        let ranks = order
+            .into_iter()
+            .enumerate()
+            .map(|(rank, id)| (id, rank))
+            .collect::<HashMap<_, _>>();
+        self.tasks
+            .sort_by_key(|task| ranks.get(&task.id).copied().unwrap_or(usize::MAX));
+        self.selected = selected_id
+            .and_then(|id| self.tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0);
+    }
+    fn agent_for_owner(&self, owner: AgentId) -> Option<&AgentProfile> {
+        self.agents
+            .iter()
+            .find(|agent| agent.id == owner)
+            .or_else(|| self.known_agents.get(&owner))
+    }
     fn event_scroll_limit(&self) -> u16 {
         self.events
             .iter()
@@ -758,10 +954,10 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::Tab => Action::NextPanel,
         KeyCode::Char('?') => Action::ToggleHelp,
-        KeyCode::Enter | KeyCode::Char('t') => Action::Compose,
-        KeyCode::Char('/') => Action::ComposeCommand,
-        KeyCode::Char('a') => Action::AddCredential,
-        KeyCode::Char('r') => Action::StartMock,
+        KeyCode::Enter => Action::FocusComposer,
+        KeyCode::Char('R') => Action::QuickRun,
+        KeyCode::Char('r') => Action::RetryTask,
+        KeyCode::Char('A') => Action::AddCredential,
         KeyCode::Char('c') => Action::Cancel,
         KeyCode::Char('y') => Action::Approve,
         KeyCode::Char('n') => Action::Deny,
@@ -775,8 +971,8 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('S') => Action::AdjustTeam,
         KeyCode::Char('1') => Action::ShowTeam,
         KeyCode::Char('2') => Action::ShowTasks,
-        KeyCode::Char('3') => Action::ShowDetails,
-        KeyCode::Char('4') => Action::ShowEvents,
+        KeyCode::Char('s') => Action::ShowTaskDetails,
+        KeyCode::Char('a') => Action::ShowRoleActivity,
         KeyCode::Esc => Action::Escape,
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -796,6 +992,15 @@ fn action_for_event(value: Event) -> Action {
 fn format_event(kind: &CanonicalEventKind) -> String {
     match kind {
         CanonicalEventKind::TaskCreated => "task created".into(),
+        CanonicalEventKind::TaskRetried {
+            previous,
+            retry,
+            attempt,
+        } => format!(
+            "re-run attempt {attempt}: {} -> {}",
+            short_task_id(*previous),
+            short_task_id(*retry)
+        ),
         CanonicalEventKind::TaskTransition { from, to } => format!("task: {from:?} -> {to:?}"),
         CanonicalEventKind::ProviderStarted => "provider started".into(),
         CanonicalEventKind::TextDelta(s) => sanitize(s),
@@ -824,7 +1029,11 @@ fn format_event(kind: &CanonicalEventKind) -> String {
             if *truncated { " (truncated)" } else { "" }
         ),
         CanonicalEventKind::TaskDelegated { parent, child, .. } => {
-            format!("delegated: {parent} -> {child}")
+            format!(
+                "delegated {} from {}",
+                short_task_id(*child),
+                short_task_id(*parent)
+            )
         }
         CanonicalEventKind::DependencyAdded { task, depends_on } => {
             format!("dependency: {task} waits for {depends_on}")
@@ -843,146 +1052,139 @@ fn format_event(kind: &CanonicalEventKind) -> String {
     }
 }
 
-fn delegation_plan_for_available_agents(
-    agents: &[AgentProfile],
-    team_lead: Option<AgentId>,
-    configured: &[DelegationProposal],
-) -> Vec<DelegationProposal> {
-    let Some(lead) = team_lead.and_then(|id| agents.iter().find(|agent| agent.id == id)) else {
-        return configured.to_vec();
-    };
-    let eligible = agents
-        .iter()
-        .filter(|agent| agent.enabled && agent.id != lead.id)
-        .filter(|agent| lead.allowed_targets.contains(&agent.name))
-        .collect::<Vec<_>>();
-    let eligible_names = eligible
-        .iter()
-        .map(|agent| agent.name.as_str())
-        .collect::<HashSet<_>>();
-    let mut plan = Vec::new();
-    for proposal in configured {
-        if eligible_names.contains(proposal.target_agent.as_str()) {
-            plan.push(proposal.clone());
-            continue;
-        }
-        let replacement = agents
-            .iter()
-            .find(|agent| agent.name == proposal.target_agent)
-            .and_then(|original| {
-                eligible.iter().find(|candidate| {
-                    candidate.role == original.role
-                        && plan.iter().all(|planned: &DelegationProposal| {
-                            planned.target_agent != candidate.name
-                        })
-                })
-            });
-        if let Some(replacement) = replacement {
-            let mut reassigned = proposal.clone();
-            reassigned.target_agent = replacement.name.clone();
-            plan.push(reassigned);
-        }
-    }
-    for (index, agent) in eligible.into_iter().enumerate() {
-        if plan
-            .iter()
-            .any(|proposal| proposal.target_agent == agent.name)
-        {
-            continue;
-        }
-        plan.push(supporting_delegation(agent, index + 1));
-    }
-    plan
+fn task_event_prefix(task_id: voff_core::TaskId) -> String {
+    format!("[{}] ", short_task_id(task_id))
 }
 
-fn supporting_delegation(agent: &AgentProfile, ordinal: usize) -> DelegationProposal {
-    let stem = agent
-        .name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned();
-    let stem = if stem.is_empty() {
-        format!("specialist-{ordinal}")
-    } else {
-        stem
-    };
-    let (objective, acceptance_criteria) = match agent.role.as_str() {
-        "backend_developer" => {
-            let path = format!("{stem}-backend-assessment.md");
-            (
-                format!(
-                    "Independently assess the parent objective's backend contract and write only {path}. Do not modify another specialist-owned file. Record edge cases, interface risks, and concrete verification advice for the Team Lead."
-                ),
-                vec![
-                    format!("{path} contains a concrete backend assessment"),
-                    "No product implementation file is modified".into(),
-                ],
-            )
+fn task_browser_order(tasks: &[Task], team_lead: Option<AgentId>) -> Vec<voff_core::TaskId> {
+    let by_id = tasks
+        .iter()
+        .map(|task| (task.id, task))
+        .collect::<HashMap<_, _>>();
+    let mut roots = Vec::new();
+    let mut children = HashMap::<voff_core::TaskId, Vec<voff_core::TaskId>>::new();
+    for task in tasks {
+        if let Some(parent) = task.parent.filter(|parent| by_id.contains_key(parent)) {
+            children.entry(parent).or_default().push(task.id);
+        } else {
+            roots.push(task.id);
         }
-        "frontend_developer" => {
-            let path = format!("{stem}-frontend-assessment.md");
-            (
-                format!(
-                    "Independently assess the parent objective's accessibility and client/interface behavior and write only {path}. Do not modify another specialist-owned file. Return actionable findings to the Team Lead."
-                ),
-                vec![
-                    format!("{path} covers accessibility, loading, and error states"),
-                    "No product implementation file is modified".into(),
-                ],
-            )
-        }
-        "code_reviewer" => (
-            "Review the current workspace and parent acceptance criteria without editing files. Return prioritized correctness, security, and integration findings to the Team Lead.".into(),
-            vec![
-                "Findings are concrete and prioritized".into(),
-                "The review identifies any blocking acceptance gap".into(),
-            ],
-        ),
-        "test_engineer" => (
-            "Design a reproducible validation matrix for the parent objective without editing specialist-owned files. Cover primary behavior, malformed input, accessibility, failure handling, and integration; return the evidence plan to the Team Lead.".into(),
-            vec![
-                "Validation covers success and failure paths".into(),
-                "Every check has reproducible steps and expected results".into(),
-            ],
-        ),
-        "devops_engineer" => {
-            let path = format!("{stem}-runbook.md");
-            (
-                format!(
-                    "Write only {path} with a dependency-minimal local runbook for starting, checking, and stopping the parent deliverable. Do not modify implementation files."
-                ),
-                vec![
-                    format!("{path} documents startup, health checking, and shutdown"),
-                    "The runbook states every runtime dependency explicitly".into(),
-                ],
-            )
-        }
-        _ => {
-            let path = format!("{stem}-integration-notes.md");
-            (
-                format!(
-                    "Write only {path} with an independent integration analysis for the parent objective. Do not modify another specialist's artifact."
-                ),
-                vec![
-                    format!("{path} identifies cross-layer risks and verification steps"),
-                    "No specialist-owned implementation file is modified".into(),
-                ],
-            )
-        }
-    };
-    DelegationProposal {
-        target_agent: agent.name.clone(),
-        objective,
-        acceptance_criteria,
     }
+
+    let compare = |a: &voff_core::TaskId, b: &voff_core::TaskId| {
+        let a = by_id[a];
+        let b = by_id[b];
+        let a_is_lead = Some(a.owner) == team_lead;
+        let b_is_lead = Some(b.owner) == team_lead;
+        b_is_lead
+            .cmp(&a_is_lead)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+    };
+    roots.sort_by(compare);
+    for siblings in children.values_mut() {
+        siblings.sort_by(compare);
+    }
+
+    let mut ordered = Vec::with_capacity(tasks.len());
+    let mut visited = HashSet::with_capacity(tasks.len());
+    let mut stack = roots.iter().rev().copied().collect::<Vec<_>>();
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        ordered.push(id);
+        if let Some(child_ids) = children.get(&id) {
+            stack.extend(child_ids.iter().rev().copied());
+        }
+    }
+
+    let mut remaining = tasks
+        .iter()
+        .map(|task| task.id)
+        .filter(|id| !visited.contains(id))
+        .collect::<Vec<_>>();
+    remaining.sort_by(compare);
+    for id in remaining {
+        if visited.contains(&id) {
+            continue;
+        }
+        stack.push(id);
+        while let Some(nested_id) = stack.pop() {
+            if !visited.insert(nested_id) {
+                continue;
+            }
+            ordered.push(nested_id);
+            if let Some(child_ids) = children.get(&nested_id) {
+                stack.extend(child_ids.iter().rev().copied());
+            }
+        }
+    }
+    ordered
+}
+
+fn event_text_color(text: &str) -> Color {
+    let text = text.to_ascii_lowercase();
+    if text.starts_with("tool proposed:")
+        || text.starts_with("approval requested:")
+        || text.starts_with("approval:")
+    {
+        Color::Yellow
+    } else if text.contains("failed")
+        || text.contains("conflict")
+        || text.contains("cancelled")
+        || text.contains("denied")
+    {
+        Color::LightRed
+    } else if text.starts_with("provider completed")
+        || text.starts_with("result:")
+        || text.starts_with("artifact published:")
+    {
+        Color::Green
+    } else if text.starts_with("task ")
+        || text.starts_with("task:")
+        || text.starts_with("re-run attempt ")
+        || text.starts_with("delegated ")
+        || text.starts_with("dependency:")
+    {
+        Color::LightCyan
+    } else if text.starts_with("usage:") {
+        Color::LightMagenta
+    } else {
+        Color::White
+    }
+}
+
+fn event_viewer_lines(app: &AppModel) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, event) in app.events.iter().enumerate().rev() {
+        let task_id = app.event_task_ids.get(index).copied().flatten();
+        let color = event_text_color(event);
+        let mut first = true;
+        for event_line in event.split('\n') {
+            let mut spans = Vec::new();
+            if first {
+                spans.push(Span::styled(
+                    format!("#{} · ", index + 1),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                if let Some(task_id) = task_id {
+                    spans.push(Span::styled(
+                        task_event_prefix(task_id),
+                        Style::default().fg(Color::LightBlue),
+                    ));
+                }
+                first = false;
+            }
+            spans.push(Span::styled(
+                event_line.to_owned(),
+                Style::default().fg(color),
+            ));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 fn sanitize(value: &str) -> String {
@@ -1035,8 +1237,7 @@ pub(crate) struct ConfiguredRun {
     pub provider_label: String,
     pub agent_name: String,
     pub agent_profiles: Vec<voff_core::AgentProfile>,
-    pub objective: String,
-    pub delegation_plan: Vec<DelegationProposal>,
+    pub known_agents: HashMap<AgentId, AgentProfile>,
     pub initial_tasks: Vec<Task>,
     pub initial_events: Vec<voff_core::CanonicalEvent>,
     pub initial_approvals: Vec<Approval>,
@@ -1074,6 +1275,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
     app.provider_label = config.provider_label;
     app.agent_name = config.agent_name;
     app.agents = agent_profiles;
+    app.known_agents = config.known_agents;
     app.model_label = model_label;
     app.input_cost_per_million = config.input_cost_per_million;
     app.output_cost_per_million = config.output_cost_per_million;
@@ -1097,19 +1299,18 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
     {
         app.estimated_cost = Some(0.0);
     }
-    app.tasks = config.initial_tasks;
-    app.approvals = config.initial_approvals;
-    app.artifacts = config.initial_artifacts;
-    for event in config.initial_events {
-        app.push_event(&event.kind);
-    }
+    restore_initial_history(
+        &mut app,
+        config.initial_tasks,
+        config.initial_events,
+        config.initial_approvals,
+        config.initial_artifacts,
+    );
     terminal_loop(
         &mut app,
         engine,
         LoopConfig {
             owner: config.owner,
-            objective: config.objective,
-            delegation_plan: config.delegation_plan,
             max_parallel_tasks: config.max_parallel_tasks,
             credential_repository,
         },
@@ -1119,13 +1320,64 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
     )
     .await
 }
+
+fn restore_initial_history(
+    app: &mut AppModel,
+    tasks: Vec<Task>,
+    events: Vec<CanonicalEvent>,
+    approvals: Vec<Approval>,
+    artifacts: Vec<Artifact>,
+) {
+    app.tasks = tasks;
+    app.sort_tasks_for_browser();
+    app.approvals = approvals;
+    app.artifacts = artifacts;
+    for event in events {
+        app.push_scoped_event(event.task_id, &event.kind);
+    }
+    if !app.tasks.is_empty() {
+        app.selected = 0;
+    }
+}
 struct LoopConfig {
     owner: AgentId,
-    objective: String,
-    delegation_plan: Vec<DelegationProposal>,
     max_parallel_tasks: usize,
     credential_repository: Arc<SqliteRepository>,
 }
+
+const QUICK_RUN_OBJECTIVE: &str = "Quick Run: analyze the workspace Markdown files as the project brief. Reconcile their active requirements, TODOs, acceptance criteria, and roadmap items with the current source; ignore work that is already completed, superseded, generated, or out of scope. Build a prioritized implementation plan, then create bounded tasks with concrete acceptance criteria. When enabled specialists are available, delegate every independent workstream to the best-fitting role with non-overlapping ownership; in a solo team, execute the work directly. Carry approved tasks through implementation and validation, request review where useful, and integrate the resulting evidence. Preserve user control: use the normal approval flow for every delegation, patch, command, or other side effect.";
+
+const QUICK_RUN_ACCEPTANCE: [&str; 5] = [
+    "Relevant Markdown requirements are reconciled with the current workspace state",
+    "Actionable work is prioritized into bounded tasks with concrete acceptance criteria",
+    "Independent workstreams are delegated to appropriate enabled specialists when available",
+    "Approved work is implemented and validated with inspectable evidence",
+    "Completed, superseded, generated, and out-of-scope items are not reimplemented",
+];
+
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn forward_terminal_events<P, R>(input_tx: mpsc::Sender<Event>, mut poll: P, mut read: R)
+where
+    P: FnMut(Duration) -> io::Result<bool>,
+    R: FnMut() -> io::Result<Event>,
+{
+    while !input_tx.is_closed() {
+        match poll(INPUT_POLL_INTERVAL) {
+            Ok(true) => {
+                let Ok(event) = read() else {
+                    break;
+                };
+                if input_tx.blocking_send(event).is_err() {
+                    break;
+                }
+            }
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+}
+
 async fn terminal_loop<R: Repository + 'static>(
     model: &mut AppModel,
     engine: Arc<Engine<R>>,
@@ -1136,27 +1388,24 @@ async fn terminal_loop<R: Repository + 'static>(
 ) -> Result<(), TuiError> {
     let LoopConfig {
         owner,
-        objective,
-        delegation_plan,
         max_parallel_tasks,
         credential_repository,
     } = config;
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let input = tokio::task::spawn_blocking(move || {
-        while let Ok(event) = event::read() {
-            if input_tx.blocking_send(event).is_err() {
-                break;
-            }
-        }
+        forward_terminal_events(input_tx, event::poll, event::read);
     });
     let (credential_tx, mut credential_rx) = mpsc::channel(1);
     let (team_adjustment_tx, mut team_adjustment_rx) =
         mpsc::channel::<Result<SavedTeamAdjustment, String>>(1);
     let (lead_submission_tx, mut lead_submission_rx) =
         mpsc::channel::<Result<&'static str, String>>(8);
+    let (quick_run_tx, mut quick_run_rx) = mpsc::channel::<Result<(), String>>(1);
+    let (retry_tx, mut retry_rx) = mpsc::channel::<Result<(voff_core::TaskId, u16), String>>(1);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
-    while !model.quit {
+    let mut loop_result = Ok(());
+    'terminal: while !model.quit {
         tokio::select! {
             Some(event)=input_rx.recv()=>{
                 let team_adjustment = model.handle_team_adjustment_event(&event);
@@ -1263,7 +1512,7 @@ async fn terminal_loop<R: Repository + 'static>(
                         }
                         ComposerEvent::Submit(message) if message.starts_with('/') => {
                             model.composer_notice = Some(format!(
-                                "Unknown command: {message}. Try /task <objective> or /tasks."
+                                "Unknown command: {message}. Press ? for command help."
                             ));
                         }
                         ComposerEvent::Submit(message) => {
@@ -1293,37 +1542,137 @@ async fn terminal_loop<R: Repository + 'static>(
                         ComposerEvent::Ignored => {
                             let action = action_for_event(event);
                             match action {
-                                Action::StartMock => {
-                                    let engine = Arc::clone(&engine);
-                                    let objective = objective.clone();
-                                    let plan = delegation_plan_for_available_agents(
-                                        &model.agents,
-                                        model.team_lead,
-                                        &delegation_plan,
-                                    );
-                                    tokio::spawn(async move {
-                                        let criteria = if plan.is_empty() {
-                                            vec!["Provider run completes".into()]
+                                Action::QuickRun => {
+                                    if model.quick_run_active() {
+                                        model.composer_notice =
+                                            Some("Quick Run is already active in Tasks.".into());
+                                        model.panel = Panel::Tasks;
+                                    } else {
+                                        model.quick_run_starting = true;
+                                        model.panel = Panel::Tasks;
+                                        model.event_viewer = false;
+                                        model.help = false;
+                                        model.selected = 0;
+                                        model.composer_notice = Some(
+                                            "Quick Run started: Team Lead is analysing Markdown."
+                                                .into(),
+                                        );
+                                        model.push_ui_event(
+                                            "Quick Run → Team Lead: analyze Markdown, plan, delegate, execute"
+                                                .into(),
+                                        );
+                                        let engine = Arc::clone(&engine);
+                                        let quick_run_tx = quick_run_tx.clone();
+                                        tokio::spawn(async move {
+                                            let result = async {
+                                                let task = engine
+                                                    .create_task(
+                                                        owner,
+                                                        QUICK_RUN_OBJECTIVE,
+                                                        QUICK_RUN_ACCEPTANCE
+                                                            .iter()
+                                                            .map(|criterion| (*criterion).into())
+                                                            .collect(),
+                                                    )
+                                                    .await?;
+                                                engine.mark_ready(task.id).await?;
+                                                engine.run_task(task.id).await
+                                            }
+                                            .await
+                                            .map_err(|error| error.to_string());
+                                            let _ = quick_run_tx.send(result).await;
+                                        });
+                                    }
+                                }
+                                Action::RetryTask if model.panel == Panel::Tasks => {
+                                    if model.retry_starting {
+                                        model.composer_notice =
+                                            Some("A task re-run is already being prepared.".into());
+                                    } else if let Some(task) = model.selected_task().cloned() {
+                                        if task.status.can_retry() {
+                                            model.retry_starting = true;
+                                            model.composer_notice = Some(format!(
+                                                "Preparing attempt {} for the selected task.",
+                                                task.attempt.saturating_add(1)
+                                            ));
+                                            let engine = Arc::clone(&engine);
+                                            let retry_tx = retry_tx.clone();
+                                            tokio::spawn(async move {
+                                                let prepared = async {
+                                                    let retry = engine.retry_task(task.id).await?;
+                                                    engine.mark_ready(retry.id).await?;
+                                                    Ok::<_, voff_engine::EngineError>((
+                                                        retry.id,
+                                                        retry.attempt,
+                                                    ))
+                                                }
+                                                .await
+                                                .map_err(|error| error.to_string());
+                                                match prepared {
+                                                    Ok((retry_id, attempt)) => {
+                                                        let _ = retry_tx
+                                                            .send(Ok((retry_id, attempt)))
+                                                            .await;
+                                                        let _ = engine.run_task(retry_id).await;
+                                                    }
+                                                    Err(error) => {
+                                                        let _ = retry_tx.send(Err(error)).await;
+                                                    }
+                                                }
+                                            });
                                         } else {
-                                            vec!["Every planned delegated workstream completes".into()]
+                                            model.composer_notice = Some(format!(
+                                                "A {:?} task cannot be re-run; cancel it first if it is active.",
+                                                task.status
+                                            ));
+                                        }
+                                    } else {
+                                        model.composer_notice =
+                                            Some("Select a task to re-run.".into());
+                                    }
+                                }
+                                Action::Cancel => {
+                                    if let Some(id) = model
+                                        .selected_task()
+                                        .filter(|task| {
+                                            matches!(
+                                                task.status,
+                                                TaskStatus::Queued
+                                                    | TaskStatus::Ready
+                                                    | TaskStatus::Running
+                                            )
+                                        })
+                                        .map(|task| task.id)
+                                    {
+                                        let engine = Arc::clone(&engine);
+                                        tokio::spawn(async move {
+                                            let _ = engine.cancel_task(id).await;
+                                        });
+                                    }
+                                }
+                                Action::Approve | Action::Deny => {
+                                    if let Some(id) = model.pending_approval().map(|value| value.id) {
+                                        let engine = Arc::clone(&engine);
+                                        let decision = if action == Action::Approve {
+                                            ApprovalDecision::ApprovedOnce
+                                        } else {
+                                            ApprovalDecision::Denied
                                         };
-                                        if let Ok(task) =
-                                            engine.create_task(owner, objective, criteria).await
-                                            && engine.mark_ready(task.id).await.is_ok()
-                                        {
-                                            if plan.is_empty() {
-                                                let _ = engine.run_task(task.id).await;
-                                            } else {
+                                        tokio::spawn(async move {
+                                            if engine
+                                                .decide_approval(id, decision)
+                                                .await
+                                                .is_ok()
+                                                && decision == ApprovalDecision::ApprovedOnce
+                                            {
                                                 let _ = engine
-                                                    .propose_delegation_plan(task.id, &plan)
+                                                    .run_until_idle_bounded(max_parallel_tasks)
                                                     .await;
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
-                                Action::Cancel=>{if let Some(id)=model.selected_task().filter(|t|matches!(t.status,TaskStatus::Queued|TaskStatus::Ready|TaskStatus::Running)).map(|t|t.id){let engine=Arc::clone(&engine);tokio::spawn(async move{let _=engine.cancel_task(id).await;});}}
-                                Action::Approve|Action::Deny=>{if let Some(id)=model.pending_approval().map(|v|v.id){let engine=Arc::clone(&engine);let decision=if action==Action::Approve{ApprovalDecision::ApprovedOnce}else{ApprovalDecision::Denied};tokio::spawn(async move{if engine.decide_approval(id,decision).await.is_ok() && decision==ApprovalDecision::ApprovedOnce { let _=engine.run_until_idle_bounded(max_parallel_tasks).await; }});}}
-                                other=>model.reduce(other)
+                                other => model.reduce(other),
                             }
                         }
                     }
@@ -1397,24 +1746,90 @@ async fn terminal_loop<R: Repository + 'static>(
                     }
                 }
             }
+            Some(result)=quick_run_rx.recv()=>{
+                match result {
+                    Ok(()) => {
+                        model.composer_notice = Some(
+                            "Quick Run planned. Review and approve its visible actions.".into()
+                        );
+                    }
+                    Err(error) => {
+                        model.quick_run_starting = false;
+                        let error = sanitize(&error);
+                        model.composer_notice = Some(format!(
+                            "Quick Run failed: {error}"
+                        ));
+                        model.push_ui_event(format!("Quick Run failed: {error}"));
+                    }
+                }
+            }
+            Some(result)=retry_rx.recv()=>{
+                model.retry_starting = false;
+                match result {
+                    Ok((task_id, attempt)) => {
+                        model.composer_notice = Some(format!(
+                            "Re-running attempt {attempt} as {}.",
+                            short_task_id(task_id)
+                        ));
+                    }
+                    Err(error) => {
+                        let error = sanitize(&error);
+                        model.composer_notice = Some(format!(
+                            "Could not re-run task: {error}"
+                        ));
+                        model.push_ui_event(format!("Task re-run failed: {error}"));
+                    }
+                }
+            }
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
                 model.team_flow.tick(Duration::from_millis(100));
-                terminal.draw(|frame|render(frame,model))?;
+                if let Err(error) = terminal.draw(|frame|render(frame,model)) {
+                    loop_result = Err(TuiError::Io(error));
+                    break 'terminal;
+                }
             }
             else=>{model.quit=true}
         }
     }
-    input.abort();
-    Ok(())
+    drop(input_rx);
+    let input_result = input.await;
+    match (loop_result, input_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(TuiError::Io(io::Error::other(format!(
+            "terminal input worker failed: {error}"
+        )))),
+    }
 }
+fn composer_height(app: &AppModel, area: Rect) -> u16 {
+    const MIN_HEIGHT: u16 = 3;
+    const MAX_HEIGHT: u16 = 12;
+
+    if !app.composer_active || area.height <= MIN_HEIGHT {
+        return MIN_HEIGHT.min(area.height);
+    }
+
+    let wrap_width = usize::from(area.width.saturating_sub(2).max(1));
+    let visual_lines = app
+        .composer
+        .lines()
+        .iter()
+        .map(|line| line.chars().count().max(1).div_ceil(wrap_width))
+        .sum::<usize>();
+    let desired = u16::try_from(visual_lines.saturating_add(2)).unwrap_or(u16::MAX);
+    let available = area.height.saturating_sub(12).max(MIN_HEIGHT);
+    desired.clamp(MIN_HEIGHT, MAX_HEIGHT.min(available))
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
+    let composer_height = composer_height(app, frame.area());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
             Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Length(composer_height),
         ])
         .split(frame.area());
     let session = app.session.to_string();
@@ -1441,15 +1856,13 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
             if slot.is_available() {
                 " · token ready".to_owned()
             } else {
-                " · no token [a]".to_owned()
+                " · no token [A]".to_owned()
             }
         })
         .unwrap_or_default();
     let view = match app.panel {
         Panel::Agents => "Team",
         Panel::Tasks => "Tasks",
-        Panel::Details => "Details",
-        Panel::Events => "Events",
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -1461,7 +1874,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
-                    "workspace · {}/{} developers enabled · {} view · session {}",
+                    "workspace · {}/{} developers enabled · {} · session {}",
                     app.agents.iter().filter(|agent| agent.enabled).count(),
                     app.agents.len(),
                     view,
@@ -1470,7 +1883,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
             ]),
             Line::from(Span::styled(
                 format!(
-                    " [1 Team] [2 Tasks] [3 Details] [4 Events] · {} · {} · circuit {:?} · {} retries · {cost}{credential}",
+                    " [1 Team] [2 Tasks] · {} · {} · circuit {:?} · {} retries · {cost}{credential}",
                     app.provider_label,
                     app.model_label,
                     app.provider_health.circuit,
@@ -1487,116 +1900,501 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         rows[0],
     );
 
-    if app.panel == Panel::Agents {
-        render_team(frame, app, rows[1]);
-    } else {
-        render_activity(frame, app, rows[1]);
+    match app.panel {
+        Panel::Agents => render_team(frame, app, rows[1]),
+        Panel::Tasks => render_tasks_workspace(frame, app, rows[1]),
     }
 
     let workspace = sanitize(&app.workspace_root.display().to_string());
-    let composer_title = if app.composer_active {
-        format!(" Team Lead · cwd {workspace} · Enter send · Shift+Enter newline · Esc keep draft ")
-    } else if let Some(notice) = &app.composer_notice {
-        format!(" {notice} · cwd {workspace} · /task assign · /tasks list ")
+    app.composer.set_placeholder_text(if app.composer_active {
+        "/task assign · /tasks browse"
     } else {
-        format!(" Team Lead · cwd {workspace} · Enter message · /task assign · /tasks list ")
+        "Press Enter to talk"
+    });
+    let composer_status = if app.composer_active {
+        let DataCursor(line, column) = app.composer.cursor();
+        Some((
+            Line::from(format!(
+                " Enter send · Shift+Enter/Ctrl+J newline · Ctrl+Z/Y undo/redo · {}:{} ",
+                line + 1,
+                column + 1
+            ))
+            .style(Style::default().fg(Color::LightCyan)),
+            Alignment::Left,
+        ))
+    } else {
+        Some(app.composer_notice.as_deref().map_or_else(
+            || {
+                (
+                    Line::from(" [R] Quick Run ").style(Style::default().fg(Color::White)),
+                    Alignment::Center,
+                )
+            },
+            |notice| {
+                (
+                    Line::from(format!(" {} ", sanitize(notice)))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    Alignment::Left,
+                )
+            },
+        ))
     };
     let composer_color = if app.composer_active {
         Color::LightCyan
     } else {
         Color::DarkGray
     };
-    app.composer.set_block(
-        Block::default()
-            .title(composer_title)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(composer_color)),
-    );
-    app.composer
-        .set_cursor_style(Style::default().fg(composer_color));
+    let mut composer_block = Block::default()
+        .title(" Team Lead ")
+        .title_bottom(
+            Line::from(format!(" ? help · cwd {workspace} "))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(ratatui::layout::Alignment::Right),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(composer_color));
+    if let Some((status, status_alignment)) = composer_status {
+        composer_block = composer_block.title_bottom(status.alignment(status_alignment));
+    }
+    app.composer.set_block(composer_block);
+    app.composer.set_cursor_style(if app.composer_active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    });
     app.composer_hitbox = rows[2];
     frame.render_widget(&app.composer, rows[2]);
     render_overlays(frame, app);
 }
 
-fn render_activity(frame: &mut ratatui::Frame<'_>, app: &AppModel, area: Rect) {
-    match app.panel {
-        Panel::Tasks => {
-            let tasks = app
-                .tasks
-                .iter()
-                .enumerate()
-                .map(|(i, task)| {
-                    ListItem::new(format!(
-                        "{} {}{} [{:?}]",
-                        if i == app.selected { "▶" } else { " " },
-                        "  ".repeat(usize::from(task.depth)),
-                        task.objective,
-                        task.status
-                    ))
+fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
+    let panes = if area.width >= 88 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(area)
+    };
+    let browser = panes[0];
+    let inspector = panes[1];
+    app.task_list_hitbox = browser;
+
+    let active = app
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Running))
+        .count();
+    let attention = app
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::WaitingApproval | TaskStatus::Blocked | TaskStatus::Failed
+            )
+        })
+        .count();
+    let completed = app
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .count();
+    let quick_run = if app.quick_run_active() {
+        " · R QUICK RUN"
+    } else {
+        ""
+    };
+    let browser_title = format!(
+        " Tasks · lead first · newest peers · [r] re-run{quick_run} · {} total · {active} active · {attention} attention · {completed} done ",
+        app.tasks.len()
+    );
+
+    if app.tasks.is_empty() {
+        app.task_window_start = 0;
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No tasks in this session",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Use /task <objective> to create explicit work for the Team Lead.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "Or press R for Quick Run: analyze Markdown, plan, delegate, execute.",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ])
+            .wrap(Wrap { trim: true })
+            .block(panel(&browser_title, true).border_type(BorderType::Rounded)),
+            browser,
+        );
+    } else {
+        app.selected = app.selected.min(app.tasks.len() - 1);
+        let visible = usize::from(browser.height.saturating_sub(2) / 2).max(1);
+        let start = app
+            .selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(app.tasks.len().saturating_sub(visible));
+        app.task_window_start = start;
+        let objective_width = usize::from(browser.width.saturating_sub(9)).max(8);
+        let items = app
+            .tasks
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, task)| {
+                let selected = index == app.selected;
+                let (icon, status, color) = task_status_visual(task.status);
+                let (owner, owner_icon, owner_color) = app.agent_for_owner(task.owner).map_or_else(
+                    || (short_agent_id(task.owner), "●", Color::Cyan),
+                    |agent| {
+                        (
+                            sanitize(&agent.name),
+                            role_icon(&agent.role),
+                            role_color(&agent.role),
+                        )
+                    },
+                );
+                let max_visible_depth = usize::from(browser.width.saturating_sub(24) / 2);
+                let visible_depth = usize::from(task.depth).min(max_visible_depth);
+                let indent = "  ".repeat(visible_depth);
+                let objective = truncate_text(
+                    &one_line(&sanitize(&task.objective)),
+                    objective_width.saturating_sub(indent.len()).max(8),
+                );
+                let heading = vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(
+                        format!("{owner_icon} "),
+                        Style::default()
+                            .fg(owner_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {icon} {status}"), Style::default().fg(color)),
+                    Span::styled(
+                        if task.attempt > 1 {
+                            format!("  ↻ attempt {}", task.attempt)
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(Color::LightCyan),
+                    ),
+                ];
+                let lines = vec![
+                    Line::from(heading),
+                    Line::from(Span::styled(
+                        format!("{indent}{objective}"),
+                        Style::default().fg(if selected { Color::White } else { Color::Gray }),
+                    )),
+                ];
+                ListItem::new(lines).style(if selected {
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
                 })
-                .collect::<Vec<_>>();
-            frame.render_widget(List::new(tasks).block(panel("2 · Tasks", true)), area);
-        }
-        Panel::Details => {
-            let details = app.selected_task().map_or_else(
-                || "No task selected. Press 2 to choose a task or r to start work.".into(),
-                |task| {
-                    let artifact_text = app
-                        .artifacts
-                        .iter()
-                        .filter(|artifact| artifact.producer == task.id)
-                        .map(|artifact| {
-                            format!(
-                                "\n\nArtifact: {} ({})\n{}",
-                                artifact.location,
-                                artifact.kind,
-                                sanitize(&artifact.preview)
-                            )
-                        })
-                        .collect::<String>();
-                    format!(
-                        "Owner: {}\nStatus: {:?}\nObjective: {}\nCriteria:\n{}{}",
-                        task.owner,
-                        task.status,
-                        task.objective,
-                        task.acceptance_criteria.join("\n"),
-                        artifact_text
-                    )
-                },
-            );
-            frame.render_widget(
-                Paragraph::new(details)
-                    .wrap(Wrap { trim: true })
-                    .block(panel("3 · Task Details", true)),
-                area,
-            );
-        }
-        Panel::Events => {
-            let logs = app
-                .events
-                .iter()
-                .enumerate()
-                .rev()
-                .map(|(index, event)| format!("[{}] {event}", index + 1))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let event_title = if app.event_follow {
-                "4 · Events · live"
-            } else {
-                "4 · Events · paused (↑ to newest)"
-            };
-            frame.render_widget(
-                Paragraph::new(logs)
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.event_scroll, 0))
-                    .block(panel(event_title, true)),
-                area,
-            );
-        }
-        Panel::Agents => {}
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(panel(&browser_title, true).border_type(BorderType::Rounded)),
+            browser,
+        );
     }
+
+    let Some(task) = app.selected_task().cloned() else {
+        frame.render_widget(
+            Paragraph::new("Select or create a task to inspect its work.")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(panel(" Inspector ", true).border_type(BorderType::Rounded)),
+            inspector,
+        );
+        return;
+    };
+    let (title, lines) = match app.task_inspector {
+        TaskInspector::Details => (
+            " Summary · [r] re-run · [s] summary · [a] activity · PgUp/PgDn scroll ",
+            task_detail_lines(app, &task),
+        ),
+        TaskInspector::RoleActivity => (
+            " Activity · [r] re-run · [s] summary · [a] activity · PgUp/PgDn scroll ",
+            role_activity_lines(app, &task),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.task_inspector_scroll, 0))
+            .block(panel(title, true).border_type(BorderType::Rounded)),
+        inspector,
+    );
+}
+
+fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let (icon, status, color) = task_status_visual(task.status);
+    let agent = app.agent_for_owner(task.owner);
+    let owner = agent.map_or_else(|| short_agent_id(task.owner), |agent| sanitize(&agent.name));
+    let role = agent.map_or_else(|| "stored role".into(), |agent| human_role(&agent.role));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {icon} {status} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  ·  {role}"), Style::default().fg(Color::Gray)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!(" {}  ·  attempt {}", task.id, task.attempt),
+        Style::default().fg(Color::DarkGray),
+    )));
+    if let Some(previous) = task.retry_of {
+        lines.push(Line::from(Span::styled(
+            format!(" re-run of {previous}"),
+            Style::default().fg(Color::LightCyan),
+        )));
+    }
+    lines.push(Line::from(""));
+    push_section(&mut lines, "OBJECTIVE", Color::LightCyan);
+    push_text_lines(&mut lines, &sanitize(&task.objective), "  ");
+
+    lines.push(Line::from(""));
+    push_section(&mut lines, "ACCEPTANCE", Color::LightCyan);
+    if task.acceptance_criteria.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No explicit criteria",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for criterion in &task.acceptance_criteria {
+            lines.push(Line::from(format!("  • {}", sanitize(criterion))));
+        }
+    }
+
+    if let Some(result) = &task.result {
+        lines.push(Line::from(""));
+        push_section(&mut lines, "RESULT", Color::Green);
+        push_text_lines(&mut lines, &sanitize(&result.summary), "  ");
+        if !result.evidence.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  Evidence  {}",
+                    result
+                        .evidence
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    let artifacts = app
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.producer == task.id)
+        .collect::<Vec<_>>();
+    if !artifacts.is_empty() {
+        lines.push(Line::from(""));
+        push_section(&mut lines, "ARTIFACTS", Color::LightMagenta);
+        for artifact in artifacts {
+            lines.push(Line::from(vec![
+                Span::styled("  ◆ ", Style::default().fg(Color::LightMagenta)),
+                Span::styled(
+                    sanitize(&artifact.location),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", sanitize(&artifact.kind)),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+            if !artifact.preview.trim().is_empty() {
+                push_text_lines(&mut lines, &sanitize(&artifact.preview), "    ");
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    let parent = task
+        .parent
+        .map_or_else(|| "root".into(), |parent| parent.to_string());
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  Parent {parent}  ·  depth {}  ·  updated {}",
+            task.depth,
+            task.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
+    let agent = app.agent_for_owner(selected.owner);
+    let owner = agent.map_or_else(
+        || short_agent_id(selected.owner),
+        |agent| sanitize(&agent.name),
+    );
+    let role = agent.map_or_else(|| "stored role".into(), |agent| human_role(&agent.role));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" ◉ ", Style::default().fg(Color::LightMagenta)),
+            Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  ·  {role}"), Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(Span::styled(
+            " Newest first · all events from this role's tasks in the current session",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+    let mut count = 0usize;
+    for event in app.scoped_events.iter().rev() {
+        let Some(task_id) = event.task_id else {
+            continue;
+        };
+        let Some(task) = app.tasks.iter().find(|task| task.id == task_id) else {
+            continue;
+        };
+        if task.owner != selected.owner {
+            continue;
+        }
+        count += 1;
+        let selected_marker = if task.id == selected.id { "●" } else { "○" };
+        let objective = truncate_text(&one_line(&sanitize(&task.objective)), 52);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{selected_marker} "),
+                Style::default().fg(if task.id == selected.id {
+                    Color::LightCyan
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(
+                task_event_prefix(task.id),
+                Style::default().fg(Color::LightBlue),
+            ),
+            Span::styled(objective, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        let event_style = Style::default().fg(event_text_color(&event.text));
+        for event_line in event.text.lines() {
+            lines.push(Line::from(Span::styled(event_line.to_owned(), event_style)));
+        }
+        lines.push(Line::from(""));
+    }
+    if count == 0 {
+        lines.push(Line::from(Span::styled(
+            "  No task-scoped events recorded for this role yet.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+fn push_section(lines: &mut Vec<Line<'static>>, title: &str, color: Color) {
+    lines.push(Line::from(Span::styled(
+        format!(" {title}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+}
+
+fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, prefix: &str) {
+    let mut any = false;
+    for line in text.lines() {
+        any = true;
+        lines.push(Line::from(format!("{prefix}{line}")));
+    }
+    if !any {
+        lines.push(Line::from(prefix.to_owned()));
+    }
+}
+
+fn popup_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {title} "),
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn popup_section_into(lines: &mut Vec<Line<'static>>, title: &str) {
+    lines.push(popup_section(title));
+}
+
+fn centered_popup(area: Rect, requested_width: u16, requested_height: u16) -> Rect {
+    let width = requested_width.min(area.width);
+    let height = requested_height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn task_status_visual(status: TaskStatus) -> (&'static str, &'static str, Color) {
+    match status {
+        TaskStatus::Queued => ("○", "queued", Color::Gray),
+        TaskStatus::Ready => ("◇", "ready", Color::LightBlue),
+        TaskStatus::Running => ("▶", "running", Color::LightCyan),
+        TaskStatus::WaitingApproval => ("◆", "approval", Color::Yellow),
+        TaskStatus::Blocked => ("!", "blocked", Color::LightRed),
+        TaskStatus::Completed => ("✓", "completed", Color::Green),
+        TaskStatus::Failed => ("×", "failed", Color::Red),
+        TaskStatus::Cancelled => ("–", "cancelled", Color::DarkGray),
+    }
+}
+
+fn human_role(role: &str) -> String {
+    role.replace('_', " ")
+}
+
+fn short_task_id(id: voff_core::TaskId) -> String {
+    short_id(&id.to_string())
+}
+
+fn short_agent_id(id: AgentId) -> String {
+    short_id(&id.to_string())
+}
+
+fn short_id(id: &str) -> String {
+    let suffix = id.chars().rev().take(6).collect::<String>();
+    format!("…{}", suffix.chars().rev().collect::<String>())
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_text(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    let mut truncated = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
@@ -1636,25 +2434,22 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
 fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
     if app.event_viewer {
         let area = frame.area();
-        let popup = ratatui::layout::Rect {
-            x: area.width / 12,
-            y: area.height / 12,
-            width: area.width * 5 / 6,
-            height: area.height * 5 / 6,
-        };
-        let text = app
-            .events
-            .iter()
-            .enumerate()
-            .rev()
-            .map(|(index, event)| format!("[{}] {}", index + 1, event))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let popup = centered_popup(
+            area,
+            area.width.saturating_sub(4).min(100),
+            area.height.saturating_sub(4).min(32),
+        );
+        let text = event_viewer_lines(app);
         frame.render_widget(Clear, popup);
         let title = if app.event_follow {
-            "Events — live, newest first | ↓/PgDn older | e/Esc close"
+            " Events · live · newest first "
         } else {
-            "Events — paused | ↑/PgUp newest | e/Esc close"
+            " Events · paused "
+        };
+        let footer = if app.event_follow {
+            " ↓/PgDn older · e/Esc close "
+        } else {
+            " ↑/PgUp newer · e/Esc close "
         };
         frame.render_widget(
             Paragraph::new(text)
@@ -1663,7 +2458,13 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                 .block(
                     Block::default()
                         .title(title)
+                        .title_bottom(
+                            Line::from(footer)
+                                .style(Style::default().fg(Color::LightCyan))
+                                .alignment(ratatui::layout::Alignment::Center),
+                        )
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::Cyan)),
                 ),
             popup,
@@ -1671,26 +2472,65 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
     }
     if app.help {
         let area = frame.area();
-        let popup = ratatui::layout::Rect {
-            x: area.width / 4,
-            y: area.height / 4,
-            width: area.width / 2,
-            height: area.height / 2,
-        };
+        let popup = centered_popup(
+            area,
+            area.width.saturating_sub(4).min(68),
+            area.height.saturating_sub(4).min(24),
+        );
         frame.render_widget(Clear, popup);
-        frame.render_widget(Paragraph::new("voff Help\n\nEnter/t  Message the Team Lead directly\n/task <objective>  Give executable work to the Team Lead\n/tasks  Focus the current task list\nclick composer  Focus the Team Lead input\nShift+Enter  New line while composing\nS  Add or adjust specialists\nmouse drag  Move a card / pan empty graph space\nclick card  Select a developer\n+/-/0/f  Zoom in / zoom out / reset / fit team\nr  Start configured objective\na  Add a missing provider token locally\nc  Cancel selected active task\ne  Open full-screen events\n↑/↓, PgUp/PgDn  Navigate or scroll\nTab  Change panel\nq  Safe exit\nEsc  Close / keep draft\n?  Close help").wrap(Wrap { trim: false }).block(Block::default().title("Help").borders(Borders::ALL)),popup);
+        let help = vec![
+            popup_section("WORKSPACE"),
+            Line::from("  1 / 2         Team / Tasks"),
+            Line::from("  Tab           Toggle Team / Tasks"),
+            Line::from("  ↑/↓ or j/k    Browse tasks and developers"),
+            Line::from(""),
+            popup_section("TASK DEBUGGING"),
+            Line::from("  s             Selected task summary"),
+            Line::from("  a             Owning role's activity"),
+            Line::from("  PgUp/PgDn     Scroll details or events"),
+            Line::from("  c             Cancel selected active task"),
+            Line::from("  r             Re-run selected terminal/blocked task"),
+            Line::from(""),
+            popup_section("TEAM & INPUT"),
+            Line::from("  R             Quick Run Markdown → tasks → execution"),
+            Line::from("  Enter         Focus / send to Team Lead"),
+            Line::from("  Shift+Enter   Insert newline (composer grows)"),
+            Line::from("  Ctrl+J/Alt+↵  Newline fallback"),
+            Line::from("  /task …       Assign executable work"),
+            Line::from("  ←/→ · Home/End · Ctrl+←/→   Navigate text"),
+            Line::from("  Ctrl+W/K      Delete word / to line end"),
+            Line::from("  Ctrl+Z/Y      Undo / redo"),
+            Line::from("  Shift+arrows  Select · PgUp/PgDn scroll"),
+            Line::from("  S             Add or adjust specialists"),
+            Line::from("  +/-/0/f       Zoom / reset / fit team"),
+            Line::from("  e             Session event viewer"),
+        ];
+        frame.render_widget(
+            Paragraph::new(help).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .title(" Help ")
+                    .title_bottom(
+                        Line::from(" ? / Esc close · q safe exit ")
+                            .style(Style::default().fg(Color::LightCyan))
+                            .alignment(ratatui::layout::Alignment::Center),
+                    )
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup,
+        );
     }
     if let Some(approval) = app.pending_approval() {
         render_approval_popup(frame, app, approval);
     }
     if let Some(input) = &app.credential_input {
         let area = frame.area();
-        let popup = Rect {
-            x: area.width / 5,
-            y: area.height / 3,
-            width: area.width * 3 / 5,
-            height: 11.min(area.height),
-        };
+        let popup = centered_popup(
+            area,
+            area.width.saturating_sub(4).min(68),
+            area.height.saturating_sub(2).min(11),
+        );
         let bullets = "•".repeat(input.chars().count().min(42));
         let status = if app.credential_saving {
             "Saving securely…"
@@ -1706,13 +2546,18 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(format!(
-                "Paste your OpenAI API token\n\n  {status}  \n\nStored in the local .voff SQLite database, never in project config or logs.{error}\n\nEnter save · Esc keep using voff without a token"
+                "Paste your OpenAI API token\n\n  {status}  \n\nStored in the local .voff SQLite database, never in project config or logs.{error}"
             ))
             .alignment(ratatui::layout::Alignment::Center)
             .wrap(Wrap { trim: true })
             .block(
                 Block::default()
                     .title(" Add token (optional) ")
+                    .title_bottom(
+                        Line::from(" Enter save · Esc cancel ")
+                            .style(Style::default().fg(Color::LightCyan))
+                            .alignment(ratatui::layout::Alignment::Center),
+                    )
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::LightCyan)),
@@ -1758,10 +2603,6 @@ fn render_team_adjustment_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) 
                 },
             )));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(
-            "↑/↓ choose · Enter/Space add · Esc return to team",
-        ));
     } else {
         for (index, agent) in app.agents.iter().enumerate() {
             let selected = index == app.team_adjustment_selected;
@@ -1805,9 +2646,6 @@ fn render_team_adjustment_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) 
             )));
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(
-            "n add specialist · ↑/↓ select · Enter/Space toggle · S/Esc close",
-        ));
     }
     let area = frame.area();
     let item_count = if app.team_role_picker {
@@ -1815,61 +2653,52 @@ fn render_team_adjustment_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) 
     } else {
         app.agents.len()
     };
-    let popup = Popup::new(KnownSizeWrapper {
-        inner: Paragraph::new(lines).wrap(Wrap { trim: true }),
-        width: usize::from(area.width.saturating_sub(6).clamp(1, 76)),
-        height: usize::from(
-            area.height
-                .saturating_sub(6)
-                .min(u16::try_from(item_count.saturating_add(11)).unwrap_or(u16::MAX))
-                .max(1),
-        ),
-    })
-    .title(if app.team_role_picker {
-        " Add specialist · Team Lead remains coordinator "
+    let popup = centered_popup(
+        area,
+        area.width.saturating_sub(6).clamp(1, 76),
+        area.height
+            .saturating_sub(6)
+            .min(u16::try_from(item_count.saturating_add(9)).unwrap_or(u16::MAX))
+            .max(1),
+    );
+    let (title, footer) = if app.team_role_picker {
+        (
+            " Add specialist · Team Lead remains coordinator ",
+            " ↑/↓ choose · Enter/Space add · Esc back ",
+        )
     } else {
-        " Adjust team · Team Lead remains required "
-    })
-    .style(Style::default().bg(Color::Black))
-    .border_set(ratatui::symbols::border::ROUNDED)
-    .border_style(Style::default().fg(Color::LightMagenta));
-    frame.render_widget(popup, area);
+        (
+            " Adjust team · Team Lead remains required ",
+            " n add · ↑/↓ select · Enter/Space toggle · S/Esc close ",
+        )
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().bg(Color::Black))
+            .block(
+                Block::default()
+                    .title(title)
+                    .title_bottom(
+                        Line::from(footer)
+                            .style(Style::default().fg(Color::LightCyan))
+                            .alignment(ratatui::layout::Alignment::Center),
+                    )
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::LightMagenta)),
+            ),
+        popup,
+    );
 }
 
 fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
-    let preview = app
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.producer == approval.task_id)
-        .map(|artifact| format!("\n\nDiff preview:\n{}", sanitize(&artifact.preview)))
-        .unwrap_or_default();
-    let details = serde_json::from_str::<DelegationProposal>(&approval.reason)
+    let delegation = serde_json::from_str::<DelegationProposal>(&approval.reason)
         .ok()
-        .filter(|_| approval.action == "task.delegate")
-        .map_or_else(
-            || format!("Reason: {}", sanitize(&approval.reason)),
-            |proposal| {
-                let criteria = proposal
-                    .acceptance_criteria
-                    .iter()
-                    .map(|criterion| format!("- {}", sanitize(criterion)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "Target: {}\nObjective: {}\nAcceptance:\n{}",
-                    sanitize(&proposal.target_agent),
-                    sanitize(&proposal.objective),
-                    criteria
-                )
-            },
-        );
+        .filter(|_| approval.action == "task.delegate");
     let pending_count = app.pending_approval_count();
     let selected = app.approval_selected.min(pending_count.saturating_sub(1));
-    let navigation = if pending_count > 1 {
-        "[↑/↓] Select request    "
-    } else {
-        ""
-    };
     let lead_name = app
         .team_lead
         .and_then(|id| app.agents.iter().find(|agent| agent.id == id))
@@ -1878,7 +2707,7 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
         .tasks
         .iter()
         .find(|task| task.id == approval.task_id)
-        .and_then(|task| app.agents.iter().find(|agent| agent.id == task.owner))
+        .and_then(|task| app.agent_for_owner(task.owner))
         .map_or(lead_name, |agent| agent.name.as_str());
     let route = if task_owner == lead_name {
         sanitize(lead_name)
@@ -1890,31 +2719,110 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
             sanitize(lead_name)
         )
     };
-    let body = Paragraph::new(format!(
-        "User decision required · Team route: {route}\nAction: {}\nTask: {}\nWorking directory: {}\n{}{}\n\n{navigation}[y] Approve once    [n] Deny",
-        sanitize(&approval.action),
-        approval.task_id,
-        sanitize(&approval.working_directory),
-        details,
-        preview
-    ))
-    .wrap(Wrap { trim: true });
+    let mut lines = vec![
+        popup_section("ROUTE"),
+        Line::from(format!("  {route}")),
+        Line::from(""),
+        popup_section("ACTION"),
+        Line::from(Span::styled(
+            format!("  {}", sanitize(&approval.action)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("  Task  {}", approval.task_id),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  Working directory  {}",
+                sanitize(&approval.working_directory)
+            ),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        popup_section("REQUEST"),
+    ];
+    if let Some(proposal) = delegation {
+        lines.push(Line::from(vec![
+            Span::styled("  Target: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                sanitize(&proposal.target_agent),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from("  Objective"));
+        push_text_lines(&mut lines, &sanitize(&proposal.objective), "    ");
+        if !proposal.acceptance_criteria.is_empty() {
+            lines.push(Line::from("  Acceptance"));
+            for criterion in proposal.acceptance_criteria {
+                lines.push(Line::from(format!("    • {}", sanitize(&criterion))));
+            }
+        }
+    } else {
+        push_text_lines(&mut lines, &sanitize(&approval.reason), "  ");
+    }
+    if let Some(artifact) = app
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer == approval.task_id)
+    {
+        lines.push(Line::from(""));
+        popup_section_into(&mut lines, "PREVIEW");
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} · {}",
+                sanitize(&artifact.location),
+                sanitize(&artifact.kind)
+            ),
+            Style::default().fg(Color::Gray),
+        )));
+        push_text_lines(&mut lines, &sanitize(&artifact.preview), "  ");
+    }
     let area = frame.area();
-    let body_width = usize::from(area.width.saturating_sub(6).clamp(1, 76));
-    let body_height = usize::from(area.height.saturating_sub(6).clamp(1, 22));
-    let popup = Popup::new(KnownSizeWrapper {
-        inner: body,
-        width: body_width,
-        height: body_height,
-    })
-    .title(format!(
-        " Approval {} of {pending_count} ",
-        selected.saturating_add(1)
-    ))
-    .style(Style::default().bg(Color::Black))
-    .border_set(ratatui::symbols::border::ROUNDED)
-    .border_style(Style::default().fg(Color::Yellow));
-    frame.render_widget(popup, area);
+    let popup = centered_popup(
+        area,
+        area.width.saturating_sub(4).clamp(1, 82),
+        area.height.saturating_sub(4).clamp(1, 24),
+    );
+    let mut footer = vec![
+        Span::styled(
+            " [y] Approve",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            "[n] Deny ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if pending_count > 1 {
+        footer.push(Span::styled(
+            "· ↑/↓ request ",
+            Style::default().fg(Color::LightCyan),
+        ));
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(Color::Black))
+            .block(
+                Block::default()
+                    .title(format!(
+                        " Approval {} of {pending_count} · User decision ",
+                        selected.saturating_add(1)
+                    ))
+                    .title_bottom(Line::from(footer).alignment(ratatui::layout::Alignment::Center))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
+        popup,
+    );
 }
 
 fn panel(title: &str, active: bool) -> Block<'_> {
@@ -1935,13 +2843,18 @@ impl TerminalGuard {
             io::stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
         )?;
         let old = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
             let _ = execute!(
                 io::stdout(),
+                PopKeyboardEnhancementFlags,
                 DisableBracketedPaste,
                 DisableMouseCapture,
                 LeaveAlternateScreen
@@ -1956,6 +2869,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -2000,20 +2914,18 @@ mod tests {
         a.reduce(Action::NextPanel);
         assert_eq!(a.panel, Panel::Tasks);
         a.reduce(Action::NextPanel);
-        assert_eq!(a.panel, Panel::Details);
-        a.reduce(Action::NextPanel);
-        assert_eq!(a.panel, Panel::Events);
-        a.reduce(Action::NextPanel);
         assert_eq!(a.panel, Panel::Agents);
         a.reduce(Action::ToggleHelp);
         assert!(a.help)
     }
     #[test]
     fn keys_map_to_actions() {
-        assert_eq!(action_for_key(KeyCode::Char('r')), Action::StartMock);
-        assert_eq!(action_for_key(KeyCode::Char('a')), Action::AddCredential);
-        assert_eq!(action_for_key(KeyCode::Enter), Action::Compose);
-        assert_eq!(action_for_key(KeyCode::Char('/')), Action::ComposeCommand);
+        assert_eq!(action_for_key(KeyCode::Char('r')), Action::RetryTask);
+        assert_eq!(action_for_key(KeyCode::Char('R')), Action::QuickRun);
+        assert_eq!(action_for_key(KeyCode::Char('A')), Action::AddCredential);
+        assert_eq!(action_for_key(KeyCode::Enter), Action::FocusComposer);
+        assert_eq!(action_for_key(KeyCode::Char('t')), Action::None);
+        assert_eq!(action_for_key(KeyCode::Char('/')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('c')), Action::Cancel);
         assert_eq!(action_for_key(KeyCode::Char('q')), Action::Quit);
         assert_eq!(action_for_key(KeyCode::Char('y')), Action::Approve);
@@ -2025,8 +2937,397 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('S')), Action::AdjustTeam);
         assert_eq!(action_for_key(KeyCode::Char('1')), Action::ShowTeam);
         assert_eq!(action_for_key(KeyCode::Char('2')), Action::ShowTasks);
-        assert_eq!(action_for_key(KeyCode::Char('3')), Action::ShowDetails);
-        assert_eq!(action_for_key(KeyCode::Char('4')), Action::ShowEvents);
+        assert_eq!(action_for_key(KeyCode::Char('3')), Action::None);
+        assert_eq!(action_for_key(KeyCode::Char('4')), Action::None);
+        assert_eq!(action_for_key(KeyCode::Char('s')), Action::ShowTaskDetails);
+        assert_eq!(action_for_key(KeyCode::Char('a')), Action::ShowRoleActivity);
+        assert_eq!(action_for_key(KeyCode::Char('d')), Action::None);
+        assert_eq!(action_for_key(KeyCode::Char('l')), Action::None);
+    }
+
+    #[test]
+    fn quick_run_is_an_explicit_team_lead_workflow() {
+        assert!(QUICK_RUN_OBJECTIVE.contains("Markdown"));
+        assert!(QUICK_RUN_OBJECTIVE.contains("delegate"));
+        assert!(QUICK_RUN_OBJECTIVE.contains("normal approval flow"));
+        assert_eq!(QUICK_RUN_ACCEPTANCE.len(), 5);
+
+        let mut app = AppModel::new(SessionId::new());
+        assert!(!app.quick_run_active());
+        app.quick_run_starting = true;
+        assert!(app.quick_run_active());
+        app.quick_run_starting = false;
+        app.tasks.push(Task::root(
+            AgentId::new(),
+            QUICK_RUN_OBJECTIVE,
+            QUICK_RUN_ACCEPTANCE
+                .iter()
+                .map(|criterion| (*criterion).into())
+                .collect(),
+            voff_core::TaskLimits::default(),
+        ));
+        assert!(app.quick_run_active());
+        app.tasks[0].status = TaskStatus::Blocked;
+        assert!(!app.quick_run_active());
+    }
+
+    #[test]
+    fn terminal_input_forwarder_stops_after_its_receiver_closes() {
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let mut input_rx = Some(input_rx);
+        let mut polls = 0;
+
+        forward_terminal_events(
+            input_tx,
+            |_| {
+                polls += 1;
+                drop(input_rx.take());
+                Ok(false)
+            },
+            || panic!("closed input must not be read"),
+        );
+
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn restored_history_keeps_team_open_and_selects_the_newest_task() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = AgentId::new();
+        let mut historical_owner = agent("Historical Reviewer", "code_reviewer", vec![]);
+        historical_owner.id = owner;
+        app.known_agents.insert(owner, historical_owner);
+        let older = Task::root(
+            owner,
+            "older task",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        let mut newest = Task::root(
+            owner,
+            "verify restored details",
+            vec!["saved result is visible".into()],
+            voff_core::TaskLimits::default(),
+        );
+        newest.transition(TaskStatus::Ready).unwrap();
+        newest.transition(TaskStatus::Running).unwrap();
+        let evidence = voff_core::ArtifactId::new();
+        newest
+            .complete(voff_core::TaskResult {
+                summary: "restored summary".into(),
+                evidence: vec![evidence],
+            })
+            .unwrap();
+
+        restore_initial_history(
+            &mut app,
+            vec![older, newest.clone()],
+            vec![],
+            vec![],
+            vec![Artifact {
+                id: evidence,
+                producer: newest.id,
+                kind: "test report".into(),
+                location: "reports/restored.txt".into(),
+                digest: "sha256:test".into(),
+                preview: "all checks passed".into(),
+            }],
+        );
+
+        assert_eq!(app.panel, Panel::Agents);
+        assert_eq!(app.selected_task().map(|task| task.id), Some(newest.id));
+        app.reduce(Action::ShowTasks);
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("restored summary"), "{rendered}");
+        assert!(rendered.contains("Historical Reviewer"), "{rendered}");
+        assert!(rendered.contains("code reviewer"), "{rendered}");
+        assert!(rendered.contains("reports/restored.txt"), "{rendered}");
+        assert!(rendered.contains("test report"), "{rendered}");
+    }
+
+    #[test]
+    fn task_browser_keeps_the_latest_created_task_at_the_top() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = AgentId::new();
+        let mut newest = Task::root(
+            owner,
+            "latest task marker",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        let mut older = Task::root(
+            owner,
+            "older task marker",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        older.created_at = newest.created_at - chrono::Duration::minutes(1);
+        newest.updated_at = newest.created_at;
+        newest.attempt = 2;
+        newest.retry_of = Some(voff_core::TaskId::new());
+
+        app.apply_event(EngineEvent::TaskUpdated(newest.clone()));
+        app.apply_event(EngineEvent::TaskUpdated(older.clone()));
+
+        assert_eq!(app.tasks[0].id, newest.id);
+        assert_eq!(app.tasks[1].id, older.id);
+        assert_eq!(app.selected_task().map(|task| task.id), Some(newest.id));
+        app.panel = Panel::Tasks;
+        app.reduce(Action::Down);
+        assert_eq!(app.selected_task().map(|task| task.id), Some(older.id));
+        app.reduce(Action::Up);
+        assert_eq!(app.selected_task().map(|task| task.id), Some(newest.id));
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let latest = rendered.find("latest task marker").unwrap();
+        let older = rendered.find("older task marker").unwrap();
+        assert!(latest < older, "{rendered}");
+        assert!(
+            rendered.contains("Tasks · lead first · newest peers"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[r] re-run"), "{rendered}");
+        assert!(rendered.contains("↻ attempt 2"), "{rendered}");
+    }
+
+    #[test]
+    fn task_browser_indents_the_entire_card_by_delegation_depth() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Lead Coordinator", "technical_lead", vec![]);
+        let frontend = agent("Frontend Developer", "frontend_developer", vec![]);
+        let backend = agent("Backend Developer", "backend_developer", vec![]);
+        let parent = Task::root(
+            lead.id,
+            "root objective",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        let mut child = Task::root(
+            frontend.id,
+            "child objective",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        child.parent = Some(parent.id);
+        child.depth = 1;
+        let mut grandchild = Task::root(
+            backend.id,
+            "grandchild objective",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        grandchild.parent = Some(child.id);
+        grandchild.depth = 2;
+        let parent_id = parent.id;
+        let child_id = child.id;
+        let grandchild_id = grandchild.id;
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, frontend, backend];
+        app.tasks = vec![grandchild, child, parent];
+        app.sort_tasks_for_browser();
+        assert_eq!(
+            app.tasks.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![parent_id, child_id, grandchild_id]
+        );
+        app.selected = 0;
+        app.panel = Panel::Tasks;
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let position = |needle: &str| {
+            rows.iter()
+                .enumerate()
+                .find_map(|(y, row)| {
+                    row.find(needle)
+                        .map(|byte_index| (row[..byte_index].chars().count(), y))
+                })
+                .unwrap_or_else(|| panic!("{needle} should be rendered"))
+        };
+        let lead_position = position("Lead Coordinator");
+        let frontend_position = position("Frontend Developer");
+        let backend_position = position("Backend Developer");
+        assert_eq!(frontend_position.0, lead_position.0 + 2);
+        assert_eq!(backend_position.0, lead_position.0 + 4);
+        let icon_cell = |(x, y): (usize, usize)| {
+            let cell = &buffer[((x - 2) as u16, y as u16)];
+            (cell.symbol().to_owned(), cell.fg)
+        };
+        assert_eq!(icon_cell(lead_position), ("◆".into(), Color::Magenta));
+        assert_eq!(icon_cell(frontend_position), ("▣".into(), Color::LightCyan));
+        assert_eq!(icon_cell(backend_position), ("⬢".into(), Color::Blue));
+
+        let root_objective = position("root objective");
+        let child_objective = position("child objective");
+        let grandchild_objective = position("grandchild objective");
+        assert_eq!(child_objective.0, root_objective.0 + 2);
+        assert_eq!(grandchild_objective.0, root_objective.0 + 4);
+    }
+
+    #[test]
+    fn task_workspace_stacks_browser_and_inspector_on_narrow_terminals() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = agent("API Engineer", "backend_developer", vec![]);
+        app.tasks.push(Task::root(
+            owner.id,
+            "Narrow terminal task",
+            vec!["Readable at small widths".into()],
+            voff_core::TaskLimits::default(),
+        ));
+        app.agents.push(owner);
+        app.reduce(Action::ShowTasks);
+        let backend = TestBackend::new(68, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Narrow terminal task"), "{rendered}");
+        assert!(rendered.contains("OBJECTIVE"), "{rendered}");
+        assert!(rendered.contains("API Engineer"), "{rendered}");
+        assert!(rendered.contains("· Tasks · session"), "{rendered}");
+        assert!(!rendered.contains("Tasks view"), "{rendered}");
+        assert!(rendered.contains("[s] summary"), "{rendered}");
+        assert!(rendered.contains("[a] activity"), "{rendered}");
+    }
+
+    #[test]
+    fn role_activity_key_filters_events_to_the_selected_tasks_owner() {
+        let mut app = AppModel::new(SessionId::new());
+        let backend = agent("Backend Developer", "backend_developer", vec![]);
+        let frontend = agent("Frontend Developer", "frontend_developer", vec![]);
+        let backend_task = Task::root(
+            backend.id,
+            "Implement API",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        let frontend_task = Task::root(
+            frontend.id,
+            "Implement UI",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        app.agents = vec![backend, frontend];
+        app.tasks = vec![backend_task.clone(), frontend_task.clone()];
+        for (task_id, message) in [
+            (backend_task.id, "backend-event-visible"),
+            (frontend_task.id, "frontend-event-hidden"),
+        ] {
+            app.apply_event(EngineEvent::Canonical(CanonicalEvent {
+                id: EventId::new(),
+                session_id: app.session,
+                task_id: Some(task_id),
+                created_at: chrono::Utc::now(),
+                kind: CanonicalEventKind::ProviderFailed(message.into()),
+            }));
+        }
+        app.reduce(action_for_key(KeyCode::Char('a')));
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Backend Developer"), "{rendered}");
+        assert!(rendered.contains("backend-event-visible"), "{rendered}");
+        assert!(!rendered.contains("frontend-event-hidden"), "{rendered}");
+    }
+
+    #[test]
+    fn task_events_are_flat_and_semantically_colored() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = AgentId::new();
+        let parent = Task::root(
+            owner,
+            "Coordinate work",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        let mut child = Task::root(
+            owner,
+            "Delegated work",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        child.parent = Some(parent.id);
+        child.depth = 1;
+        app.tasks = vec![child.clone(), parent.clone()];
+
+        let root_prefix = task_event_prefix(parent.id);
+        let child_prefix = task_event_prefix(child.id);
+        assert!(root_prefix.starts_with('['), "{root_prefix}");
+        assert!(child_prefix.starts_with('['), "{child_prefix}");
+        assert!(!root_prefix.starts_with(' '), "{root_prefix}");
+        assert!(!child_prefix.starts_with(' '), "{child_prefix}");
+        assert_eq!(event_text_color("tool proposed: file.patch"), Color::Yellow);
+        assert_eq!(
+            event_text_color("provider failed: timeout"),
+            Color::LightRed
+        );
+        assert_eq!(event_text_color("provider completed"), Color::Green);
+        assert_eq!(event_text_color("task created"), Color::LightCyan);
+        assert_eq!(
+            event_text_color("re-run attempt 2: abc -> def"),
+            Color::LightCyan
+        );
+        assert_eq!(
+            event_text_color("usage: 10 in / 2 out"),
+            Color::LightMagenta
+        );
+
+        app.push_scoped_event(
+            Some(child.id),
+            &CanonicalEventKind::TaskDelegated {
+                parent: parent.id,
+                child: child.id,
+                owner,
+            },
+        );
+        app.event_viewer = true;
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_overlays(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(
+            rendered.contains("Events · live · newest first"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("└─"), "{rendered}");
+        assert!(rendered.contains("delegated"), "{rendered}");
     }
 
     #[test]
@@ -2107,53 +3408,6 @@ mod tests {
     }
 
     #[test]
-    fn configured_run_assigns_every_enabled_allowed_specialist_once() {
-        let lead = agent(
-            "Team Lead",
-            "technical_lead",
-            vec!["Backend".into(), "Reviewer".into(), "Disabled".into()],
-        );
-        let backend = agent("Backend", "backend_developer", vec![]);
-        let reviewer = agent("Reviewer", "code_reviewer", vec![]);
-        let mut disabled = agent("Disabled", "test_engineer", vec![]);
-        disabled.enabled = false;
-        let configured = vec![DelegationProposal {
-            target_agent: backend.name.clone(),
-            objective: "Own server.py".into(),
-            acceptance_criteria: vec!["API complete".into()],
-        }];
-
-        let plan = delegation_plan_for_available_agents(
-            &[lead.clone(), backend, reviewer, disabled],
-            Some(lead.id),
-            &configured,
-        );
-
-        assert_eq!(plan.len(), 2);
-        assert_eq!(
-            plan.iter()
-                .map(|proposal| proposal.target_agent.as_str())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["Backend", "Reviewer"])
-        );
-        assert_eq!(plan[0].objective, "Own server.py");
-    }
-
-    #[test]
-    fn generated_support_artifacts_do_not_require_missing_directories() {
-        let specialist = agent("Full-stack Developer 6", "full_stack_developer", vec![]);
-
-        let proposal = supporting_delegation(&specialist, 1);
-
-        assert!(
-            proposal
-                .objective
-                .contains("full-stack-developer-6-integration-notes.md")
-        );
-        assert!(!proposal.objective.contains("docs/"));
-    }
-
-    #[test]
     fn team_adjustment_refuses_to_disable_a_specialist_with_active_work() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Team Lead", "technical_lead", vec!["Backend".into()]);
@@ -2190,7 +3444,7 @@ mod tests {
     #[test]
     fn textarea_submits_a_message_to_the_team_lead_flow() {
         let mut app = AppModel::new(SessionId::new());
-        app.reduce(Action::Compose);
+        app.composer_active = true;
         assert_eq!(
             app.handle_composer_event(&Event::Paste("Please review the current plan".into())),
             ComposerEvent::Consumed
@@ -2205,6 +3459,52 @@ mod tests {
         );
         assert!(!app.composer_active);
         assert_eq!(app.composer.lines(), [""]);
+    }
+
+    #[test]
+    fn multiline_composer_grows_and_supports_modern_undo_redo() {
+        let mut app = AppModel::new(SessionId::new());
+        app.composer_active = true;
+        let area = Rect::new(0, 0, 100, 24);
+        assert_eq!(composer_height(&app, area), 3);
+
+        app.handle_composer_event(&Event::Paste("first line".into()));
+        let newline = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.handle_composer_event(&newline), ComposerEvent::Consumed);
+        assert_eq!(app.composer.lines(), ["first line", ""]);
+        assert_eq!(composer_height(&app, area), 4);
+
+        let fallback_newline = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(
+            app.handle_composer_event(&fallback_newline),
+            ComposerEvent::Consumed
+        );
+        assert_eq!(app.composer.lines(), ["first line", "", ""]);
+        assert_eq!(composer_height(&app, area), 5);
+
+        let typed = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ));
+        app.handle_composer_event(&typed);
+        let undo = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL,
+        ));
+        app.handle_composer_event(&undo);
+        assert_eq!(app.composer.lines(), ["first line", "", ""]);
+        let redo = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL,
+        ));
+        app.handle_composer_event(&redo);
+        assert_eq!(app.composer.lines(), ["first line", "", "x"]);
     }
 
     #[test]
@@ -2232,16 +3532,16 @@ mod tests {
     #[test]
     fn tasks_command_focuses_the_current_task_list() {
         let mut app = AppModel::new(SessionId::new());
-        app.panel = Panel::Events;
+        app.panel = Panel::Agents;
         app.tasks.push(Task::root(
             AgentId::new(),
             "current work",
             vec![],
             voff_core::TaskLimits::default(),
         ));
-        app.reduce(Action::ComposeCommand);
-        assert_eq!(app.composer.lines(), ["/"]);
-        app.handle_composer_event(&Event::Paste("tasks".into()));
+        app.reduce(Action::FocusComposer);
+        assert_eq!(app.composer.lines(), [""]);
+        app.handle_composer_event(&Event::Paste("/tasks".into()));
         let enter = Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -2257,6 +3557,23 @@ mod tests {
             app.composer_notice.as_deref(),
             Some("Showing 1 current task.")
         );
+    }
+
+    #[test]
+    fn enter_focuses_an_empty_composer_and_escape_quits() {
+        let mut app = AppModel::new(SessionId::new());
+
+        app.reduce(Action::FocusComposer);
+
+        assert!(app.composer_active);
+        assert_eq!(app.composer.lines(), [""]);
+        let escape = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.handle_composer_event(&escape), ComposerEvent::Consumed);
+        assert!(app.quit);
+        assert!(!app.composer_active);
     }
 
     #[test]
@@ -2294,10 +3611,11 @@ mod tests {
     #[test]
     fn full_screen_events_open_and_scroll_without_moving_task_selection() {
         let mut app = AppModel::new(SessionId::new());
+        app.panel = Panel::Tasks;
         app.events = vec!["a sufficiently long event message for scrolling".into(); 20];
         app.reduce(Action::ToggleEvents);
         assert!(app.event_viewer);
-        assert_eq!(app.panel, Panel::Events);
+        assert_eq!(app.panel, Panel::Tasks);
         assert!(app.event_follow);
         app.reduce(Action::PageDown);
         assert_eq!(app.event_scroll, 10);
@@ -2311,7 +3629,7 @@ mod tests {
     #[test]
     fn events_follow_new_activity_until_the_user_scrolls_history() {
         let mut app = AppModel::new(SessionId::new());
-        app.panel = Panel::Events;
+        app.reduce(Action::ToggleEvents);
         app.events = vec!["older event".into(); 20];
 
         app.reduce(Action::PageDown);
@@ -2410,6 +3728,11 @@ mod tests {
         assert!(rendered.contains("Linus"));
         assert!(rendered.contains("qwen-test"));
         assert!(rendered.contains("4096 tokens"));
+        assert!(rendered.contains("[1 Team] [2 Tasks]"), "{rendered}");
+        assert!(!rendered.contains("[R Quick Run]"), "{rendered}");
+        assert!(!rendered.contains("[3 Events]"), "{rendered}");
+        assert!(rendered.contains("· Team · session"), "{rendered}");
+        assert!(!rendered.contains("Team view"), "{rendered}");
         assert_eq!(app.team_flow.edges().len(), 1);
         assert!(
             app.team_flow
@@ -2417,7 +3740,91 @@ mod tests {
                 .iter()
                 .all(|edge| edge.label.is_none())
         );
-        assert!(rendered.contains("cwd /workspaces/voff-demo"));
+        let composer = (buffer.area.height.saturating_sub(3)..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(composer.contains("Team Lead"), "{composer}");
+        assert!(composer.contains("Press Enter to talk"), "{composer}");
+        assert!(!composer.contains("/task assign"), "{composer}");
+        assert!(!composer.contains("/tasks browse"), "{composer}");
+        assert!(composer.contains("[R] Quick Run"), "{composer}");
+        assert!(!composer.contains("1/2/3 views"), "{composer}");
+        let bottom_border = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
+            .collect::<String>();
+        assert!(bottom_border.contains("? help · cwd"), "{bottom_border}");
+        let hint_x = (0..buffer.area.width.saturating_sub(2))
+            .find(|x| {
+                buffer[(*x, buffer.area.height - 1)].symbol() == "["
+                    && buffer[(x.saturating_add(1), buffer.area.height - 1)].symbol() == "R"
+            })
+            .expect("Quick Run should be visible on the bottom border");
+        assert!(
+            hint_x.abs_diff(buffer.area.width / 2) <= 10,
+            "{bottom_border}"
+        );
+        assert_eq!(buffer[(hint_x, buffer.area.height - 1)].fg, Color::White);
+        assert_eq!(
+            buffer[(hint_x + 1, buffer.area.height - 1)].fg,
+            Color::White
+        );
+        assert_eq!(
+            buffer[(hint_x + 2, buffer.area.height - 1)].fg,
+            Color::White
+        );
+        assert_eq!(
+            buffer[(hint_x + 4, buffer.area.height - 1)].fg,
+            Color::White
+        );
+        let cwd = bottom_border
+            .find("cwd /workspaces/voff-demo")
+            .expect("cwd should be visible on the bottom border");
+        assert!(cwd > usize::from(buffer.area.width / 2), "{bottom_border}");
+    }
+
+    #[test]
+    fn role_cards_render_one_icon_labeled_identity_inside_the_border() {
+        let mut app = AppModel::new(SessionId::new());
+        app.agents = vec![agent("Backend Developer", "backend_developer", vec![])];
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("⬢ Backend Developer"), "{rendered}");
+        assert_eq!(
+            rendered.matches("Backend Developer").count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn composer_hint_switches_to_commands_after_enter_focuses_it() {
+        let mut app = AppModel::new(SessionId::new());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.reduce(Action::FocusComposer);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let composer = (buffer.area.height.saturating_sub(3)..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(!composer.contains("Press Enter to talk"), "{composer}");
+        assert_eq!(composer.matches("/task assign").count(), 1, "{composer}");
+        assert_eq!(composer.matches("/tasks browse").count(), 1, "{composer}");
+        let cursor = (
+            app.composer_hitbox.x.saturating_add(1),
+            app.composer_hitbox.y.saturating_add(1),
+        );
+        assert_eq!(buffer[cursor].bg, Color::LightCyan);
+        assert_eq!(buffer[cursor].fg, Color::Black);
     }
 
     #[test]
@@ -2568,6 +3975,58 @@ mod tests {
     }
 
     #[test]
+    fn approval_border_keeps_decisions_visible_and_highlights_the_action() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = AgentId::new();
+        let task = Task::root(
+            owner,
+            "Apply a reviewed change",
+            vec!["Patch is inspectable".into()],
+            voff_core::TaskLimits::default(),
+        );
+        app.approvals.push(Approval {
+            id: voff_core::ApprovalId::new(),
+            task_id: task.id,
+            tool_call_id: voff_core::ToolCallId::new(),
+            action: "file.patch".into(),
+            working_directory: "/workspaces/voff".into(),
+            reason: "Apply the proposed file changes after reviewing the preview. ".repeat(8),
+            decision: ApprovalDecision::Pending,
+            created_at: chrono::Utc::now(),
+        });
+        app.artifacts.push(Artifact {
+            id: voff_core::ArtifactId::new(),
+            producer: task.id,
+            kind: "patch".into(),
+            location: "changes.diff".into(),
+            digest: "sha256:test".into(),
+            preview: "+ a deliberately long preview line\n".repeat(30),
+        });
+        app.tasks.push(task);
+
+        let backend = TestBackend::new(44, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_overlays(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        let mut action_position = None;
+        for y in 0..buffer.area.height {
+            let row = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if let Some(x) = row.find("file.patch") {
+                action_position = Some((u16::try_from(x).unwrap(), y));
+            }
+            rendered.push_str(&row);
+        }
+        assert!(rendered.contains("[y] Approve"), "{rendered}");
+        assert!(rendered.contains("[n] Deny"), "{rendered}");
+        let action_position = action_position.expect("action should be visible");
+        assert_eq!(buffer[action_position].fg, Color::Yellow);
+    }
+
+    #[test]
     fn live_delegation_animates_the_edge_and_spins_on_working_roles() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
@@ -2676,7 +4135,8 @@ mod tests {
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
         assert!(rendered.contains("1 handoff complete"));
-        assert!(rendered.contains("⬢ Linus"), "{rendered}");
+        assert!(rendered.contains("⬢ Backend Developer"), "{rendered}");
+        assert!(rendered.contains("Linus"), "{rendered}");
         assert!(
             app.team_flow
                 .edges()

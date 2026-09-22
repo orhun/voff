@@ -32,8 +32,9 @@ Phase 1 exit gate is complete: a configured Ollama agent can run and cancel a ta
 - Structured test executor without a shell, command allowlist, workspace boundary, timeout/output bounds and consumed approval grant: `voff-tools` executor tests.
 - Approval/artifact domain events and SQLite migration: `voff-core`, `voff-storage` contract tests.
 - Provider tool requests enter `WaitingApproval`; approval and denial are persisted and projected to the TUI: `voff-engine` integration test.
-- Queued `tui-popup` approval dialog (`Up`/`Down` inspect, `y` once / `n` deny),
-  restored pending approvals and task-local artifact diff preview: `voff` TUI module.
+- Queued centered approval dialog (`Up`/`Down` inspect, `y` once / `n` deny),
+  persistent border controls, restored pending approvals, and task-local artifact
+  diff preview: `voff` TUI module.
 - Terminal control sanitization and basic credential redaction: `voff` TUI tests.
 - Scoped Phase 2 capabilities are explicit in configuration: `file.patch` and `process.test`; arbitrary shell remains rejected.
 
@@ -94,7 +95,7 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   minimize input. Exactly one Team Lead is required and generated teams grant
   delegation authority only to that entry agent. Provider and model selection exists only on each developer.
   OpenAI tokens are offered as an optional masked setup field and can be added
-  after launch with `a`; missing credentials never block the workspace. Values
+  after launch with `A`; missing credentials never block the workspace. Values
   are stored in the workspace-local SQLite database rather than project
   configuration (temporary plaintext-at-rest tradeoff, ADR 0019). The model
   catalog also supplies provider-qualified per-agent cost estimates, with
@@ -103,8 +104,10 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
 - A `ratatui-textarea` composer sends plain text to the entry Team Lead as a
   persisted, tool-free conversation task; `/task <objective>` submits
   executable work with delegation enabled, and `/tasks` focuses the current
-  task list without provider I/O. Background submission failures return to the
-  composer visibly.
+  task list without provider I/O. Enter focuses the composer; once focused, its
+  hint switches to the available conversation commands. `? help` sits beside
+  the working directory on the bottom-right border. Background submission
+  failures return to the composer visibly.
 - The workspace presents developers as status-rich cards connected by their
   explicit Team Lead-mediated delegation relationships. Each specialist has
   one connector to the lead for assignments, requests, and results, so a
@@ -113,23 +116,33 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   never renders direct peer edges. Static permission routes stay faint;
   persisted cross-owner child tasks become directional routes with a double-line
   animated live state. Objectives and status remain on owner cards; connector
-  lines carry no text. `rataflow` owns route rendering, node
+  lines carry no text. Each card renders one icon-labeled role identity inside
+  its border rather than repeating it as a title. `rataflow` owns route rendering, node
   dragging, selection, pan, zoom, and fit-view while voff supplies the
   provider-neutral card and handoff projections. Cards support mouse selection
   and dragging while all workflow controls remain keyboard-accessible.
-- `S` opens a `tui-popup` runtime team editor that enables or disables idle
+- `S` opens a centered runtime team editor that enables or disables idle
   specialists or adds safe role presets inheriting the lead's provider/model.
   It keeps the Team Lead immutable, refuses availability changes around active
   or approval-pending work, strips peer-delegation authority, and persists team
   audit events. Rataflow immediately projects the updated lead routing.
-- The Rataflow team canvas is the default fullscreen center view. `1`–`4` open
-  Team, Tasks, Task Details, and Events respectively, while `Tab` cycles them.
-  Connector routes carry no text; card state, marker shape, color, line style,
-  and animation communicate delegation without collision-prone labels.
-- Starting the configured objective builds its delegation plan from the live
-  formation: every enabled Team Lead target receives exactly one task, disabled
-  agents are skipped, runtime additions are included, and role-specific support
-  artifacts use unique ownership paths to avoid writer clashes.
+- The Rataflow team canvas is the default fullscreen center view. `1` and `2`
+  open Team and the combined task browser/inspector, while `Tab` toggles them.
+  `e` opens session events as a temporary full-screen diagnostic viewer rather
+  than a permanent tab. The task workspace provides structured details and a
+  keyed task-owner activity view for role-level debugging. Tasks render newest
+  first, and lowercase `r` creates an audited, correlated attempt for the
+  selected terminal or blocked task without rewriting history. Root and
+  delegated-task events use short-ID tree connectors to
+  preserve hierarchy. Connector routes carry no text; card state, marker shape,
+  color, line style, and animation communicate delegation without
+  collision-prone labels.
+- Launch and resume create no implicit objective. Users create work explicitly
+  with `/task <objective>` or capital `R`. `R` creates a persisted Quick Run
+  root task that asks the Team Lead to reconcile Markdown requirements, create
+  bounded work, delegate it, execute it, and validate evidence. Delegation
+  remains bounded by enabled membership, allowed targets, approvals, and task
+  limits.
 - Root README now provides local and heterogeneous-team onboarding, secure
   credential setup, TUI controls, and contributor quality commands.
 - `voff init` interactively creates a validated solo Ollama or OpenAI
@@ -138,10 +151,11 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
 - Tag-triggered release CI builds locked Linux x86-64 and macOS Intel/Apple
   Silicon archives, generates SHA-256 checksums, and publishes them only for
   version tags. The maintainer procedure is documented in `docs/RELEASING.md`.
-- `voff run` creates a clean session by default; `--resume` explicitly
-  reopens the newest session. Initial TUI projections and interruption recovery
-  are scoped to the selected session, preventing unrelated historical tasks
-  from being mixed into a new run.
+- A bare `voff` launch reopens the newest task-bearing session, while explicit
+  `voff run` creates a clean session by default and `--resume` reopens history.
+  The global `--workspace <DIR>` override selects that directory's local state
+  without rewriting configuration. Initial TUI projections and interruption
+  recovery remain scoped to the selected session.
 - `voff export` writes a session-scoped diagnostic JSON bundle, redacts the
   configured credential value and common secret forms, and refuses accidental
   overwrite.

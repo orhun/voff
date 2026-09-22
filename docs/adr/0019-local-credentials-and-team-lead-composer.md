@@ -32,7 +32,22 @@ normal engine, retaining the Team Lead's delegation policy. `/tasks` focuses
 the in-memory current-session task list without provider I/O. The composer is
 handled on the responsive TUI event loop, while provider and SQLite work
 remains asynchronous. Completion or failure is returned to the composer rather
-than being silently discarded by a detached task.
+than being silently discarded by a detached task. Enter focuses an inactive
+composer, while `/` has no global key binding and remains ordinary input for
+slash commands. The border title remains `Team Lead`. Once focused, the empty
+input hints at the available commands. Shift+Enter adds lines and dynamically
+grows the soft-wrapped editor up to a bounded terminal-relative height; longer
+drafts scroll. The TUI enables terminal keyboard enhancement flags so modified
+Enter keys remain distinguishable, with Ctrl+J and Alt+Enter as portable newline
+fallbacks. The editor exposes a high-contrast block cursor, selection, word-wise
+editing, and undo/redo controls. The resolved working directory is right-aligned
+beside `? help` on the bottom border. Esc from the active composer performs the
+same safe quit as Esc from the surrounding workspace.
+
+Capital `R` remains a workspace action rather than textarea input while the
+composer is inactive. It creates a persisted Quick Run root task for the Team
+Lead using the standard engine workflow; when the composer is active, `R` is
+ordinary text.
 
 The first-launch defaults page contains developer count, an existing working
 directory (default `.`), and the shared maximum output-token limit. Provider

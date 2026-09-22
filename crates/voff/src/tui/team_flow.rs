@@ -19,8 +19,7 @@ const WORKING_FRAMES: [&str; 4] = ["◒", "◐", "◓", "◑"];
 
 #[derive(Clone, Debug)]
 struct AgentCard {
-    title: String,
-    role: String,
+    identity: String,
     provider: String,
     model: String,
     detail: String,
@@ -72,16 +71,16 @@ impl NodeContent for AgentCard {
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
+        let identity = Line::from(Span::styled(
+            self.identity.as_str(),
+            Style::default()
+                .fg(self.role_color)
+                .add_modifier(Modifier::BOLD),
+        ));
         let mut lines = if ctx.area.height <= 3 {
-            vec![status]
+            vec![identity]
         } else {
-            vec![
-                Line::from(Span::styled(
-                    self.role.as_str(),
-                    Style::default().fg(Color::Gray),
-                )),
-                status,
-            ]
+            vec![identity, status]
         };
         if ctx.area.height >= 6 {
             lines.push(Line::from(Span::styled(
@@ -103,7 +102,6 @@ impl NodeContent for AgentCard {
             .wrap(Wrap { trim: true })
             .block(
                 Block::default()
-                    .title(self.title.as_str())
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(border_style),
@@ -326,9 +324,15 @@ fn agent_card(agent: &AgentProfile, tasks: &[Task], approvals: &[Approval]) -> A
     } else {
         format!("{} tokens · delegation", agent.max_output_tokens)
     };
+    let role = human_role(&agent.role);
+    let name = sanitize(&agent.name);
+    let identity = if name.eq_ignore_ascii_case(&role) {
+        format!("{} {role}", role_icon(&agent.role))
+    } else {
+        format!("{} {role} · {name}", role_icon(&agent.role))
+    };
     AgentCard {
-        title: format!(" {} {} ", role_icon(&agent.role), sanitize(&agent.name)),
-        role: human_role(&agent.role),
+        identity,
         provider: sanitize(&agent.provider),
         model: sanitize(&agent.model),
         detail,
@@ -753,7 +757,7 @@ fn status_symbol(status: &str) -> &'static str {
     }
 }
 
-fn role_color(role: &str) -> Color {
+pub(super) fn role_color(role: &str) -> Color {
     match role {
         "technical_lead" => Color::Magenta,
         "frontend_developer" => Color::LightCyan,
@@ -765,7 +769,7 @@ fn role_color(role: &str) -> Color {
     }
 }
 
-fn role_icon(role: &str) -> &'static str {
+pub(super) fn role_icon(role: &str) -> &'static str {
     match role {
         "technical_lead" => "◆",
         "frontend_developer" => "▣",

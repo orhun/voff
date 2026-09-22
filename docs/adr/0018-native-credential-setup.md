@@ -18,7 +18,7 @@ Interactive first launch offers an OpenAI API token only when at least one
 configured developer uses OpenAI and no token already resolves. The field is
 optional, supports terminal paste, and renders bullets only. Enter skips it
 and launches the workspace. The running TUI shows the missing state and lets
-the user press `a` to add the token later without restarting. Keyring writes
+the user press `A` to add the token later without restarting. Keyring writes
 run outside the render loop. voff stores the token with the cross-platform
 `keyring` crate under the configured environment-reference name. This maps to
 macOS Keychain, Windows Credential Manager, or Linux Secret Service.

@@ -286,6 +286,7 @@ async fn stream_model<M: CompletionModel>(
     request
         .validate_message_content()
         .map_err(completion_error)?;
+    let recovery_request = request.clone();
     let mut stream = tokio::select! {
         () = cancellation.cancelled() => return Err(cancelled()),
         result = model.stream(request) => result.map_err(completion_error)?,
@@ -370,6 +371,18 @@ async fn stream_model<M: CompletionModel>(
             .await?;
             send(&sink, ProviderEvent::Completed, &cancellation).await?;
             Ok(ProviderCompletion { usage: None })
+        } else if matches!(tool_names, ToolNames::OpenAi)
+            && is_responses_stream_decode_error(&error)
+        {
+            recover_with_completion(
+                model,
+                recovery_request,
+                sink,
+                cancellation,
+                tool_names,
+                &error,
+            )
+            .await
         } else {
             Err(error)
         }
@@ -380,6 +393,83 @@ async fn stream_model<M: CompletionModel>(
             retryable: true,
         })
     }
+}
+
+async fn recover_with_completion<M: CompletionModel>(
+    model: &M,
+    request: RigCompletionRequest,
+    sink: ProviderEventSink,
+    cancellation: CancellationToken,
+    tool_names: ToolNames,
+    stream_error: &ProviderError,
+) -> Result<ProviderCompletion, ProviderError> {
+    let response = tokio::select! {
+        () = cancellation.cancelled() => return Err(cancelled()),
+        result = model.completion(request) => result.map_err(|error| {
+            let mut error = completion_error(error);
+            error.message = format!(
+                "stream decoding failed ({}); non-streaming recovery failed: {}",
+                stream_error.message, error.message
+            );
+            error
+        })?,
+    };
+
+    let mut emitted_usable_output = false;
+    for content in response.choice {
+        match content {
+            AssistantContent::Text(text) if !text.text.is_empty() => {
+                emitted_usable_output = true;
+                send(&sink, ProviderEvent::TextDelta(text.text), &cancellation).await?;
+            }
+            AssistantContent::ToolCall(tool_call) => {
+                emitted_usable_output = true;
+                let name = match tool_names {
+                    ToolNames::Canonical => tool_call.function.name,
+                    ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
+                };
+                send(
+                    &sink,
+                    ProviderEvent::ToolRequest(StructuredToolRequest {
+                        id: voff_core::ToolCallId::new(),
+                        name,
+                        arguments_json: tool_call.function.arguments.to_string(),
+                    }),
+                    &cancellation,
+                )
+                .await?;
+            }
+            AssistantContent::Text(_)
+            | AssistantContent::Reasoning(_)
+            | AssistantContent::Image(_) => {}
+        }
+    }
+
+    if !emitted_usable_output {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::InvalidResponse,
+            message: format!(
+                "stream decoding failed ({}); non-streaming recovery returned no usable text or tool calls",
+                stream_error.message
+            ),
+            retryable: false,
+        });
+    }
+
+    let usage = response.usage.has_values().then_some(Usage {
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+    });
+    if let Some(usage) = &usage {
+        send(&sink, ProviderEvent::Usage(usage.clone()), &cancellation).await?;
+    }
+    send(&sink, ProviderEvent::Completed, &cancellation).await?;
+    Ok(ProviderCompletion { usage })
+}
+
+fn is_responses_stream_decode_error(error: &ProviderError) -> bool {
+    error.kind == ProviderErrorKind::InvalidResponse
+        && error.message.contains("StreamingCompletionChunk")
 }
 
 fn rig_request(
@@ -580,6 +670,7 @@ mod tests {
     use super::*;
     use rig_core::{
         completion::{CompletionResponse, Usage as RigUsage},
+        message::{ToolCall as RigToolCall, ToolFunction},
         streaming::{
             RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamingCompletionResponse,
         },
@@ -597,6 +688,9 @@ mod tests {
 
     #[derive(Clone)]
     struct RigJsonErrorModel;
+
+    #[derive(Clone)]
+    struct RigRecoveringResponsesModel;
 
     impl CompletionModel for RigFixtureModel {
         async fn completion(
@@ -707,6 +801,47 @@ mod tests {
             _: RigCompletionRequest,
         ) -> Result<StreamingCompletionResponse, CompletionError> {
             let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+            let items = vec![Err(CompletionError::JsonError(json_error))];
+            Ok(StreamingCompletionResponse::stream(
+                "fixture",
+                Box::pin(futures_util::stream::iter(items)),
+            ))
+        }
+    }
+
+    impl CompletionModel for RigRecoveringResponsesModel {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            Ok(CompletionResponse::new(
+                vec![
+                    AssistantContent::Text(Text::new("recovered response")),
+                    AssistantContent::ToolCall(RigToolCall::from_wire(
+                        "call-1",
+                        ToolFunction::new(
+                            "file__patch".into(),
+                            serde_json::json!({"path": "README.md"}),
+                        ),
+                    )),
+                ],
+                RigUsage {
+                    input_tokens: 11,
+                    output_tokens: 4,
+                    total_tokens: 15,
+                    ..RigUsage::default()
+                },
+                "fixture",
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            let json_error = <serde_json::Error as serde::de::Error>::custom(
+                "data did not match any variant of untagged enum StreamingCompletionChunk",
+            );
             let items = vec![Err(CompletionError::JsonError(json_error))];
             Ok(StreamingCompletionResponse::stream(
                 "fixture",
@@ -876,6 +1011,53 @@ mod tests {
 
         assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
         assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovers_an_openai_responses_stream_decoder_failure_without_output() {
+        let (sink, mut events) = tokio::sync::mpsc::channel(16);
+        let completion = stream_model(
+            &RigRecoveringResponsesModel,
+            request(),
+            sink,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
+        .unwrap();
+
+        let mut received = Vec::new();
+        while let Some(event) = events.recv().await {
+            received.push(event);
+        }
+
+        assert_eq!(
+            received[0],
+            ProviderEvent::TextDelta("recovered response".into())
+        );
+        let ProviderEvent::ToolRequest(tool) = &received[1] else {
+            panic!("expected a recovered tool request");
+        };
+        assert_eq!(tool.name, "file.patch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool.arguments_json).unwrap()["path"],
+            "README.md"
+        );
+        assert_eq!(
+            received[2],
+            ProviderEvent::Usage(Usage {
+                input_tokens: 11,
+                output_tokens: 4,
+            })
+        );
+        assert_eq!(received[3], ProviderEvent::Completed);
+        assert_eq!(
+            completion.usage,
+            Some(Usage {
+                input_tokens: 11,
+                output_tokens: 4,
+            })
+        );
     }
 
     #[test]

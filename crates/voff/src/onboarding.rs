@@ -1,4 +1,4 @@
-//! First-launch team builder.
+//! Interactive workspace setup and team builder.
 
 use crate::{config::MAX_OUTPUT_TOKENS, model_catalog::ModelCatalog};
 use crossterm::{
@@ -18,7 +18,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, FrameExt as _, Gauge, Paragraph, Wrap},
 };
 use ratatui_explorer::{FileExplorer, FileExplorerBuilder, Theme};
-use std::{io, panic, path::PathBuf};
+use std::{
+    io, panic,
+    path::{Path, PathBuf},
+};
 
 const MAX_DEVELOPERS: usize = 32;
 const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
@@ -786,11 +789,16 @@ fn suggested_name(role: DeveloperRole, index: usize) -> String {
     }
 }
 
-/// Run the first-launch setup. `None` means the user cancelled without writing.
-pub fn run(catalog: ModelCatalog, credential_available: bool) -> io::Result<Option<SetupDraft>> {
+/// Run workspace setup. `None` means the user cancelled without writing.
+pub fn run(
+    catalog: ModelCatalog,
+    credential_available: bool,
+    initial_workspace: &Path,
+) -> io::Result<Option<SetupDraft>> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut wizard = Wizard::new(catalog, credential_available);
+    wizard.working_directory = initial_workspace.to_path_buf();
     while !wizard.cancelled && !wizard.complete {
         terminal.draw(|frame| render(frame, &wizard))?;
         match event::read()? {
@@ -967,7 +975,7 @@ fn render_credential(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Paste it now, or press Enter to launch and add it later with a."),
+        Line::from("Paste it now, or press Enter to launch and add it later with A."),
         Line::from("Tokens are stored in the local .voff SQLite database—not config or logs."),
         Line::from(Span::styled(
             "OPENAI_API_KEY remains the non-interactive override.",

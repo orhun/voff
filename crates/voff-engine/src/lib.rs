@@ -23,6 +23,10 @@ pub enum EngineError {
     Provider(#[from] ProviderError),
     #[error("task is not runnable from {0:?}")]
     NotRunnable(TaskStatus),
+    #[error("task cannot be re-run from {0:?}")]
+    NotRetryable(TaskStatus),
+    #[error("task retry attempt limit reached")]
+    RetryLimitReached,
     #[error("task not found")]
     TaskNotFound,
     #[error("engine event channel closed")]
@@ -237,6 +241,44 @@ impl<R: Repository + 'static> Engine<R> {
         self.record(Some(t.id), CanonicalEventKind::TaskCreated)
             .await?;
         Ok(t)
+    }
+    /// Create a fresh persisted attempt without mutating the selected task's history.
+    pub async fn retry_task(&self, id: TaskId) -> Result<Task, EngineError> {
+        let previous = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
+        if !previous.status.can_retry() {
+            return Err(EngineError::NotRetryable(previous.status));
+        }
+        let attempt = previous
+            .attempt
+            .checked_add(1)
+            .ok_or(EngineError::RetryLimitReached)?;
+        let now = chrono::Utc::now();
+        let retry = Task {
+            id: TaskId::new(),
+            attempt,
+            retry_of: Some(previous.id),
+            parent: previous.parent,
+            owner: previous.owner,
+            objective: previous.objective,
+            acceptance_criteria: previous.acceptance_criteria,
+            limits: previous.limits,
+            depth: previous.depth,
+            status: TaskStatus::Queued,
+            result: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.repo.save_task(retry.clone()).await?;
+        self.record(
+            Some(retry.id),
+            CanonicalEventKind::TaskRetried {
+                previous: previous.id,
+                retry: retry.id,
+                attempt,
+            },
+        )
+        .await?;
+        Ok(retry)
     }
     /// Persist every item in a trusted application plan as a separate pending
     /// delegation approval. No child is dispatched until the user approves it.
@@ -1211,7 +1253,9 @@ impl<R: Repository + 'static> Engine<R> {
             .filter(|event| {
                 matches!(
                     event.kind,
-                    CanonicalEventKind::TaskCreated | CanonicalEventKind::TaskDelegated { .. }
+                    CanonicalEventKind::TaskCreated
+                        | CanonicalEventKind::TaskRetried { .. }
+                        | CanonicalEventKind::TaskDelegated { .. }
                 )
             })
             .filter_map(|event| event.task_id)
@@ -1645,6 +1689,75 @@ mod tests {
                 .any(|x| matches!(x.kind, CanonicalEventKind::TextDelta(_)))
         );
         while rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn retry_creates_a_new_audited_attempt_without_rewriting_history() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let session = SessionId::new();
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("done")),
+            session,
+            tx,
+        );
+        let original = engine
+            .create_task(AgentId::new(), "repeatable work", vec!["done".into()])
+            .await
+            .unwrap();
+        engine.mark_ready(original.id).await.unwrap();
+        engine.run_task(original.id).await.unwrap();
+
+        let retry = engine.retry_task(original.id).await.unwrap();
+
+        assert_ne!(retry.id, original.id);
+        assert_eq!(retry.retry_of, Some(original.id));
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.status, TaskStatus::Queued);
+        assert_eq!(retry.objective, original.objective);
+        assert_eq!(
+            repo.task(original.id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        assert!(repo.events(session).await.unwrap().iter().any(|event| {
+            matches!(
+                event.kind,
+                CanonicalEventKind::TaskRetried {
+                    previous,
+                    retry: retry_id,
+                    attempt: 2,
+                } if previous == original.id && retry_id == retry.id
+            )
+        }));
+
+        engine.mark_ready(retry.id).await.unwrap();
+        engine.run_task(retry.id).await.unwrap();
+        assert_eq!(
+            repo.task(retry.id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_an_active_attempt() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo,
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        );
+        let task = engine
+            .create_task(AgentId::new(), "active", vec![])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.retry_task(task.id).await,
+            Err(EngineError::NotRetryable(TaskStatus::Queued))
+        ));
     }
 
     #[tokio::test]

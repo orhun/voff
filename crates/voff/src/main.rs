@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{BufRead, BufWriter, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -24,51 +24,10 @@ use voff_core::{
     AgentId, AgentProfile, CanonicalEvent, CanonicalEventKind, EventId, FormationId, Session,
     SessionId, TaskStatus,
 };
-use voff_engine::DelegationProposal;
 use voff_provider::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
 use voff_tools::ScopedWorkspace;
-
-const DEFAULT_OBJECTIVE: &str = "Build a full-stack calculator through the Team Lead. Give every enabled specialist one explicit, non-overlapping delegated task. Backend Developer owns server.py: use only the Python standard library, serve the frontend, and implement POST /api/calculate with add, subtract, multiply, divide, numeric-input validation, JSON responses, and division-by-zero errors. Frontend Developer owns index.html: build an accessible calculator that calls /api/calculate and clearly displays loading, results, validation errors, and server errors. Other enabled specialists contribute role-appropriate review, validation, integration, or operational evidence without overlapping those files. Every delegated task must complete; the app must run with python3 server.py and require no external dependencies.";
-
-fn calculator_delegation_plan(objective: &str, agents: &[AgentProfile]) -> Vec<DelegationProposal> {
-    if objective != DEFAULT_OBJECTIVE {
-        return Vec::new();
-    }
-    let Some(backend) = agents
-        .iter()
-        .find(|agent| agent.role == "backend_developer")
-    else {
-        return Vec::new();
-    };
-    let Some(frontend) = agents
-        .iter()
-        .find(|agent| agent.role == "frontend_developer")
-    else {
-        return Vec::new();
-    };
-    vec![
-        DelegationProposal {
-            target_agent: backend.name.clone(),
-            objective: "Create server.py for the full-stack calculator. Use only the Python standard library, serve index.html, and implement POST /api/calculate for add, subtract, multiply, and divide with numeric-input validation, JSON responses, and division-by-zero errors. Own only server.py.".into(),
-            acceptance_criteria: vec![
-                "server.py is complete and runnable with python3 server.py".into(),
-                "POST /api/calculate returns JSON results for all four operations".into(),
-                "Invalid numbers, operations, JSON, and division by zero return clear errors".into(),
-            ],
-        },
-        DelegationProposal {
-            target_agent: frontend.name.clone(),
-            objective: "Create index.html for the full-stack calculator. Build an accessible browser interface that calls POST /api/calculate and clearly displays loading, results, client validation, and server errors. Own only index.html and do not implement arithmetic locally.".into(),
-            acceptance_criteria: vec![
-                "index.html provides inputs and controls for all four operations".into(),
-                "The interface calls /api/calculate and renders its JSON response".into(),
-                "Keyboard use, labels, loading state, and error feedback are present".into(),
-            ],
-        },
-    ]
-}
 
 #[derive(Parser)]
 #[command(
@@ -77,6 +36,9 @@ fn calculator_delegation_plan(objective: &str, agents: &[AgentProfile]) -> Vec<D
     about = "Provider-neutral terminal AI workspace"
 )]
 struct Cli {
+    /// Override the configured working directory and use its local voff state.
+    #[arg(long, global = true, value_name = "DIR")]
+    workspace: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -100,11 +62,6 @@ enum Command {
     Run {
         #[arg(long, default_value = ".voff/config.toml")]
         config: PathBuf,
-        #[arg(
-            long,
-            default_value = DEFAULT_OBJECTIVE
-        )]
-        objective: String,
         /// Resume the newest stored session instead of creating a clean session.
         #[arg(long)]
         resume: bool,
@@ -165,12 +122,8 @@ async fn application() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let first_launch = cli.command.is_none();
-    match cli.command.unwrap_or(Command::Run {
-        config: ".voff/config.toml".into(),
-        objective: DEFAULT_OBJECTIVE.into(),
-        resume: false,
-        session: None,
-    }) {
+    let workspace = cli.workspace;
+    match cli.command.unwrap_or_else(default_launch_command) {
         Command::Init {
             template,
             provider,
@@ -179,23 +132,26 @@ async fn application() -> Result<()> {
             output,
         } => init(template, provider, model, max_output_tokens, &output),
         Command::Run {
-            config,
-            objective,
+            mut config,
             resume,
             session,
         } => {
-            if first_launch && !config.exists() {
+            if first_launch {
+                let plan = bare_launch_plan(&config, workspace.as_deref())?;
+                config = plan.config_path.clone();
+                if !plan.needs_setup {
+                    return run(&config, workspace.as_deref(), resume, session).await;
+                }
                 if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                     anyhow::bail!(
-                        "first launch needs an interactive terminal; use 'voff init --template solo --provider ollama --model <MODEL>' for non-interactive setup"
+                        "workspace setup needs an interactive terminal; use 'voff init --template solo --provider ollama --model <MODEL>' for non-interactive setup"
                     );
                 }
-                let state_path = Config::default().state_path();
                 let credential_lookup = async {
-                    if !state_path.exists() {
+                    if !plan.state_path.is_file() {
                         return false;
                     }
-                    let Ok(repository) = SqliteRepository::open(&state_path).await else {
+                    let Ok(repository) = SqliteRepository::open(&plan.state_path).await else {
                         return false;
                     };
                     credential::resolve("OPENAI_API_KEY", &repository)
@@ -204,22 +160,87 @@ async fn application() -> Result<()> {
                 };
                 let (catalog, credential_available) =
                     tokio::join!(setup_model_catalog(), credential_lookup);
-                let Some(draft) = onboarding::run(catalog, credential_available)? else {
+                let Some(draft) =
+                    onboarding::run(catalog, credential_available, &plan.initial_workspace)?
+                else {
                     return Ok(());
                 };
-                let generated = config_from_setup(&draft)?;
+                let generated =
+                    apply_workspace_override(config_from_setup(&draft)?, workspace.as_deref())?;
+                write_setup_config(&generated, &plan.setup_output)?;
                 if let Some(token) = draft.openai_token {
                     let repository = SqliteRepository::open(&generated.state_path()).await?;
                     credential::store("OPENAI_API_KEY", &token, &repository).await?;
                 }
-                write_config_new(&generated, &config)?;
+                config = plan.setup_output;
             }
-            run(&config, objective, resume, session).await
+            run(&config, workspace.as_deref(), resume, session).await
         }
-        Command::Doctor { config } => doctor(&config).await,
-        Command::Export { config, output } => export(&config, &output).await,
-        Command::Sessions { config } => list_sessions(&config).await,
+        Command::Doctor { config } => doctor(&config, workspace.as_deref()).await,
+        Command::Export { config, output } => export(&config, workspace.as_deref(), &output).await,
+        Command::Sessions { config } => list_sessions(&config, workspace.as_deref()).await,
     }
+}
+
+fn default_launch_command() -> Command {
+    Command::Run {
+        config: ".voff/config.toml".into(),
+        resume: true,
+        session: None,
+    }
+}
+
+#[derive(Debug)]
+struct BareLaunchPlan {
+    config_path: PathBuf,
+    setup_output: PathBuf,
+    state_path: PathBuf,
+    initial_workspace: PathBuf,
+    needs_setup: bool,
+}
+
+fn bare_launch_plan(config_path: &Path, workspace: Option<&Path>) -> Result<BareLaunchPlan> {
+    let workspace_root = workspace
+        .map(|root| {
+            let root = std::fs::canonicalize(root).with_context(|| {
+                format!("workspace override is unavailable: {}", root.display())
+            })?;
+            anyhow::ensure!(
+                root.is_dir(),
+                "workspace override is not a directory: {}",
+                root.display()
+            );
+            Ok::<_, anyhow::Error>(root)
+        })
+        .transpose()?;
+    let local_config = workspace_root
+        .as_ref()
+        .map(|root| root.join(".voff/config.toml"));
+    let effective_config = local_config
+        .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| config_path.to_path_buf());
+    anyhow::ensure!(
+        !effective_config.exists() || effective_config.is_file(),
+        "configuration path is not a file: {}",
+        effective_config.display()
+    );
+    let config_exists = effective_config.is_file();
+    let config = apply_workspace_override(load(&effective_config)?, workspace_root.as_deref())?;
+    let state_path = config.state_path();
+    anyhow::ensure!(
+        !state_path.exists() || state_path.is_file(),
+        "workspace state path is not a file: {}",
+        state_path.display()
+    );
+    Ok(BareLaunchPlan {
+        config_path: effective_config,
+        setup_output: local_config.unwrap_or_else(|| config_path.to_path_buf()),
+        state_path: state_path.clone(),
+        initial_workspace: config.workspace.root,
+        needs_setup: !config_exists || !state_path.is_file(),
+    })
 }
 
 async fn setup_model_catalog() -> ModelCatalog {
@@ -322,6 +343,69 @@ fn write_config_new(config: &Config, output: &Path) -> Result<()> {
         .open(output)
         .with_context(|| format!("refusing to overwrite configuration: {}", output.display()))?;
     file.write_all(encoded.as_bytes())?;
+    Ok(())
+}
+
+fn write_setup_config(config: &Config, output: &Path) -> Result<()> {
+    if !output.exists() {
+        return write_config_new(config, output);
+    }
+    anyhow::ensure!(
+        output.is_file(),
+        "configuration path is not a file: {}",
+        output.display()
+    );
+    let encoded = toml::to_string_pretty(config)?;
+    let file_name = output
+        .file_name()
+        .context("configuration path must have a file name")?;
+    let mut backup_index = 0_u32;
+    let (backup_path, mut backup_file) = loop {
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(if backup_index == 0 {
+            ".bak".to_owned()
+        } else {
+            format!(".bak.{backup_index}")
+        });
+        let backup_path = output.with_file_name(backup_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(file) => break (backup_path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                backup_index = backup_index
+                    .checked_add(1)
+                    .context("too many configuration backups")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not preserve existing configuration: {}",
+                        output.display()
+                    )
+                });
+            }
+        }
+    };
+    let mut existing = File::open(output)?;
+    std::io::copy(&mut existing, &mut backup_file)?;
+    backup_file.flush()?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new().write(true).truncate(true).open(output)?;
+        file.write_all(encoded.as_bytes())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::copy(&backup_path, output);
+        return Err(error).with_context(|| {
+            format!(
+                "could not save setup configuration; previous contents are in {}",
+                backup_path.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -509,13 +593,33 @@ fn load(path: &Path) -> Result<Config> {
         Config::validate(Config::default()).context("built-in configuration failed")
     }
 }
+
+fn load_for_workspace(path: &Path, workspace: Option<&Path>) -> Result<Config> {
+    apply_workspace_override(load(path)?, workspace)
+}
+
+fn apply_workspace_override(mut config: Config, workspace: Option<&Path>) -> Result<Config> {
+    let Some(workspace) = workspace else {
+        return Ok(config);
+    };
+    let root = std::fs::canonicalize(workspace)
+        .with_context(|| format!("workspace override is unavailable: {}", workspace.display()))?;
+    anyhow::ensure!(
+        root.is_dir(),
+        "workspace override is not a directory: {}",
+        root.display()
+    );
+    config.workspace.root = root;
+    Config::validate(config).context("workspace override produced invalid configuration")
+}
+
 async fn run(
     path: &Path,
-    objective: String,
+    workspace: Option<&Path>,
     resume: bool,
     selected_session: Option<SessionId>,
 ) -> Result<()> {
-    let config = load(path)?;
+    let config = load_for_workspace(path, workspace)?;
     let default_provider = default_provider_id(&config);
     let repo = Arc::new(SqliteRepository::open(&config.state_path()).await?);
     let sessions = repo.sessions().await?;
@@ -529,9 +633,8 @@ async fn run(
                 )
             })?
     } else if resume && !sessions.is_empty() {
-        sessions
-            .into_iter()
-            .max_by_key(|session| session.created_at)
+        newest_session_with_tasks(repo.as_ref(), &sessions)
+            .await?
             .expect("non-empty checked")
     } else {
         let value = Session {
@@ -632,6 +735,12 @@ async fn run(
         .into_iter()
         .filter(|artifact| task_ids.contains(&artifact.producer))
         .collect();
+    let known_agents = repo
+        .agents()
+        .await?
+        .into_iter()
+        .map(|agent| (agent.id, agent))
+        .collect();
     let credential_slots = credential_slots(&config, repo.as_ref()).await;
     let credential_target = provider_routes(&config)
         .into_iter()
@@ -669,7 +778,6 @@ async fn run(
     })?;
     let workspace = ScopedWorkspace::new(&workspace_root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
-    let delegation_plan = calculator_delegation_plan(&objective, &agent_profiles);
     tui::run_configured(tui::ConfiguredRun {
         repo,
         provider,
@@ -694,8 +802,7 @@ async fn run(
         },
         agent_name,
         agent_profiles,
-        objective,
-        delegation_plan,
+        known_agents,
         initial_tasks: tasks,
         initial_events: events,
         initial_approvals: approvals,
@@ -719,8 +826,8 @@ async fn run(
     Ok(())
 }
 
-async fn list_sessions(path: &Path) -> Result<()> {
-    let config = load(path)?;
+async fn list_sessions(path: &Path, workspace: Option<&Path>) -> Result<()> {
+    let config = load_for_workspace(path, workspace)?;
     let repository = SqliteRepository::open(&config.state_path()).await?;
     let mut sessions = repository.sessions().await?;
     sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
@@ -773,8 +880,22 @@ async fn session_task_ids<R: Repository>(
         .filter_map(|event| event.task_id)
         .collect())
 }
-async fn doctor(path: &Path) -> Result<()> {
-    let config = load(path)?;
+
+async fn newest_session_with_tasks<R: Repository>(
+    repo: &R,
+    sessions: &[Session],
+) -> Result<Option<Session>> {
+    let mut newest_first = sessions.iter().collect::<Vec<_>>();
+    newest_first.sort_by_key(|session| std::cmp::Reverse(session.created_at));
+    for session in &newest_first {
+        if !session_task_ids(repo, session.id).await?.is_empty() {
+            return Ok(Some((*session).clone()));
+        }
+    }
+    Ok(newest_first.first().map(|session| (**session).clone()))
+}
+async fn doctor(path: &Path, workspace: Option<&Path>) -> Result<()> {
+    let config = load_for_workspace(path, workspace)?;
     println!("voff doctor");
     println!("[ok] config_version {}", config.config_version);
     println!(
@@ -842,8 +963,8 @@ struct DiagnosticBundle {
     dependencies: Vec<voff_core::TaskDependency>,
 }
 
-async fn export(path: &Path, output: &Path) -> Result<()> {
-    let config = load(path)?;
+async fn export(path: &Path, workspace: Option<&Path>, output: &Path) -> Result<()> {
+    let config = load_for_workspace(path, workspace)?;
     let repo = SqliteRepository::open(&config.state_path()).await?;
     let session = repo
         .sessions()
@@ -1087,40 +1208,143 @@ mod tests {
     }
 
     #[test]
-    fn default_calculator_requires_all_enabled_specialist_handoffs() {
-        let cli = Cli::try_parse_from(["voff", "run"]).unwrap();
-        let Some(Command::Run { objective, .. }) = cli.command else {
-            panic!("run command expected");
-        };
+    fn workspace_override_is_global_and_bare_launch_resumes() {
+        let before =
+            Cli::try_parse_from(["voff", "--workspace", "/tmp/project", "run", "--resume"])
+                .unwrap();
+        assert_eq!(before.workspace, Some(PathBuf::from("/tmp/project")));
+        assert!(matches!(
+            before.command,
+            Some(Command::Run { resume: true, .. })
+        ));
 
-        assert_eq!(objective, DEFAULT_OBJECTIVE);
-        assert!(objective.contains("every enabled specialist"));
-        assert!(objective.contains("Backend Developer owns server.py"));
-        assert!(objective.contains("Frontend Developer owns index.html"));
-        assert!(objective.contains("Every delegated task must complete"));
-        let profile = |name: &str, role: &str| AgentProfile {
-            id: AgentId::new(),
-            name: name.into(),
-            role: role.into(),
-            provider: "mock".into(),
-            model: "mock-v1".into(),
-            system_prompt: String::new(),
-            tools: vec![],
-            max_output_tokens: 4096,
-            enabled: true,
-            allowed_targets: vec![],
-            delegation_limits: None,
-        };
-        let plan = calculator_delegation_plan(
-            &objective,
-            &[
-                profile("API Specialist", "backend_developer"),
-                profile("UI Specialist", "frontend_developer"),
-            ],
+        let after = Cli::try_parse_from([
+            "voff",
+            "run",
+            "--workspace",
+            "/tmp/another-project",
+            "--resume",
+        ])
+        .unwrap();
+        assert_eq!(after.workspace, Some(PathBuf::from("/tmp/another-project")));
+        assert!(matches!(
+            default_launch_command(),
+            Command::Run {
+                resume: true,
+                session: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn workspace_override_retargets_local_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = apply_workspace_override(Config::default(), Some(directory.path())).unwrap();
+
+        assert_eq!(
+            config.workspace.root,
+            std::fs::canonicalize(directory.path()).unwrap()
         );
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].target_agent, "API Specialist");
-        assert_eq!(plan[1].target_agent, "UI Specialist");
+        assert_eq!(config.state_path(), directory.path().join(".voff/voff.db"));
+    }
+
+    #[test]
+    fn bare_launch_requires_setup_for_an_unrecognized_workspace() {
+        let invocation = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = invocation.path().join(".voff/config.toml");
+        write_config_new(&Config::default(), &config_path).unwrap();
+
+        let plan = bare_launch_plan(&config_path, Some(workspace.path())).unwrap();
+
+        assert!(plan.needs_setup);
+        assert_eq!(
+            plan.setup_output,
+            workspace.path().join(".voff/config.toml")
+        );
+        assert_eq!(plan.state_path, workspace.path().join(".voff/voff.db"));
+        assert_eq!(
+            plan.initial_workspace,
+            std::fs::canonicalize(workspace.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn bare_launch_recognizes_an_existing_workspace_database() {
+        let invocation = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = invocation.path().join(".voff/config.toml");
+        write_config_new(&Config::default(), &config_path).unwrap();
+        let state_path = workspace.path().join(".voff/voff.db");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        File::create(&state_path).unwrap();
+
+        let plan = bare_launch_plan(&config_path, Some(workspace.path())).unwrap();
+
+        assert!(!plan.needs_setup);
+        assert_eq!(plan.config_path, config_path);
+        assert_eq!(plan.state_path, state_path);
+    }
+
+    #[test]
+    fn setup_preserves_an_existing_configuration_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join(".voff/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "previous configuration\n").unwrap();
+        let mut config = Config::default();
+        config.workspace.root = directory.path().to_path_buf();
+        let config = Config::validate(config).unwrap();
+
+        write_setup_config(&config, &config_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(config_path.with_file_name("config.toml.bak")).unwrap(),
+            "previous configuration\n"
+        );
+        assert!(Config::load(&config_path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn resume_skips_newer_empty_sessions_when_task_history_exists() {
+        let repo = InMemoryRepository::default();
+        let older = Session {
+            id: SessionId::new(),
+            formation_id: FormationId::new(),
+            workspace: ".".into(),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+        };
+        let newer = Session {
+            id: SessionId::new(),
+            formation_id: FormationId::new(),
+            workspace: ".".into(),
+            created_at: chrono::Utc::now(),
+        };
+        repo.save_session(older.clone()).await.unwrap();
+        repo.save_session(newer.clone()).await.unwrap();
+        let task = Task::root(AgentId::new(), "persisted", vec![], TaskLimits::default());
+        repo.save_task(task.clone()).await.unwrap();
+        repo.append_event(CanonicalEvent {
+            id: EventId::new(),
+            session_id: older.id,
+            task_id: Some(task.id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::TaskCreated,
+        })
+        .await
+        .unwrap();
+
+        let selected = newest_session_with_tasks(&repo, &[older.clone(), newer])
+            .await
+            .unwrap();
+
+        assert_eq!(selected.map(|session| session.id), Some(older.id));
+    }
+
+    #[test]
+    fn run_rejects_the_removed_implicit_objective_argument() {
+        assert!(Cli::try_parse_from(["voff", "run", "--objective", "surprise work"]).is_err());
     }
 
     #[tokio::test]

@@ -24,6 +24,10 @@ cards and derives every edge from structured state:
 - connector edges carry no text; task objectives and textual status stay on
   owner cards while marker, color, stroke, and animation project route state.
 
+Each card renders its icon-labeled role identity once inside the border. A
+distinct custom agent name may appear alongside the role, but the border has no
+duplicated role title.
+
 When a runtime Team Lead is bound, voff renders exactly one connector per
 allowed specialist. The connector represents the mediated relationship in both
 directions: the lead assigns work and the specialist returns requests/results

@@ -32,7 +32,7 @@ Frontend-to-Backend relationship visible only through the two roles' shared
 Lead hub; no peer-to-peer edge or peer delegation authority exists. This is a
 projection of engine policy, not an editable authorization graph.
 
-After launch, `S` opens a `tui-popup` team-adjustment modal. The user may enable
+After launch, `S` opens a centered team-adjustment modal. The user may enable
 or disable an idle specialist for future assignments in the active runtime, or
 press `n` to add a Backend, Frontend, Full-stack, Reviewer, Tester, or DevOps
 specialist. A new specialist inherits the lead's provider, model, output limit,
@@ -46,19 +46,16 @@ provider, and model customization remains a config-and-restart operation;
 runtime-added preset membership applies to the active run and emits
 `AgentAdded`.
 
-The configured-run planner combines any required named workstreams with the
-live formation. It preserves those assignments when their targets are enabled,
-reassigns a required workstream to another enabled agent of the same role when
-possible, and gives every remaining enabled Team Lead target one unique
-role-specific support task. Disabled or unauthorized agents receive no task.
-The lead's child limit grows with safely added runtime members so the persisted
-approval queue can represent the full live team.
-
-Generated support tasks use unique top-level artifact names rather than
-assuming a `docs/` directory exists in an arbitrary target workspace. If tool
-proposal validation or workspace preparation fails before an approval is
-created, the engine records the failure and moves the task from `Running` to
-`Failed`; it must never leak an indefinitely active task.
+Launch and resume create no root work implicitly. The user submits an explicit
+`/task <objective>` or presses capital `R` for a predefined Quick Run objective,
+and the Team Lead decides whether to propose bounded child tasks for enabled,
+allowed specialists. Quick Run reconciles Markdown requirements with current
+source before planning, but uses the same persisted tasks and approval path as
+manual work. The lead's child limit grows with safely added runtime members so
+the persisted approval queue can represent the live team. If tool proposal
+validation or workspace preparation fails before an approval is created, the
+engine records the failure and moves the task from `Running` to `Failed`; it
+must never leak an indefinitely active task.
 
 ## Consequences
 

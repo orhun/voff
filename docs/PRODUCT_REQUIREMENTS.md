@@ -133,9 +133,16 @@ Acceptance:
 - Policy is checked before dispatch.
 - Root work and delegation decisions originate from the configured Team Lead;
   specialists return results to that coordinator.
-- A configured run assigns one non-overlapping child task to every enabled,
-  allowed specialist and waits for all assigned results.
+- Launch and resume create no implicit task; the user submits root work
+  explicitly with `/task <objective>` or capital `R` Quick Run.
+- Quick Run passes a predefined Markdown-analysis objective to the Team Lead,
+  persists the root task, exposes its child tasks in the task browser, and uses
+  the same delegation and side-effect approvals as manually submitted work.
+- The Team Lead may delegate bounded, non-overlapping children only to enabled,
+  allowed specialists and waits for every dispatched result.
 - The UI shows both tasks and their relationship.
+- Lowercase `r` in Tasks re-runs the selected terminal or blocked task as a new
+  persisted, correlated attempt without rewriting the prior attempt's status.
 - Child failure does not appear as successful parent completion.
 
 ### US-3 Use only one agent
