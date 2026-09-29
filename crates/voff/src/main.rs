@@ -1,16 +1,22 @@
 mod config;
+mod credential;
+mod model_catalog;
+mod onboarding;
 mod tui;
 
 use crate::config::{
-    Config, DelegationConfig, FormationAgentConfig, FormationConfig, ProviderConfig,
+    AgentConfig, Config, DelegationConfig, FormationAgentConfig, FormationConfig,
+    NamedProviderConfig, ProviderConfig,
 };
+use crate::model_catalog::ModelCatalog;
+use crate::onboarding::{DeveloperRole, ProviderChoice, SetupDraft};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
-    fs::OpenOptions,
-    io::{BufRead, BufWriter, Write},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufWriter, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -22,6 +28,7 @@ use voff_provider::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
 use voff_tools::ScopedWorkspace;
+
 #[derive(Parser)]
 #[command(
     name = "voff",
@@ -29,6 +36,9 @@ use voff_tools::ScopedWorkspace;
     about = "Provider-neutral terminal AI workspace"
 )]
 struct Cli {
+    /// Override the configured working directory and use its local voff state.
+    #[arg(long, global = true, value_name = "DIR")]
+    workspace: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -43,17 +53,15 @@ enum Command {
         provider: Option<InitProvider>,
         #[arg(long)]
         model: Option<String>,
+        /// Maximum output tokens generated per provider response.
+        #[arg(long)]
+        max_output_tokens: Option<u64>,
         #[arg(long, default_value = ".voff/config.toml")]
         output: PathBuf,
     },
     Run {
         #[arg(long, default_value = ".voff/config.toml")]
         config: PathBuf,
-        #[arg(
-            long,
-            default_value = "Inspect the workspace and report the most important next action."
-        )]
-        objective: String,
         /// Resume the newest stored session instead of creating a clean session.
         #[arg(long)]
         resume: bool,
@@ -112,36 +120,148 @@ async fn application() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
         .init();
-    match Cli::parse().command.unwrap_or(Command::Run {
-        config: ".voff/config.toml".into(),
-        objective: "Inspect the workspace and report the most important next action.".into(),
-        resume: false,
-        session: None,
-    }) {
+    let cli = Cli::parse();
+    let first_launch = cli.command.is_none();
+    let workspace = cli.workspace;
+    match cli.command.unwrap_or_else(default_launch_command) {
         Command::Init {
             template,
             provider,
             model,
+            max_output_tokens,
             output,
-        } => init(template, provider, model, &output),
+        } => init(template, provider, model, max_output_tokens, &output),
         Command::Run {
-            config,
-            objective,
+            mut config,
             resume,
             session,
-        } => run(&config, objective, resume, session).await,
-        Command::Doctor { config } => doctor(&config).await,
-        Command::Export { config, output } => export(&config, &output).await,
-        Command::Sessions { config } => list_sessions(&config).await,
+        } => {
+            if first_launch {
+                let plan = bare_launch_plan(&config, workspace.as_deref())?;
+                config = plan.config_path.clone();
+                if !plan.needs_setup {
+                    return run(&config, workspace.as_deref(), resume, session).await;
+                }
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    anyhow::bail!(
+                        "workspace setup needs an interactive terminal; use 'voff init --template solo --provider ollama --model <MODEL>' for non-interactive setup"
+                    );
+                }
+                let credential_lookup = async {
+                    if !plan.state_path.is_file() {
+                        return false;
+                    }
+                    let Ok(repository) = SqliteRepository::open(&plan.state_path).await else {
+                        return false;
+                    };
+                    credential::resolve("OPENAI_API_KEY", &repository)
+                        .await
+                        .is_ok()
+                };
+                let (catalog, credential_available) =
+                    tokio::join!(setup_model_catalog(), credential_lookup);
+                let Some(draft) =
+                    onboarding::run(catalog, credential_available, &plan.initial_workspace)?
+                else {
+                    return Ok(());
+                };
+                let generated =
+                    apply_workspace_override(config_from_setup(&draft)?, workspace.as_deref())?;
+                write_setup_config(&generated, &plan.setup_output)?;
+                if let Some(token) = draft.openai_token {
+                    let repository = SqliteRepository::open(&generated.state_path()).await?;
+                    credential::store("OPENAI_API_KEY", &token, &repository).await?;
+                }
+                config = plan.setup_output;
+            }
+            run(&config, workspace.as_deref(), resume, session).await
+        }
+        Command::Doctor { config } => doctor(&config, workspace.as_deref()).await,
+        Command::Export { config, output } => export(&config, workspace.as_deref(), &output).await,
+        Command::Sessions { config } => list_sessions(&config, workspace.as_deref()).await,
     }
+}
+
+fn default_launch_command() -> Command {
+    Command::Run {
+        config: ".voff/config.toml".into(),
+        resume: true,
+        session: None,
+    }
+}
+
+#[derive(Debug)]
+struct BareLaunchPlan {
+    config_path: PathBuf,
+    setup_output: PathBuf,
+    state_path: PathBuf,
+    initial_workspace: PathBuf,
+    needs_setup: bool,
+}
+
+fn bare_launch_plan(config_path: &Path, workspace: Option<&Path>) -> Result<BareLaunchPlan> {
+    let workspace_root = workspace
+        .map(|root| {
+            let root = std::fs::canonicalize(root).with_context(|| {
+                format!("workspace override is unavailable: {}", root.display())
+            })?;
+            anyhow::ensure!(
+                root.is_dir(),
+                "workspace override is not a directory: {}",
+                root.display()
+            );
+            Ok::<_, anyhow::Error>(root)
+        })
+        .transpose()?;
+    let local_config = workspace_root
+        .as_ref()
+        .map(|root| root.join(".voff/config.toml"));
+    let effective_config = local_config
+        .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| config_path.to_path_buf());
+    anyhow::ensure!(
+        !effective_config.exists() || effective_config.is_file(),
+        "configuration path is not a file: {}",
+        effective_config.display()
+    );
+    let config_exists = effective_config.is_file();
+    let config = apply_workspace_override(load(&effective_config)?, workspace_root.as_deref())?;
+    let state_path = config.state_path();
+    anyhow::ensure!(
+        !state_path.exists() || state_path.is_file(),
+        "workspace state path is not a file: {}",
+        state_path.display()
+    );
+    Ok(BareLaunchPlan {
+        config_path: effective_config,
+        setup_output: local_config.unwrap_or_else(|| config_path.to_path_buf()),
+        state_path: state_path.clone(),
+        initial_workspace: config.workspace.root,
+        needs_setup: !config_exists || !state_path.is_file(),
+    })
+}
+
+async fn setup_model_catalog() -> ModelCatalog {
+    let mut catalog = ModelCatalog::bundled().unwrap_or_default();
+    if let Ok(provider) = OllamaProvider::new("http://127.0.0.1:11434")
+        && let Ok(Ok(models)) =
+            tokio::time::timeout(std::time::Duration::from_millis(750), provider.models()).await
+    {
+        catalog.set_ollama_models(models);
+    }
+    catalog
 }
 
 fn init(
     template: Option<InitTemplate>,
     provider: Option<InitProvider>,
     model: Option<String>,
+    max_output_tokens: Option<u64>,
     output: &Path,
 ) -> Result<()> {
+    let interactive = template.is_none() || provider.is_none() || model.is_none();
     let template = match template {
         Some(template) => template,
         None => match prompt("Template [solo/team]", "solo")?.as_str() {
@@ -166,6 +286,13 @@ fn init(
         Some(model) => model,
         None => prompt("Model", default_model)?,
     };
+    let max_output_tokens = match max_output_tokens {
+        Some(value) => value,
+        None if interactive => prompt("Maximum output tokens", "4096")?
+            .parse()
+            .context("maximum output tokens must be a whole number")?,
+        None => 4096,
+    };
     let mut config = Config {
         provider: match provider {
             InitProvider::Ollama => ProviderConfig::Ollama {
@@ -179,6 +306,7 @@ fn init(
         },
         ..Config::default()
     };
+    config.agent.max_output_tokens = max_output_tokens;
     if matches!(template, InitTemplate::Team) {
         config.formation = Some(FormationConfig {
             name: "Lead, Implementer and Reviewer".into(),
@@ -186,18 +314,12 @@ fn init(
             max_parallel_tasks: 2,
         });
         config.agents = team_template();
+        for agent in &mut config.agents {
+            agent.max_output_tokens = max_output_tokens;
+        }
     }
     let config = Config::validate(config).context("generated configuration is invalid")?;
-    let encoded = toml::to_string_pretty(&config)?;
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-        .with_context(|| format!("refusing to overwrite configuration: {}", output.display()))?;
-    file.write_all(encoded.as_bytes())?;
+    write_config_new(&config, output)?;
     println!("[ok] configuration written to {}", output.display());
     match provider {
         InitProvider::Ollama => {
@@ -210,6 +332,210 @@ fn init(
     Ok(())
 }
 
+fn write_config_new(config: &Config, output: &Path) -> Result<()> {
+    let encoded = toml::to_string_pretty(config)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .with_context(|| format!("refusing to overwrite configuration: {}", output.display()))?;
+    file.write_all(encoded.as_bytes())?;
+    Ok(())
+}
+
+fn write_setup_config(config: &Config, output: &Path) -> Result<()> {
+    if !output.exists() {
+        return write_config_new(config, output);
+    }
+    anyhow::ensure!(
+        output.is_file(),
+        "configuration path is not a file: {}",
+        output.display()
+    );
+    let encoded = toml::to_string_pretty(config)?;
+    let file_name = output
+        .file_name()
+        .context("configuration path must have a file name")?;
+    let mut backup_index = 0_u32;
+    let (backup_path, mut backup_file) = loop {
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(if backup_index == 0 {
+            ".bak".to_owned()
+        } else {
+            format!(".bak.{backup_index}")
+        });
+        let backup_path = output.with_file_name(backup_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(file) => break (backup_path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                backup_index = backup_index
+                    .checked_add(1)
+                    .context("too many configuration backups")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not preserve existing configuration: {}",
+                        output.display()
+                    )
+                });
+            }
+        }
+    };
+    let mut existing = File::open(output)?;
+    std::io::copy(&mut existing, &mut backup_file)?;
+    backup_file.flush()?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new().write(true).truncate(true).open(output)?;
+        file.write_all(encoded.as_bytes())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::copy(&backup_path, output);
+        return Err(error).with_context(|| {
+            format!(
+                "could not save setup configuration; previous contents are in {}",
+                backup_path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn config_from_setup(setup: &SetupDraft) -> Result<Config> {
+    let first = setup
+        .developers
+        .first()
+        .context("the team must contain at least one developer")?;
+    anyhow::ensure!(
+        first.role == DeveloperRole::Lead,
+        "guided setup requires the first developer to be the Team Lead"
+    );
+    anyhow::ensure!(
+        setup
+            .developers
+            .iter()
+            .skip(1)
+            .all(|developer| developer.role != DeveloperRole::Lead),
+        "guided setup permits exactly one Team Lead"
+    );
+    let has_specialists = setup.developers.len() > 1;
+    let first_tools = tools_for(first.role, true, has_specialists);
+    let mut config = Config {
+        workspace: config::WorkspaceConfig {
+            root: setup.working_directory.clone(),
+            ..Config::default().workspace
+        },
+        provider: provider_from_choice(first.provider, &first.model),
+        agent: AgentConfig {
+            name: first.name.clone(),
+            role: first.role.config_role().into(),
+            system_prompt: if has_specialists {
+                first.role.prompt().into()
+            } else {
+                "Act as the required Team Lead and sole developer. Make explicit decisions, implement scoped changes directly, and return verified evidence."
+                    .into()
+            },
+            tools: first_tools,
+            max_output_tokens: first.max_output_tokens,
+        },
+        ..Config::default()
+    };
+    if setup.developers.len() == 1 {
+        return Config::validate(config).context("generated configuration is invalid");
+    }
+
+    let ids = (1..=setup.developers.len())
+        .map(|index| format!("developer-{index}"))
+        .collect::<Vec<_>>();
+    let mut seen_providers = HashSet::new();
+    config.providers = setup
+        .developers
+        .iter()
+        .filter_map(|developer| {
+            let id = developer.provider.id().to_owned();
+            seen_providers
+                .insert(id.clone())
+                .then(|| NamedProviderConfig {
+                    id,
+                    config: provider_from_choice(developer.provider, &developer.model),
+                })
+        })
+        .collect();
+    config.agents = setup
+        .developers
+        .iter()
+        .enumerate()
+        .map(|(index, developer)| FormationAgentConfig {
+            id: ids[index].clone(),
+            name: developer.name.clone(),
+            role: developer.role.config_role().into(),
+            system_prompt: developer.role.prompt().into(),
+            tools: tools_for(developer.role, index == 0, has_specialists),
+            provider: Some(developer.provider.id().into()),
+            model: Some(developer.model.clone()),
+            max_output_tokens: developer.max_output_tokens,
+            delegation: if index == 0 {
+                DelegationConfig {
+                    allowed_targets: ids.iter().skip(1).cloned().collect(),
+                    max_depth: 2,
+                    max_children: u16::try_from(setup.developers.len().saturating_sub(1))
+                        .unwrap_or(u16::MAX),
+                }
+            } else {
+                DelegationConfig::default()
+            },
+        })
+        .collect();
+    config.formation = Some(FormationConfig {
+        name: format!("{}-developer custom team", setup.developers.len()),
+        entry_agent: ids[0].clone(),
+        max_parallel_tasks: setup.developers.len().min(4),
+    });
+    Config::validate(config).context("generated configuration is invalid")
+}
+
+fn provider_from_choice(provider: ProviderChoice, model: &str) -> ProviderConfig {
+    match provider {
+        ProviderChoice::Ollama => ProviderConfig::Ollama {
+            base_url: "http://127.0.0.1:11434".into(),
+            model: model.into(),
+        },
+        ProviderChoice::OpenAi => ProviderConfig::Openai {
+            model: model.into(),
+            api_key_env: "OPENAI_API_KEY".into(),
+        },
+    }
+}
+
+fn tools_for(role: DeveloperRole, team_lead: bool, has_specialists: bool) -> Vec<String> {
+    let mut tools = role.tools();
+    if team_lead && has_specialists {
+        for tool in ["task.delegate", "review.request"] {
+            if !tools.iter().any(|configured| configured == tool) {
+                tools.push(tool.into());
+            }
+        }
+    } else {
+        tools.retain(|tool| !matches!(tool.as_str(), "task.delegate" | "review.request"));
+    }
+    if team_lead && !has_specialists {
+        for tool in ["file.patch", "process.test"] {
+            if !tools.iter().any(|configured| configured == tool) {
+                tools.push(tool.into());
+            }
+        }
+    }
+    tools
+}
+
 fn team_template() -> Vec<FormationAgentConfig> {
     vec![
         FormationAgentConfig {
@@ -220,6 +546,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             tools: vec!["file.read".into(), "search.text".into(), "task.delegate".into(), "review.request".into()],
             provider: None,
             model: None,
+            max_output_tokens: 4096,
             delegation: DelegationConfig { allowed_targets: vec!["implementer".into(), "reviewer".into()], max_depth: 2, max_children: 5 },
         },
         FormationAgentConfig {
@@ -230,6 +557,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             tools: vec!["file.read".into(), "search.text".into(), "file.patch".into(), "process.test".into()],
             provider: None,
             model: None,
+            max_output_tokens: 4096,
             delegation: DelegationConfig::default(),
         },
         FormationAgentConfig {
@@ -240,6 +568,7 @@ fn team_template() -> Vec<FormationAgentConfig> {
             tools: vec!["file.read".into(), "search.text".into(), "process.test".into()],
             provider: None,
             model: None,
+            max_output_tokens: 4096,
             delegation: DelegationConfig::default(),
         },
     ]
@@ -264,13 +593,33 @@ fn load(path: &Path) -> Result<Config> {
         Config::validate(Config::default()).context("built-in configuration failed")
     }
 }
+
+fn load_for_workspace(path: &Path, workspace: Option<&Path>) -> Result<Config> {
+    apply_workspace_override(load(path)?, workspace)
+}
+
+fn apply_workspace_override(mut config: Config, workspace: Option<&Path>) -> Result<Config> {
+    let Some(workspace) = workspace else {
+        return Ok(config);
+    };
+    let root = std::fs::canonicalize(workspace)
+        .with_context(|| format!("workspace override is unavailable: {}", workspace.display()))?;
+    anyhow::ensure!(
+        root.is_dir(),
+        "workspace override is not a directory: {}",
+        root.display()
+    );
+    config.workspace.root = root;
+    Config::validate(config).context("workspace override produced invalid configuration")
+}
+
 async fn run(
     path: &Path,
-    objective: String,
+    workspace: Option<&Path>,
     resume: bool,
     selected_session: Option<SessionId>,
 ) -> Result<()> {
-    let config = load(path)?;
+    let config = load_for_workspace(path, workspace)?;
     let default_provider = default_provider_id(&config);
     let repo = Arc::new(SqliteRepository::open(&config.state_path()).await?);
     let sessions = repo.sessions().await?;
@@ -284,9 +633,8 @@ async fn run(
                 )
             })?
     } else if resume && !sessions.is_empty() {
-        sessions
-            .into_iter()
-            .max_by_key(|session| session.created_at)
+        newest_session_with_tasks(repo.as_ref(), &sessions)
+            .await?
             .expect("non-empty checked")
     } else {
         let value = Session {
@@ -299,6 +647,7 @@ async fn run(
         value
     };
     let mut agent_profiles = Vec::new();
+    let mut agent_provider_kinds = HashMap::new();
     let owner = if let Some(formation) = &config.formation {
         let mut entry = None;
         let names = config
@@ -324,6 +673,7 @@ async fn run(
                     .unwrap_or_else(|| model_name(selected_provider)),
                 system_prompt: configured.system_prompt.clone(),
                 tools: configured.tools.clone(),
+                max_output_tokens: configured.max_output_tokens,
                 enabled: true,
                 allowed_targets: configured
                     .delegation
@@ -340,6 +690,7 @@ async fn run(
             if configured.id == formation.entry_agent {
                 entry = Some(profile.id);
             }
+            agent_provider_kinds.insert(profile.id, provider_name(selected_provider).into());
             repo.save_agent(profile.clone()).await?;
             agent_profiles.push(profile);
         }
@@ -353,15 +704,18 @@ async fn run(
             model: model_name(&config.provider),
             system_prompt: config.agent.system_prompt.clone(),
             tools: config.agent.tools.clone(),
+            max_output_tokens: config.agent.max_output_tokens,
             enabled: true,
             allowed_targets: vec![],
             delegation_limits: None,
         };
         let id = profile.id;
+        agent_provider_kinds.insert(profile.id, provider_name(&config.provider).into());
         repo.save_agent(profile.clone()).await?;
         agent_profiles.push(profile);
         id
     };
+    agent_profiles.sort_by_key(|agent| agent.id != owner);
     recover_interrupted(repo.as_ref(), session.id).await?;
     let events = repo.events(session.id).await?;
     let task_ids = events
@@ -381,7 +735,26 @@ async fn run(
         .into_iter()
         .filter(|artifact| task_ids.contains(&artifact.producer))
         .collect();
-    let providers = provider_registry(&config)?;
+    let known_agents = repo
+        .agents()
+        .await?
+        .into_iter()
+        .map(|agent| (agent.id, agent))
+        .collect();
+    let credential_slots = credential_slots(&config, repo.as_ref()).await;
+    let credential_target = provider_routes(&config)
+        .into_iter()
+        .find_map(|(_, configured)| {
+            if let ProviderConfig::Openai { api_key_env, .. } = configured {
+                credential_slots
+                    .get(api_key_env)
+                    .cloned()
+                    .map(|slot| (api_key_env.clone(), slot))
+            } else {
+                None
+            }
+        });
+    let providers = provider_registry(&config, &credential_slots)?;
     let provider = Arc::clone(
         providers
             .get(&default_provider)
@@ -397,7 +770,13 @@ async fn run(
         .find(|a| a.id == owner)
         .map(|a| a.model.clone())
         .unwrap_or_else(|| model_name(&config.provider));
-    let workspace = ScopedWorkspace::new(&config.workspace.root, 256 * 1024)?;
+    let workspace_root = std::fs::canonicalize(&config.workspace.root).with_context(|| {
+        format!(
+            "working directory is unavailable: {}",
+            config.workspace.root.display()
+        )
+    })?;
+    let workspace = ScopedWorkspace::new(&workspace_root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
     tui::run_configured(tui::ConfiguredRun {
         repo,
@@ -423,14 +802,14 @@ async fn run(
         },
         agent_name,
         agent_profiles,
-        objective,
+        known_agents,
         initial_tasks: tasks,
         initial_events: events,
         initial_approvals: approvals,
         initial_artifacts: artifacts,
         capacity: config.runtime.event_channel_capacity,
         workspace_context,
-        workspace_root: config.workspace.root,
+        workspace_root,
         max_parallel_tasks: config
             .formation
             .as_ref()
@@ -438,13 +817,17 @@ async fn run(
         input_cost_per_million: config.cost.input_per_million,
         output_cost_per_million: config.cost.output_per_million,
         cost_currency: config.cost.currency,
+        model_catalog: ModelCatalog::bundled().unwrap_or_default(),
+        agent_provider_kinds,
+        credential_target,
+        team_lead: owner,
     })
     .await?;
     Ok(())
 }
 
-async fn list_sessions(path: &Path) -> Result<()> {
-    let config = load(path)?;
+async fn list_sessions(path: &Path, workspace: Option<&Path>) -> Result<()> {
+    let config = load_for_workspace(path, workspace)?;
     let repository = SqliteRepository::open(&config.state_path()).await?;
     let mut sessions = repository.sessions().await?;
     sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
@@ -497,8 +880,22 @@ async fn session_task_ids<R: Repository>(
         .filter_map(|event| event.task_id)
         .collect())
 }
-async fn doctor(path: &Path) -> Result<()> {
-    let config = load(path)?;
+
+async fn newest_session_with_tasks<R: Repository>(
+    repo: &R,
+    sessions: &[Session],
+) -> Result<Option<Session>> {
+    let mut newest_first = sessions.iter().collect::<Vec<_>>();
+    newest_first.sort_by_key(|session| std::cmp::Reverse(session.created_at));
+    for session in &newest_first {
+        if !session_task_ids(repo, session.id).await?.is_empty() {
+            return Ok(Some((*session).clone()));
+        }
+    }
+    Ok(newest_first.first().map(|session| (**session).clone()))
+}
+async fn doctor(path: &Path, workspace: Option<&Path>) -> Result<()> {
+    let config = load_for_workspace(path, workspace)?;
     println!("voff doctor");
     println!("[ok] config_version {}", config.config_version);
     println!(
@@ -517,8 +914,9 @@ async fn doctor(path: &Path) -> Result<()> {
     );
     println!("[ok] scoped tools: {}", config.agent.tools.join(", "));
     println!("[ok] shell disabled; patch writes require digest check and explicit approval");
+    let slots = credential_slots(&config, &repo).await;
     for (id, configured) in provider_routes(&config) {
-        match provider(configured) {
+        match provider(configured, &slots) {
             Ok(selected) => {
                 let capabilities = selected.descriptor().capabilities;
                 println!(
@@ -546,7 +944,9 @@ async fn doctor(path: &Path) -> Result<()> {
             "[ok] estimated cost rates: {input}/{output} {} per 1M input/output tokens",
             config.cost.currency
         ),
-        _ => println!("[info] cost estimate disabled; configure both cost rates to enable"),
+        _ => println!(
+            "[ok] catalog cost estimates enabled where provider/model pricing is available"
+        ),
     }
     Ok(())
 }
@@ -563,8 +963,8 @@ struct DiagnosticBundle {
     dependencies: Vec<voff_core::TaskDependency>,
 }
 
-async fn export(path: &Path, output: &Path) -> Result<()> {
-    let config = load(path)?;
+async fn export(path: &Path, workspace: Option<&Path>, output: &Path) -> Result<()> {
+    let config = load_for_workspace(path, workspace)?;
     let repo = SqliteRepository::open(&config.state_path()).await?;
     let session = repo
         .sessions()
@@ -613,7 +1013,7 @@ async fn export(path: &Path, output: &Path) -> Result<()> {
             .collect(),
     };
     let mut value = serde_json::to_value(bundle)?;
-    redact_json(&mut value, &configured_secrets(&config));
+    redact_json(&mut value, &configured_secrets(&config, &repo).await);
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -632,15 +1032,17 @@ async fn export(path: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn configured_secrets(config: &Config) -> Vec<String> {
-    provider_routes(config)
-        .into_iter()
-        .filter_map(|(_, provider)| match provider {
-            ProviderConfig::Openai { api_key_env, .. } => std::env::var(api_key_env).ok(),
-            _ => None,
-        })
-        .filter(|secret| !secret.is_empty())
-        .collect()
+async fn configured_secrets(config: &Config, repository: &SqliteRepository) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for (_, provider) in provider_routes(config) {
+        if let ProviderConfig::Openai { api_key_env, .. } = provider
+            && let Ok(secret) = credential::resolve(api_key_env, repository).await
+            && !secret.is_empty()
+        {
+            secrets.push(secret);
+        }
+    }
+    secrets
 }
 
 fn redact_json(value: &mut serde_json::Value, secrets: &[String]) {
@@ -709,10 +1111,29 @@ fn provider_config<'a>(config: &'a Config, id: &str) -> Option<&'a ProviderConfi
         .find_map(|(candidate, provider)| (candidate == id).then_some(provider))
 }
 
-fn provider_registry(config: &Config) -> Result<HashMap<String, Arc<dyn ModelProvider>>> {
+async fn credential_slots(
+    config: &Config,
+    repository: &SqliteRepository,
+) -> HashMap<String, credential::CredentialSlot> {
+    let mut slots = HashMap::new();
+    for (_, configured) in provider_routes(config) {
+        if let ProviderConfig::Openai { api_key_env, .. } = configured
+            && !slots.contains_key(api_key_env)
+        {
+            let secret = credential::resolve(api_key_env, repository).await.ok();
+            slots.insert(api_key_env.clone(), credential::CredentialSlot::new(secret));
+        }
+    }
+    slots
+}
+
+fn provider_registry(
+    config: &Config,
+    credential_slots: &HashMap<String, credential::CredentialSlot>,
+) -> Result<HashMap<String, Arc<dyn ModelProvider>>> {
     provider_routes(config)
         .into_iter()
-        .map(|(id, configured)| Ok((id.to_owned(), provider(configured)?)))
+        .map(|(id, configured)| Ok((id.to_owned(), provider(configured, credential_slots)?)))
         .collect()
 }
 fn provider_name(value: &ProviderConfig) -> &'static str {
@@ -729,7 +1150,10 @@ fn model_name(value: &ProviderConfig) -> String {
         ProviderConfig::Openai { model, .. } => model.clone(),
     }
 }
-fn provider(value: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
+fn provider(
+    value: &ProviderConfig,
+    credential_slots: &HashMap<String, credential::CredentialSlot>,
+) -> Result<Arc<dyn ModelProvider>> {
     let inner: Arc<dyn ModelProvider> = match value {
         ProviderConfig::Mock => Arc::new(MockProvider::new(vec![
             MockStep::Event(voff_provider::ProviderEvent::TextDelta(
@@ -743,10 +1167,14 @@ fn provider(value: &ProviderConfig) -> Result<Arc<dyn ModelProvider>> {
         ])),
         ProviderConfig::Ollama { base_url, .. } => Arc::new(OllamaProvider::new(base_url.clone())?),
         ProviderConfig::Openai { api_key_env, .. } => {
-            let api_key = std::env::var(api_key_env).with_context(|| {
-                format!("OpenAI credential environment variable {api_key_env} is missing")
-            })?;
-            Arc::new(OpenAiProvider::new("https://api.openai.com", api_key)?)
+            let slot = credential_slots
+                .get(api_key_env)
+                .cloned()
+                .unwrap_or_default();
+            Arc::new(OpenAiProvider::new_deferred(
+                "https://api.openai.com",
+                Arc::new(move || slot.get()),
+            )?)
         }
     };
     Ok(Arc::new(ResilientProvider::new(
@@ -777,6 +1205,172 @@ mod tests {
             cli.command,
             Some(Command::Run { resume: false, .. })
         ));
+    }
+
+    #[test]
+    fn workspace_override_is_global_and_bare_launch_resumes() {
+        let before =
+            Cli::try_parse_from(["voff", "--workspace", "/tmp/project", "run", "--resume"])
+                .unwrap();
+        assert_eq!(before.workspace, Some(PathBuf::from("/tmp/project")));
+        assert!(matches!(
+            before.command,
+            Some(Command::Run { resume: true, .. })
+        ));
+
+        let after = Cli::try_parse_from([
+            "voff",
+            "run",
+            "--workspace",
+            "/tmp/another-project",
+            "--resume",
+        ])
+        .unwrap();
+        assert_eq!(after.workspace, Some(PathBuf::from("/tmp/another-project")));
+        assert!(matches!(
+            default_launch_command(),
+            Command::Run {
+                resume: true,
+                session: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn workspace_override_retargets_local_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = apply_workspace_override(Config::default(), Some(directory.path())).unwrap();
+
+        assert_eq!(
+            config.workspace.root,
+            std::fs::canonicalize(directory.path()).unwrap()
+        );
+        assert_eq!(config.state_path(), directory.path().join(".voff/voff.db"));
+    }
+
+    #[test]
+    fn bare_launch_requires_setup_for_an_unrecognized_workspace() {
+        let invocation = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = invocation.path().join(".voff/config.toml");
+        write_config_new(&Config::default(), &config_path).unwrap();
+
+        let plan = bare_launch_plan(&config_path, Some(workspace.path())).unwrap();
+
+        assert!(plan.needs_setup);
+        assert_eq!(
+            plan.setup_output,
+            workspace.path().join(".voff/config.toml")
+        );
+        assert_eq!(plan.state_path, workspace.path().join(".voff/voff.db"));
+        assert_eq!(
+            plan.initial_workspace,
+            std::fs::canonicalize(workspace.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn bare_launch_recognizes_an_existing_workspace_database() {
+        let invocation = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = invocation.path().join(".voff/config.toml");
+        write_config_new(&Config::default(), &config_path).unwrap();
+        let state_path = workspace.path().join(".voff/voff.db");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        File::create(&state_path).unwrap();
+
+        let plan = bare_launch_plan(&config_path, Some(workspace.path())).unwrap();
+
+        assert!(!plan.needs_setup);
+        assert_eq!(plan.config_path, config_path);
+        assert_eq!(plan.state_path, state_path);
+    }
+
+    #[test]
+    fn setup_preserves_an_existing_configuration_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join(".voff/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "previous configuration\n").unwrap();
+        let mut config = Config::default();
+        config.workspace.root = directory.path().to_path_buf();
+        let config = Config::validate(config).unwrap();
+
+        write_setup_config(&config, &config_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(config_path.with_file_name("config.toml.bak")).unwrap(),
+            "previous configuration\n"
+        );
+        assert!(Config::load(&config_path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn resume_skips_newer_empty_sessions_when_task_history_exists() {
+        let repo = InMemoryRepository::default();
+        let older = Session {
+            id: SessionId::new(),
+            formation_id: FormationId::new(),
+            workspace: ".".into(),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+        };
+        let newer = Session {
+            id: SessionId::new(),
+            formation_id: FormationId::new(),
+            workspace: ".".into(),
+            created_at: chrono::Utc::now(),
+        };
+        repo.save_session(older.clone()).await.unwrap();
+        repo.save_session(newer.clone()).await.unwrap();
+        let task = Task::root(AgentId::new(), "persisted", vec![], TaskLimits::default());
+        repo.save_task(task.clone()).await.unwrap();
+        repo.append_event(CanonicalEvent {
+            id: EventId::new(),
+            session_id: older.id,
+            task_id: Some(task.id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::TaskCreated,
+        })
+        .await
+        .unwrap();
+
+        let selected = newest_session_with_tasks(&repo, &[older.clone(), newer])
+            .await
+            .unwrap();
+
+        assert_eq!(selected.map(|session| session.id), Some(older.id));
+    }
+
+    #[test]
+    fn run_rejects_the_removed_implicit_objective_argument() {
+        assert!(Cli::try_parse_from(["voff", "run", "--objective", "surprise work"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn openai_credential_slot_loads_from_local_sqlite() {
+        let repository = SqliteRepository::open_in_memory().await.unwrap();
+        repository
+            .save_credential("VOFF_TEST_LOCAL_OPENAI", "sk-test-local")
+            .await
+            .unwrap();
+        let config = Config {
+            provider: ProviderConfig::Openai {
+                model: "gpt-5-mini".into(),
+                api_key_env: "VOFF_TEST_LOCAL_OPENAI".into(),
+            },
+            ..Config::default()
+        };
+
+        let slots = credential_slots(&config, &repository).await;
+
+        assert_eq!(
+            slots
+                .get("VOFF_TEST_LOCAL_OPENAI")
+                .and_then(credential::CredentialSlot::get)
+                .as_deref(),
+            Some("sk-test-local")
+        );
     }
 
     #[tokio::test]
@@ -839,6 +1433,7 @@ mod tests {
             Some(InitTemplate::Solo),
             Some(InitProvider::Openai),
             Some("gpt-test".into()),
+            Some(8192),
             &output,
         )
         .unwrap();
@@ -850,6 +1445,7 @@ mod tests {
                 ref api_key_env
             } if model == "gpt-test" && api_key_env == "OPENAI_API_KEY"
         ));
+        assert_eq!(config.agent.max_output_tokens, 8192);
         let contents = std::fs::read_to_string(&output).unwrap();
         assert!(!contents.contains("sk-"));
         assert!(
@@ -857,6 +1453,7 @@ mod tests {
                 Some(InitTemplate::Solo),
                 Some(InitProvider::Ollama),
                 Some("qwen3:4b".into()),
+                None,
                 &output
             )
             .is_err()
@@ -871,12 +1468,142 @@ mod tests {
             Some(InitTemplate::Team),
             Some(InitProvider::Ollama),
             Some("qwen3:4b".into()),
+            Some(16_384),
             &output,
         )
         .unwrap();
         let config = Config::load(&output).unwrap();
         assert_eq!(config.agents.len(), 3);
+        assert!(
+            config
+                .agents
+                .iter()
+                .all(|agent| agent.max_output_tokens == 16_384)
+        );
         assert_eq!(config.formation.unwrap().entry_agent, "lead");
+    }
+
+    #[test]
+    fn guided_setup_preserves_each_developers_provider_model_and_role() {
+        let setup = SetupDraft {
+            developers: vec![
+                onboarding::DeveloperDraft::new(
+                    "Ada",
+                    DeveloperRole::Lead,
+                    ProviderChoice::OpenAi,
+                    "gpt-lead",
+                    16_384,
+                ),
+                onboarding::DeveloperDraft::new(
+                    "Linus",
+                    DeveloperRole::Backend,
+                    ProviderChoice::Ollama,
+                    "qwen-backend",
+                    8192,
+                ),
+                onboarding::DeveloperDraft::new(
+                    "Grace",
+                    DeveloperRole::Reviewer,
+                    ProviderChoice::OpenAi,
+                    "gpt-review",
+                    4096,
+                ),
+            ],
+            working_directory: "/tmp/voff-guided-team".into(),
+            openai_token: Some("sk-must-never-be-serialized".into()),
+        };
+
+        let config = config_from_setup(&setup).unwrap();
+
+        assert_eq!(config.providers.len(), 2);
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.agents[0].model.as_deref(), Some("gpt-lead"));
+        assert_eq!(config.agents[1].model.as_deref(), Some("qwen-backend"));
+        assert_eq!(config.agents[2].model.as_deref(), Some("gpt-review"));
+        assert_eq!(config.agents[0].max_output_tokens, 16_384);
+        assert_eq!(config.agents[1].max_output_tokens, 8192);
+        assert_eq!(config.agents[1].role, "backend_developer");
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/voff-guided-team")
+        );
+        assert_eq!(
+            config.agents[0].delegation.allowed_targets,
+            vec!["developer-2", "developer-3"]
+        );
+        assert!(config.agents[0].tools.contains(&"task.delegate".into()));
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("sk-must-never-be-serialized")
+        );
+    }
+
+    #[test]
+    fn guided_solo_setup_uses_the_same_safe_configuration_path() {
+        let setup = SetupDraft {
+            developers: vec![onboarding::DeveloperDraft::new(
+                "Solo",
+                DeveloperRole::Lead,
+                ProviderChoice::Ollama,
+                "local-model",
+                2048,
+            )],
+            working_directory: ".".into(),
+            openai_token: None,
+        };
+
+        let config = config_from_setup(&setup).unwrap();
+
+        assert!(config.formation.is_none());
+        assert!(config.agents.is_empty());
+        assert_eq!(config.agent.name, "Solo");
+        assert_eq!(config.agent.max_output_tokens, 2048);
+        assert!(config.agent.tools.contains(&"file.patch".into()));
+        assert!(config.agent.tools.contains(&"process.test".into()));
+        assert!(!config.agent.tools.contains(&"task.delegate".into()));
+        assert!(matches!(
+            config.provider,
+            ProviderConfig::Ollama { ref model, .. } if model == "local-model"
+        ));
+    }
+
+    #[test]
+    fn guided_setup_rejects_missing_or_duplicate_team_leads() {
+        let specialist_only = SetupDraft {
+            developers: vec![onboarding::DeveloperDraft::new(
+                "Backend",
+                DeveloperRole::Backend,
+                ProviderChoice::Ollama,
+                "local-model",
+                2048,
+            )],
+            working_directory: ".".into(),
+            openai_token: None,
+        };
+        assert!(config_from_setup(&specialist_only).is_err());
+
+        let duplicate = SetupDraft {
+            developers: vec![
+                onboarding::DeveloperDraft::new(
+                    "Lead One",
+                    DeveloperRole::Lead,
+                    ProviderChoice::Ollama,
+                    "local-model",
+                    2048,
+                ),
+                onboarding::DeveloperDraft::new(
+                    "Lead Two",
+                    DeveloperRole::Lead,
+                    ProviderChoice::Ollama,
+                    "local-model",
+                    2048,
+                ),
+            ],
+            working_directory: ".".into(),
+            openai_token: None,
+        };
+        assert!(config_from_setup(&duplicate).is_err());
     }
 
     #[test]

@@ -81,6 +81,8 @@ Enable a user to configure one or more AI agents, assign them software-developme
 - Command palette for common operations.
 - Keyboard navigation, help overlay, pause/cancel and approval dialog.
 - Stream output without blocking rendering.
+- Show cross-role relationships as directional specialist-to-Lead-to-specialist
+  routes; never imply direct peer dispatch when policy requires mediation.
 
 ### FR-8 Persistence and recovery
 
@@ -114,6 +116,10 @@ As a user, I can assign arbitrary providers/models to arbitrary roles.
 Acceptance:
 
 - No role is tied to a provider in source code.
+- Guided setup requires exactly one entry Team Lead and keeps specialists from
+  acquiring peer-dispatch authority.
+- After setup, the user can add a safe preset specialist or change an idle
+  specialist's availability without changing Team Lead authority.
 - Invalid model/provider combinations are reported before session start.
 - The formation can be saved and loaded with no secrets included.
 
@@ -125,7 +131,18 @@ Acceptance:
 
 - The child task has parent, owner, objective and acceptance criteria.
 - Policy is checked before dispatch.
+- Root work and delegation decisions originate from the configured Team Lead;
+  specialists return results to that coordinator.
+- Launch and resume create no implicit task; the user submits root work
+  explicitly with `/task <objective>` or capital `R` Quick Run.
+- Quick Run passes a predefined Markdown-analysis objective to the Team Lead,
+  persists the root task, exposes its child tasks in the task browser, and uses
+  the same delegation and side-effect approvals as manually submitted work.
+- The Team Lead may delegate bounded, non-overlapping children only to enabled,
+  allowed specialists and waits for every dispatched result.
 - The UI shows both tasks and their relationship.
+- Lowercase `r` in Tasks re-runs the selected terminal or blocked task as a new
+  persisted, correlated attempt without rewriting the prior attempt's status.
 - Child failure does not appear as successful parent completion.
 
 ### US-3 Use only one agent

@@ -66,7 +66,10 @@ Do not rely only on string blocklists. Combine structured invocation, path resol
 
 ## 7. Secrets and privacy
 
-- Prefer OS keychain/secret service or environment references.
+- Prefer environment references. During the ADR 0019 transition, interactive
+  credentials may use the workspace-local SQLite table with mode `0600` on
+  Unix. It is plaintext at rest and must not be presented as production-grade
+  secret storage.
 - Redact known secret values and sensitive headers before persistence/rendering.
 - Avoid passing full environment maps to child processes.
 - Diagnostic exports are redacted and previewable.
@@ -92,7 +95,7 @@ Do not rely only on string blocklists. Combine structured invocation, path resol
 ## 10. Adapter and dependency security
 
 - Keep adapters least-privileged.
-- Pin and audit dependencies; use `cargo-deny` and automated advisories.
+- Pin and audit dependencies, and keep automated advisory reporting enabled.
 - For future dynamic plugins, require a versioned capability manifest and process/WASM isolation. Do not load arbitrary native libraries into the main process in MVP.
 - Publish checksums/signatures for releases when release automation is added.
 

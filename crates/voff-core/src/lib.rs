@@ -48,6 +48,11 @@ typed_id!(ApprovalId, "apr");
 typed_id!(ArtifactId, "art");
 typed_id!(EventId, "evt");
 
+/// Backward-compatible per-response generation limit for agent profiles.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4096;
+/// Hard safety ceiling for one provider response.
+pub const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
@@ -64,11 +69,17 @@ pub struct AgentProfile {
     pub model: String,
     pub system_prompt: String,
     pub tools: Vec<String>,
+    /// Maximum tokens the model may generate for one provider response.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u64,
     pub enabled: bool,
     #[serde(default)]
     pub allowed_targets: Vec<String>,
     #[serde(default)]
     pub delegation_limits: Option<TaskLimits>,
+}
+const fn default_max_output_tokens() -> u64 {
+    DEFAULT_MAX_OUTPUT_TOKENS
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
@@ -138,10 +149,21 @@ impl TaskStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    #[must_use]
+    pub const fn can_retry(self) -> bool {
+        self.is_terminal() || matches!(self, Self::Blocked)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
+    /// One-based execution attempt number. Older persisted tasks deserialize as attempt one.
+    #[serde(default = "first_task_attempt")]
+    pub attempt: u16,
+    /// The immediately preceding attempt when this task was explicitly re-run.
+    #[serde(default)]
+    pub retry_of: Option<TaskId>,
     pub parent: Option<TaskId>,
     pub owner: AgentId,
     pub objective: String,
@@ -164,6 +186,8 @@ impl Task {
         let now = Utc::now();
         Self {
             id: TaskId::new(),
+            attempt: first_task_attempt(),
+            retry_of: None,
             parent: None,
             owner,
             objective: objective.into(),
@@ -214,9 +238,18 @@ impl Task {
     }
 }
 
+const fn first_task_attempt() -> u16 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CanonicalEventKind {
     TaskCreated,
+    TaskRetried {
+        previous: TaskId,
+        retry: TaskId,
+        attempt: u16,
+    },
     TaskTransition {
         from: TaskStatus,
         to: TaskStatus,
@@ -267,6 +300,16 @@ pub enum CanonicalEventKind {
     TaskResultPublished {
         summary: String,
         evidence: Vec<ArtifactId>,
+    },
+    AgentAvailabilityChanged {
+        agent_id: AgentId,
+        name: String,
+        enabled: bool,
+    },
+    AgentAdded {
+        agent_id: AgentId,
+        name: String,
+        role: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +371,8 @@ impl TaskGraph {
         let now = Utc::now();
         let task = Task {
             id: TaskId::new(),
+            attempt: first_task_attempt(),
+            retry_of: None,
             parent: Some(parent),
             owner,
             objective: objective.into(),
@@ -402,6 +447,43 @@ impl TaskGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_agent_profiles_default_the_output_token_limit() {
+        let profile = AgentProfile {
+            id: AgentId::new(),
+            name: "Legacy".into(),
+            role: "developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "work".into(),
+            tools: vec![],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        let mut encoded = serde_json::to_value(profile).unwrap();
+        encoded.as_object_mut().unwrap().remove("max_output_tokens");
+
+        let restored: AgentProfile = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(restored.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn older_tasks_default_to_the_first_attempt() {
+        let task = Task::root(AgentId::new(), "legacy", vec![], TaskLimits::default());
+        let mut encoded = serde_json::to_value(task).unwrap();
+        let object = encoded.as_object_mut().unwrap();
+        object.remove("attempt");
+        object.remove("retry_of");
+
+        let restored: Task = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(restored.attempt, 1);
+        assert_eq!(restored.retry_of, None);
+    }
     #[test]
     fn transitions_validate() {
         let mut t = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());

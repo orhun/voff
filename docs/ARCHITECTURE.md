@@ -112,6 +112,10 @@ Responsibilities:
 - Enforce concurrency and budgets
 - Start/cancel provider runs
 - Validate structured tool/delegation requests
+- Bind the configured entry agent as Team Lead and reject root/delegation
+  decisions from specialists
+- Validate and register runtime specialists, updating only the Team Lead's
+  allowed-target set and persisting an audit event
 - Coordinate approvals
 - Emit canonical UI/storage events
 - Recover interrupted sessions
@@ -159,6 +163,10 @@ Suggested tables:
 - `AppModel`: UI projection only, derived from engine events.
 - `Action`: normalized keyboard/command intent.
 - `Effect`: async request sent to the engine.
+- `rataflow` owns interactive team-graph layout, routing and viewport state;
+  node and edge content remain projections of canonical voff state. One
+  connector represents each mediated Lead/specialist relationship without
+  creating peer-to-peer authority.
 - Render functions are pure and fast.
 - Background tasks send bounded events; coalesce high-frequency streaming deltas.
 - Virtualize long lists and cap in-memory scrollback.
@@ -176,6 +184,12 @@ Bottom: command input, shortcuts and status
 ## 12. Configuration precedence
 
 `CLI flags > environment references > workspace config > user config > built-in defaults`.
+
+Credential values use a narrower precedence: process/loaded `.env` value, then
+the workspace-local SQLite credential table. Configuration contains only the
+lookup name. The local database is mode `0600` on Unix, excluded from
+diagnostic exports, and is a temporary plaintext-at-rest compromise documented
+by ADR 0019.
 
 Secrets are resolved at runtime and are never serialized into a formation snapshot.
 

@@ -6,8 +6,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
+use voff_core::DEFAULT_MAX_OUTPUT_TOKENS;
 
 pub const CONFIG_VERSION: u16 = 1;
+pub use voff_core::MAX_OUTPUT_TOKENS;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -91,6 +93,9 @@ pub struct AgentConfig {
     pub role: String,
     pub system_prompt: String,
     pub tools: Vec<String>,
+    /// Maximum tokens the model may generate for one provider response.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FormationConfig {
@@ -110,6 +115,9 @@ pub struct FormationAgentConfig {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Maximum tokens the model may generate for one provider response.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u64,
     #[serde(default)]
     pub delegation: DelegationConfig,
 }
@@ -133,6 +141,9 @@ impl Default for DelegationConfig {
 }
 const fn default_parallel() -> usize {
     2
+}
+const fn default_max_output_tokens() -> u64 {
+    DEFAULT_MAX_OUTPUT_TOKENS
 }
 const fn default_depth() -> u16 {
     2
@@ -161,6 +172,7 @@ impl Default for Config {
                 role: "software_developer".into(),
                 system_prompt: "Follow repository rules and return verifiable results.".into(),
                 tools: vec!["file.read".into(), "search.text".into()],
+                max_output_tokens: default_max_output_tokens(),
             },
             formation: None,
             agents: vec![],
@@ -204,6 +216,8 @@ pub enum ConfigError {
     TargetNotFound(String),
     #[error("formation and agents must be configured together")]
     IncompleteFormation,
+    #[error("max_output_tokens must be between 1 and {MAX_OUTPUT_TOKENS}, got {0}")]
+    InvalidOutputTokenLimit(u64),
 }
 
 impl Config {
@@ -257,6 +271,7 @@ impl Config {
         if config.agent.role.trim().is_empty() {
             return Err(ConfigError::EmptyAgentField("role"));
         }
+        validate_output_tokens(config.agent.max_output_tokens)?;
         let allowed = HashSet::from([
             "file.read",
             "search.text",
@@ -319,6 +334,7 @@ impl Config {
                     {
                         return Err(ConfigError::EmptyAgentField("formation agent model"));
                     }
+                    validate_output_tokens(agent.max_output_tokens)?;
                 }
                 if !ids.contains(formation.entry_agent.as_str()) {
                     return Err(ConfigError::EntryAgentNotFound(
@@ -342,6 +358,14 @@ impl Config {
     #[must_use]
     pub fn state_path(&self) -> PathBuf {
         self.workspace.root.join(&self.workspace.state_file)
+    }
+}
+
+fn validate_output_tokens(value: u64) -> Result<(), ConfigError> {
+    if value == 0 || value > MAX_OUTPUT_TOKENS {
+        Err(ConfigError::InvalidOutputTokenLimit(value))
+    } else {
+        Ok(())
     }
 }
 
@@ -457,6 +481,32 @@ mod tests {
             Err(ConfigError::EmptyAgentField("provider.api_key_env"))
         ));
     }
+
+    #[test]
+    fn validates_and_defaults_output_token_limits() {
+        let encoded = toml::to_string(&Config::default()).unwrap();
+        let legacy = encoded
+            .lines()
+            .filter(|line| !line.starts_with("max_output_tokens"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let restored: Config = toml::from_str(&legacy).unwrap();
+        assert_eq!(restored.agent.max_output_tokens, 4096);
+
+        let mut zero = Config::default();
+        zero.agent.max_output_tokens = 0;
+        assert!(matches!(
+            Config::validate(zero),
+            Err(ConfigError::InvalidOutputTokenLimit(0))
+        ));
+
+        let mut excessive = Config::default();
+        excessive.agent.max_output_tokens = MAX_OUTPUT_TOKENS + 1;
+        assert!(matches!(
+            Config::validate(excessive),
+            Err(ConfigError::InvalidOutputTokenLimit(_))
+        ));
+    }
     #[test]
     fn validates_named_provider_routes_for_formation_agents() {
         let c = Config {
@@ -489,6 +539,7 @@ mod tests {
                 tools: vec![],
                 provider: Some("cloud".into()),
                 model: Some("gpt-5-mini".into()),
+                max_output_tokens: 8192,
                 delegation: DelegationConfig::default(),
             }],
             ..Config::default()
@@ -512,6 +563,7 @@ mod tests {
                     tools: vec!["task.delegate".into()],
                     provider: None,
                     model: None,
+                    max_output_tokens: 4096,
                     delegation: DelegationConfig {
                         allowed_targets: vec!["worker".into()],
                         ..DelegationConfig::default()
@@ -525,6 +577,7 @@ mod tests {
                     tools: vec!["file.patch".into(), "process.test".into()],
                     provider: None,
                     model: None,
+                    max_output_tokens: 2048,
                     delegation: DelegationConfig::default(),
                 },
             ],
@@ -548,6 +601,7 @@ mod tests {
                 tools: vec![],
                 provider: None,
                 model: None,
+                max_output_tokens: 4096,
                 delegation: DelegationConfig {
                     allowed_targets: vec!["missing".into()],
                     ..DelegationConfig::default()

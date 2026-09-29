@@ -12,35 +12,143 @@ and a keyboard-driven Ratatui interface.
 - macOS or Linux
 - Rust 1.91 or newer
 - Ollama when using local models
-- An OpenAI API key only when using the OpenAI provider
+- An OpenAI API key only when running OpenAI tasks (not to launch voff)
 
-## Quick start: local agent
+## Quick start: build your team
 
 ```bash
 git clone https://github.com/voffsh/voff.git
 cd voff
 ollama pull qwen3:4b
-cargo run -p voff -- init
+cargo run -p voff
 cargo run -p voff -- doctor
-cargo run -p voff -- run --objective "Inspect this repository and suggest the next safe improvement"
 ```
 
-`voff init` asks for a `solo` or `team` template, `ollama` or `openai`, and
-a model, then creates
-`.voff/config.toml`. It never asks for or stores an API key. For scripts and
-repeatable setup, use `--provider`, `--model`, and `--output`:
+Voff starts without an implicit task. Press Enter, then submit `/task
+<objective>` to create explicit work for the Team Lead, or press capital `R`
+for Quick Run. Nothing runs merely because the workspace opened or resumed.
+
+On first launch, or when a bare launch points at a workspace without its local
+`.voff/voff.db`, voff opens a quick team builder instead of silently creating
+an unrecognized workspace. With `--workspace`, setup stores that workspace's
+configuration at `<DIR>/.voff/config.toml` and preselects `<DIR>` as the working
+directory. One defaults page sets the developer count, working directory (`.`
+by default), and default output-token limit. Names and roles are
+suggested automatically; provider and model are selected only on each
+developer. The first developer is always the required Team Lead, and later
+developers can select specialist roles but cannot create a competing lead.
+Press Enter to accept a developer or adjust the available role, provider, or
+model choices. OpenAI models come from a
+bundled models.dev catalog with context and price metadata; installed Ollama
+models are discovered locally when Ollama is running.
+
+The workspace field opens a directory-only `ratatui-explorer` picker. Navigate
+with the arrow keys or `hjkl`, press `/` and type to filter directory names,
+and press Enter to choose the highlighted folder. Right/`l` opens the
+highlighted directory; Left/`h` returns to its parent, and Space chooses the
+currently displayed directory. Press Esc to finish or clear a filter, then
+again to return without changing the workspace.
+
+If the selected team uses OpenAI and no credential is configured, the builder
+offers an optional masked token field. Press Enter to skip it: a missing API
+token never blocks launch. In the workspace, press `A` to add it later without
+restarting. Values entered either way are stored in the workspace-local
+`.voff/voff.db`, never in `.voff/config.toml`, logs, prompts, or exports.
+
+The workspace includes a `ratatui-textarea` composer at the bottom, with the
+resolved working directory pinned to the bottom-right border. Press Enter or
+click the composer to start talking to the Team Lead. Enter sends once the
+composer is active, Shift+Enter inserts a newline and grows the composer, and
+Esc safely quits. Voff enables modifier-aware terminal input for Shift+Enter;
+Ctrl+J or Alt+Enter provides a fallback on terminals without that protocol.
+The editor soft-wraps long text and supports selection, word-wise navigation
+and deletion, scrolling, and Ctrl+Z/Ctrl+Y undo/redo.
+Plain text asks the Team Lead for a direct, tool-free response. `/task
+<objective>` gives executable work that the lead may delegate, while `/tasks`
+focuses the current task list. Both conversations and assignments become
+explicit, persisted root tasks, so their status and results remain inspectable.
+
+Capital `R` is the explicit Quick Run shortcut. It sends a predefined root task
+to the Team Lead to reconcile relevant Markdown requirements and TODOs with the
+current source, create a prioritized bounded plan, delegate independent work to
+enabled specialists, execute it, validate it, and integrate the evidence. Quick
+Run switches directly to Tasks and remains subject to normal approval prompts.
+In Tasks, lowercase `r` re-runs the selected completed, failed, cancelled, or
+blocked task as a new persisted attempt. The prior attempt remains unchanged
+and inspectable.
+
+Risky requests appear in one centered approval popup. When several requests are
+pending, use Up/Down to inspect them one at a time; `y` approves only the visible
+request once and `n` denies only that request. The action (for example,
+`file.patch`) is highlighted in yellow, while the approve/deny keys stay pinned
+to the popup's bottom border so long previews cannot hide them.
+
+The workspace uses `rataflow` to render every developer as a live status card.
+Every root-work and delegation decision is enforced through the Team Lead;
+specialists cannot dispatch work directly to one another. Every specialist has
+one relationship connector to the Lead, representing assignments out and
+requests/results back through the same coordination hub. Cross-role
+collaboration is therefore specialist → Lead → specialist, never a direct peer
+edge. Once a persisted child task crosses a route, its connector becomes bright
+and animates while work is running. Connectors
+intentionally carry no text so parallel routes
+remain scannable; the task objective and status stay inside the owning developer
+card. Running roles use a pulsing border, activity glyph, and `LIVE` status, so
+ownership becomes visible as explicit tasks run. Each card shows its role once inside the border, paired
+with the role icon; a distinct custom agent name appears alongside it without
+repeating the role as a title. Cards can be selected or repositioned with the mouse;
+clicking a role highlights its Team Lead-mediated connector in yellow. Drag
+empty graph space to pan, use `+`/`-` to zoom, `0` to reset zoom, and `f`
+to fit the team. Press `S` after setup to open the team popup. `n` adds another
+Backend, Frontend, Full-stack, Reviewer, Tester, or DevOps specialist using the
+Team Lead's provider/model defaults; Enter enables or disables the selected idle
+specialist. The Team Lead cannot be disabled, and a specialist with queued,
+running, or pending-approved work must finish or cancel it before availability
+changes. New specialists have no peer-delegation authority. The same status information remains available through text
+and symbols, so keyboard-only use and terminals without color remain supported.
+Token usage is costed per task owner and model from the same catalog. Explicit
+`[cost]` rates override catalog prices; unknown local prices stay visibly
+unconfigured rather than being treated as free.
+
+The Rataflow team view owns the full workspace center by default. Press `1` for
+Team or `2` for the task workspace; `Tab` toggles between them while the header
+and Team Lead composer remain visible. Tasks use a two-pane browser and
+inspector: `↑`/`↓` or `j`/`k` selects work, `s` shows its structured summary,
+and `a` shows task-scoped activity for the owning role. `PgUp`/`PgDn` scrolls long
+results and role activity. Press `e` for the session-wide event viewer without
+adding another permanent workspace tab. Tasks are ordered newest first. Event
+rows use `◆` for root tasks and indented `└─` connectors for delegated work so
+each task's activity remains visually connected to its hierarchy.
+
+Existing configurations skip the builder and open normally; there is no config
+migration. For scripts and repeatable setup, `voff init` remains available with
+`--provider`, `--model`, and `--output`:
 
 ```bash
 cargo run -p voff -- init \
   --template team \
   --provider ollama \
   --model qwen3:4b \
+  --max-output-tokens 8192 \
   --output .voff/config.toml
 ```
 
-Each `run` creates a clean session. Add `--resume` to reopen the newest stored
-session. Previous task histories remain available without being mixed into a
-new run.
+Launching `voff` without a subcommand reopens the newest task-bearing session
+when one exists. A bare launch recognizes a workspace only when it has usable
+configuration and its local `.voff/voff.db`; otherwise it opens setup. Use
+`--workspace` to select another working directory and its local state:
+
+```bash
+cargo run -p voff -- --workspace /path/to/project
+```
+
+An explicit `run` creates a clean session. Add `--resume` to reopen the newest
+task-bearing session, or select a stored session by ID. Global arguments work
+before or after the subcommand:
+
+```bash
+cargo run -p voff -- run --workspace /path/to/project --resume
+```
 
 List stored sessions and resume a specific one:
 
@@ -64,38 +172,37 @@ before sharing it because repository/model content is untrusted input.
 
 ## Heterogeneous OpenAI + Ollama team
 
-Keep credentials outside TOML files. Create an optional `.env` in the directory where you invoke
-voff (no parent directories are searched):
+Interactive setup and the workspace's `A` shortcut store the OpenAI API token
+in the local `.voff/voff.db`. For CI, scripts, or an explicit override, create an
+optional `.env` in the directory
+where you invoke voff (no parent directories are searched):
 
 ```dotenv
 OPENAI_API_KEY=YOUR_API_KEY
 ```
 
-Existing process environment variables override `.env`. OpenAI defaults to
-`OPENAI_API_KEY`; a custom `api_key_env` name works identically. Ollama needs
-no token. Never commit `.env`; it is ignored by Git. Malformed or unreadable
-files stop startup with a redacted error. Existing TOML configurations need
-no migration.
-
-Alternatively, on macOS, store the API key in Keychain:
-
-```bash
-security add-generic-password -U -a "$USER" -s "voff-openai" -w "YOUR_API_KEY"
-export OPENAI_API_KEY="$(security find-generic-password -a "$USER" -s "voff-openai" -w)"
-```
+Existing process variables override `.env`, which overrides the local database.
+OpenAI defaults to `OPENAI_API_KEY`; a custom `api_key_env` name works
+identically. Ollama needs no token. Never commit `.env`; it is ignored by Git.
+Malformed or unreadable files stop startup with a redacted error. Existing TOML
+configurations need no migration.
 
 Then validate and run the example formation:
 
 ```bash
 cargo run -p voff -- doctor --config .voff/heterogeneous.example.toml
-cargo run -p voff -- run \
-  --config .voff/heterogeneous.example.toml \
-  --objective "Analyze the project; delegate implementation and review to suitable agents"
+cargo run -p voff -- run --config .voff/heterogeneous.example.toml
 ```
 
+Once the workspace opens, use `/task <objective>` to submit the work you want
+the configured formation to perform.
+
 Delegations, patches, and test commands remain subject to explicit approval.
-Press `y` to approve once, `n` to deny, `e` to inspect events, `?` for help,
-and `q` to quit.
+Drag a developer card to arrange the team, click a card to select it, press `y`
+to approve once, `n` to deny, `S` to add or adjust specialists, `1`/`2` to
+switch workspace views, `s`/`a` to switch task summary and owner-role activity,
+`r` to re-run the selected terminal task, `R` for Quick Run, `f` to fit the team graph, `e` to inspect session events,
+`?` for help, and `q` to quit. All core actions remain keyboard-accessible.
 
 ## Development checks
 
@@ -103,7 +210,6 @@ and `q` to quit.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo deny check
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/ARCHITECTURE.md),
@@ -122,7 +228,10 @@ Provider contributors should start with
 ## Security
 
 Never commit API keys or place them in `.voff/*.toml`. Provider credentials
-are resolved from environment variables at runtime. voff does not grant
+are resolved from environment variables or the workspace-local SQLite database
+at runtime. The database stores the token as plaintext with workspace-local
+file permissions; treat `.voff/voff.db` as sensitive and do not share it.
+voff does not grant
 models unrestricted shell or filesystem access.
 
 ## License

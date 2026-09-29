@@ -53,7 +53,17 @@ pub struct CanonicalRequest {
     pub model: String,
     pub messages: Vec<CanonicalMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
     pub max_output_tokens: Option<u64>,
+}
+/// Provider-neutral control over whether a model may or must call tools.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ToolChoice {
+    /// Let the model choose between text and any available tool.
+    #[default]
+    Auto,
+    /// Require one of the named tools. A single name forces that exact tool.
+    Specific(Vec<String>),
 }
 #[derive(Clone, Debug)]
 pub struct ToolDefinition {
@@ -276,8 +286,10 @@ impl ModelProvider for ResilientProvider {
             let cancel = cancellation.clone();
             let run = tokio::spawn(async move { inner.start(req, attempt_tx, cancel).await });
             let mut emitted = false;
+            let mut emitted_tool_request = false;
             while let Some(event) = attempt_rx.recv().await {
                 emitted = true;
+                emitted_tool_request |= matches!(&event, ProviderEvent::ToolRequest(_));
                 sink.send(event).await.map_err(|_| ProviderError {
                     kind: ProviderErrorKind::Internal,
                     message: "event receiver closed".into(),
@@ -293,6 +305,15 @@ impl ModelProvider for ResilientProvider {
                 Ok(value) => {
                     self.success().await;
                     return Ok(value);
+                }
+                Err(error)
+                    if emitted_tool_request && error.kind == ProviderErrorKind::InvalidResponse =>
+                {
+                    // A structured tool proposal is already durable at the engine
+                    // boundary. A malformed trailing frame remains auditable, but
+                    // must not poison the shared route used to execute that tool.
+                    self.success().await;
+                    return Err(error);
                 }
                 Err(error)
                     if !emitted && retry_allowed(&error) && attempt < self.policy.max_attempts =>
@@ -334,6 +355,7 @@ pub mod contract {
                 content: "provider contract probe".into(),
             }],
             tools: vec![],
+            tool_choice: ToolChoice::Auto,
             max_output_tokens: Some(32),
         }
     }
@@ -482,6 +504,7 @@ mod tests {
             model: "x".into(),
             messages: vec![],
             tools: vec![],
+            tool_choice: ToolChoice::Auto,
             max_output_tokens: None,
         }
     }
@@ -562,5 +585,34 @@ mod tests {
                 .contains("circuit")
         );
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn valid_tool_output_does_not_poison_the_circuit_on_a_bad_terminal_frame() {
+        let inner = Arc::new(MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "file.patch".into(),
+                arguments_json: r#"{"path":"index.html","replacement":"ok"}"#.into(),
+            })),
+            MockStep::Fail("malformed terminal frame".into()),
+        ]));
+        let provider = ResilientProvider::new(inner, policy());
+
+        for _ in 0..4 {
+            let (tx, mut rx) = mpsc::channel(4);
+            let error = provider
+                .start(request(), tx, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+            assert!(matches!(
+                rx.recv().await,
+                Some(ProviderEvent::ToolRequest(_))
+            ));
+            let health = provider.health().await;
+            assert_eq!(health.circuit, CircuitStatus::Closed);
+            assert_eq!(health.consecutive_failures, 0);
+        }
     }
 }
