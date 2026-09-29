@@ -642,7 +642,7 @@ fn canonical_tool_name(name: &str) -> String {
     name.replace("__", ".")
 }
 
-async fn send(
+pub(crate) async fn send(
     sink: &ProviderEventSink,
     event: ProviderEvent,
     cancellation: &CancellationToken,
@@ -657,7 +657,7 @@ async fn send(
     }
 }
 
-fn cancelled() -> ProviderError {
+pub(crate) fn cancelled() -> ProviderError {
     ProviderError {
         kind: ProviderErrorKind::Cancelled,
         message: "request cancelled".into(),

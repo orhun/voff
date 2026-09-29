@@ -28,7 +28,7 @@
 
 - [ ] Verify every `.sha256` file.
 - [ ] Extract every archive and confirm it contains only the `voff` binary.
-- [ ] Run `voff --version` and `voff init --help` on the matching OS and
+- [ ] Run `voff --version`, `voff --help`, and `voff doctor --help` on the matching OS and
       architecture.
 - [ ] Confirm the binary reports `0.1.0-beta.1`.
 

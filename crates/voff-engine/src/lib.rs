@@ -97,6 +97,28 @@ pub struct DelegationProposal {
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
 }
+
+#[derive(Deserialize)]
+struct DelegationBatch {
+    proposals: Vec<DelegationProposal>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DelegationArguments {
+    Batch(DelegationBatch),
+    Single(DelegationProposal),
+}
+
+impl DelegationArguments {
+    fn into_proposals(self) -> Vec<DelegationProposal> {
+        match self {
+            Self::Batch(batch) => batch.proposals,
+            Self::Single(proposal) => vec![proposal],
+        }
+    }
+}
+
 impl<R: Repository + 'static> Engine<R> {
     #[must_use]
     pub fn new(
@@ -292,11 +314,6 @@ impl<R: Repository + 'static> Engine<R> {
         if task.status != TaskStatus::Ready {
             return Err(EngineError::NotRunnable(task.status));
         }
-        if proposals.is_empty() {
-            return Err(EngineError::InvalidDelegationPlan(
-                "at least one child task is required".into(),
-            ));
-        }
         let agent = self
             .repo
             .agent(task.owner)
@@ -307,53 +324,8 @@ impl<R: Repository + 'static> Engine<R> {
                 "task owner cannot delegate".into(),
             ));
         }
-        let existing_children = self
-            .repo
-            .tasks()
-            .await?
-            .into_iter()
-            .filter(|candidate| candidate.parent == Some(id))
-            .count();
-        if existing_children.saturating_add(proposals.len()) > usize::from(task.limits.max_children)
-        {
-            return Err(EngineError::InvalidDelegationPlan(format!(
-                "{} proposed children exceed the task limit of {}",
-                existing_children.saturating_add(proposals.len()),
-                task.limits.max_children
-            )));
-        }
-        if task.depth.saturating_add(1) > task.limits.max_delegation_depth {
-            return Err(EngineError::InvalidDelegationPlan(
-                "delegation depth limit reached".into(),
-            ));
-        }
-        for proposal in proposals {
-            if proposal.objective.trim().is_empty() {
-                return Err(EngineError::InvalidDelegationPlan(
-                    "child objective cannot be empty".into(),
-                ));
-            }
-            if !agent
-                .allowed_targets
-                .iter()
-                .any(|target| target == &proposal.target_agent)
-            {
-                return Err(EngineError::InvalidDelegationPlan(format!(
-                    "{} is not an allowed target",
-                    proposal.target_agent
-                )));
-            }
-            if !self
-                .delegation_target(&proposal.target_agent)
-                .await?
-                .is_some_and(|target| target.enabled)
-            {
-                return Err(EngineError::InvalidDelegationPlan(format!(
-                    "{} is not enabled in the current formation",
-                    proposal.target_agent
-                )));
-            }
-        }
+        self.validate_delegation_proposals(&task, &agent, proposals)
+            .await?;
 
         self.transition(id, TaskStatus::Running).await?;
         let mut approvals = Vec::with_capacity(proposals.len());
@@ -567,8 +539,16 @@ impl<R: Repository + 'static> Engine<R> {
         self.record(Some(id), CanonicalEventKind::ProviderStarted)
             .await?;
         let (tx, mut rx) = mpsc::channel(64);
+        let delegation_targets = self
+            .enabled_delegation_targets(&agent.allowed_targets)
+            .await?;
+        let delegation_target_names = delegation_targets
+            .iter()
+            .map(|target| target.name.clone())
+            .collect::<Vec<_>>();
         let must_delegate = mode == RunMode::Work
-            && !agent.allowed_targets.is_empty()
+            && !delegation_targets.is_empty()
+            && task.limits.max_children > 0
             && agent.tools.iter().any(|tool| tool == "task.delegate");
         let must_patch = mode == RunMode::Work
             && agent.allowed_targets.is_empty()
@@ -580,9 +560,10 @@ impl<R: Repository + 'static> Engine<R> {
             )
         } else if must_delegate {
             format!(
-                "{}\n\nYou are the coordinating lead. You must delegate every independently required workstream by calling task.delegate before doing any implementation. An objective may require multiple task.delegate calls to different agents; do not stop after the first when acceptance depends on more than one specialty. Do not return source code or implement the objective yourself. Every target_agent must be exactly one of: {}.",
+                "{}\n\nYou are the coordinating lead. Before doing implementation, decompose the objective into every independent workstream needed for a usable, verified result. Call task.delegate exactly once with a proposals array containing the complete bounded plan. Assign each workstream to the best-qualified enabled role; use distinct roles when the objective spans specialties, but do not invent filler work merely to use the whole team. Independent proposals will run concurrently after approval. Do not return source code or implement the objective yourself. You may propose at most {} children. Enabled targets:\n{}",
                 agent.system_prompt,
-                agent.allowed_targets.join(", ")
+                task.limits.max_children,
+                delegation_roster(&delegation_targets)
             )
         } else if agent.allowed_targets.is_empty() {
             if must_patch {
@@ -603,7 +584,11 @@ impl<R: Repository + 'static> Engine<R> {
         let tools = if mode == RunMode::Conversation {
             Vec::new()
         } else {
-            tool_definitions(&agent.tools, &agent.allowed_targets)
+            tool_definitions(
+                &agent.tools,
+                &delegation_target_names,
+                task.limits.max_children,
+            )
         };
         let tool_choice = if must_delegate {
             ToolChoice::Specific(vec!["task.delegate".into()])
@@ -674,6 +659,67 @@ impl<R: Repository + 'static> Engine<R> {
                         .await?;
                         continue;
                     }
+                    if is_delegation {
+                        if self.require_team_lead(agent.id).is_err() {
+                            self.record(
+                                Some(id),
+                                CanonicalEventKind::ProviderFailed(
+                                    "delegation denied: route the decision through the Team Lead"
+                                        .into(),
+                                ),
+                            )
+                            .await?;
+                            self.transition(id, TaskStatus::Blocked).await?;
+                            waiting_approval = true;
+                            continue;
+                        }
+                        let proposals = if request.name == "task.delegate" {
+                            serde_json::from_str::<DelegationArguments>(&request.arguments_json)?
+                                .into_proposals()
+                        } else {
+                            vec![serde_json::from_str::<DelegationProposal>(
+                                &request.arguments_json,
+                            )?]
+                        };
+                        if let Err(error) = self
+                            .validate_delegation_proposals(&task, &agent, &proposals)
+                            .await
+                        {
+                            self.record(
+                                Some(id),
+                                CanonicalEventKind::ProviderFailed(error.to_string()),
+                            )
+                            .await?;
+                            self.transition(id, TaskStatus::Blocked).await?;
+                            waiting_approval = true;
+                            continue;
+                        }
+                        for (index, proposal) in proposals.into_iter().enumerate() {
+                            let tool_call_id = if index == 0 {
+                                request.id
+                            } else {
+                                ToolCallId::new()
+                            };
+                            self.record(
+                                Some(id),
+                                CanonicalEventKind::ToolProposed {
+                                    tool_call_id,
+                                    name: request.name.clone(),
+                                },
+                            )
+                            .await?;
+                            self.request_approval(
+                                id,
+                                tool_call_id,
+                                request.name.clone(),
+                                ".".into(),
+                                serde_json::to_string(&proposal)?,
+                            )
+                            .await?;
+                        }
+                        waiting_approval = true;
+                        continue;
+                    }
                     self.record(
                         Some(id),
                         CanonicalEventKind::ToolProposed {
@@ -711,44 +757,6 @@ impl<R: Repository + 'static> Engine<R> {
                             let args: TestArguments =
                                 serde_json::from_str(&request.arguments_json)?;
                             command_spec(&args.command, Path::new("."))?;
-                        }
-                        "task.delegate" | "review.request" => {
-                            if self.require_team_lead(agent.id).is_err() {
-                                self.record(
-                                    Some(id),
-                                    CanonicalEventKind::ProviderFailed(
-                                        "delegation denied: route the decision through the Team Lead"
-                                            .into(),
-                                    ),
-                                )
-                                .await?;
-                                self.transition(id, TaskStatus::Blocked).await?;
-                                waiting_approval = true;
-                                continue;
-                            }
-                            let args: DelegationProposal =
-                                serde_json::from_str(&request.arguments_json)?;
-                            let target_exists = self
-                                .delegation_target(&args.target_agent)
-                                .await?
-                                .is_some_and(|agent| agent.enabled);
-                            let target_allowed = agent
-                                .allowed_targets
-                                .iter()
-                                .any(|name| name == &args.target_agent);
-                            if !target_exists || !target_allowed || args.objective.trim().is_empty()
-                            {
-                                self.record(
-                                    Some(id),
-                                    CanonicalEventKind::ProviderFailed(
-                                        "invalid delegation target or objective".into(),
-                                    ),
-                                )
-                                .await?;
-                                self.transition(id, TaskStatus::Blocked).await?;
-                                waiting_approval = true;
-                                continue;
-                            }
                         }
                         _ => {
                             self.record(
@@ -1262,6 +1270,95 @@ impl<R: Repository + 'static> Engine<R> {
             .collect())
     }
 
+    async fn enabled_delegation_targets(
+        &self,
+        allowed_targets: &[String],
+    ) -> Result<Vec<AgentProfile>, EngineError> {
+        let agents = self.repo.agents().await?;
+        Ok(allowed_targets
+            .iter()
+            .filter_map(|name| {
+                agents
+                    .iter()
+                    .find(|agent| agent.enabled && agent.name == *name)
+                    .cloned()
+            })
+            .collect())
+    }
+
+    async fn validate_delegation_proposals(
+        &self,
+        task: &Task,
+        agent: &AgentProfile,
+        proposals: &[DelegationProposal],
+    ) -> Result<(), EngineError> {
+        if proposals.is_empty() {
+            return Err(EngineError::InvalidDelegationPlan(
+                "at least one child task is required".into(),
+            ));
+        }
+        if task.depth.saturating_add(1) > task.limits.max_delegation_depth {
+            return Err(EngineError::InvalidDelegationPlan(
+                "delegation depth limit reached".into(),
+            ));
+        }
+        let existing_children = self
+            .repo
+            .tasks()
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.parent == Some(task.id))
+            .count();
+        let pending_children = self
+            .repo
+            .approvals(self.session)
+            .await?
+            .into_iter()
+            .filter(|approval| {
+                approval.task_id == task.id
+                    && approval.decision == ApprovalDecision::Pending
+                    && matches!(approval.action.as_str(), "task.delegate" | "review.request")
+            })
+            .count();
+        let proposed_children = existing_children
+            .saturating_add(pending_children)
+            .saturating_add(proposals.len());
+        if proposed_children > usize::from(task.limits.max_children) {
+            return Err(EngineError::InvalidDelegationPlan(format!(
+                "{proposed_children} proposed children exceed the task limit of {}",
+                task.limits.max_children
+            )));
+        }
+        for proposal in proposals {
+            if proposal.objective.trim().is_empty() {
+                return Err(EngineError::InvalidDelegationPlan(
+                    "child objective cannot be empty".into(),
+                ));
+            }
+            if !agent
+                .allowed_targets
+                .iter()
+                .any(|target| target == &proposal.target_agent)
+            {
+                return Err(EngineError::InvalidDelegationPlan(format!(
+                    "{} is not an allowed target",
+                    proposal.target_agent
+                )));
+            }
+            if !self
+                .delegation_target(&proposal.target_agent)
+                .await?
+                .is_some_and(|target| target.enabled)
+            {
+                return Err(EngineError::InvalidDelegationPlan(format!(
+                    "{} is not enabled in the current formation",
+                    proposal.target_agent
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn delegation_target(&self, name: &str) -> Result<Option<AgentProfile>, EngineError> {
         if let Some(id) = self.formation_agents.read().await.get(name).copied() {
             return Ok(self.repo.agent(id).await?);
@@ -1439,14 +1536,70 @@ fn command_spec(command: &str, cwd: &Path) -> Result<CommandSpec, EngineError> {
         output_limit: 256 * 1024,
     })
 }
-fn tool_definitions(names: &[String], allowed_targets: &[String]) -> Vec<ToolDefinition> {
+fn delegation_roster(targets: &[AgentProfile]) -> String {
+    targets
+        .iter()
+        .map(|target| {
+            format!(
+                "- {} — role: {}; capabilities: {}",
+                target.name,
+                target.role,
+                target.tools.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_definitions(
+    names: &[String],
+    allowed_targets: &[String],
+    max_delegations: u16,
+) -> Vec<ToolDefinition> {
     names.iter().filter_map(|name| match name.as_str() {
         "file.patch" => Some(ToolDefinition { name: name.clone(), description: "Propose creating or replacing one workspace text file; user approval and base-digest validation are mandatory.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
         "process.test" => Some(ToolDefinition { name: name.clone(), description: "Propose a scoped Cargo verification command; user approval is mandatory.".into(), input_schema: r#"{"type":"object","properties":{"command":{"type":"string","enum":["cargo test","cargo check","cargo clippy","cargo fmt --check"]}},"required":["command"]}"#.into() }),
-        "task.delegate" => Some(delegation_tool(name, "Propose one bounded child task for an enabled target agent. Call it once for each independent workstream required by the objective; every call requires user approval.", allowed_targets)),
-        "review.request" => Some(delegation_tool(name, "Request review by delegating a bounded evidence review task.", allowed_targets)),
+        "task.delegate" if !allowed_targets.is_empty() && max_delegations > 0 => Some(delegation_plan_tool(name, allowed_targets, max_delegations)),
+        "review.request" if !allowed_targets.is_empty() => Some(delegation_tool(name, "Request review by delegating a bounded evidence review task.", allowed_targets)),
         _ => None,
     }).collect()
+}
+
+fn delegation_plan_tool(
+    name: &str,
+    allowed_targets: &[String],
+    max_delegations: u16,
+) -> ToolDefinition {
+    ToolDefinition {
+        name: name.into(),
+        description: format!(
+            "Propose the complete bounded child-task plan in one call. Put one independently approvable workstream in each proposals item and assign it to the best-qualified enabled target. Independent items can run concurrently. Exact target_agent values: {}.",
+            allowed_targets.join(", ")
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "proposals": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": max_delegations,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target_agent": {"type": "string", "enum": allowed_targets},
+                            "objective": {"type": "string"},
+                            "acceptance_criteria": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["target_agent", "objective", "acceptance_criteria"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["proposals"],
+            "additionalProperties": false
+        })
+        .to_string(),
+    }
 }
 
 fn delegation_tool(name: &str, description: &str, allowed_targets: &[String]) -> ToolDefinition {
@@ -1519,12 +1672,14 @@ mod tests {
         let tools = tool_definitions(
             &["task.delegate".into()],
             &["Local Implementer".into(), "Cloud Reviewer".into()],
+            2,
         );
         let schema: serde_json::Value = serde_json::from_str(&tools[0].input_schema).unwrap();
         assert_eq!(
-            schema["properties"]["target_agent"]["enum"],
+            schema["properties"]["proposals"]["items"]["properties"]["target_agent"]["enum"],
             serde_json::json!(["Local Implementer", "Cloud Reviewer"])
         );
+        assert_eq!(schema["properties"]["proposals"]["maxItems"], 2);
         assert!(tools[0].description.contains("Local Implementer"));
     }
 
@@ -1824,6 +1979,23 @@ mod tests {
                 delegation_limits: None,
             };
             repo.save_agent(owner.clone()).await.unwrap();
+            if name == "Lead" {
+                repo.save_agent(AgentProfile {
+                    id: AgentId::new(),
+                    name: "Developer".into(),
+                    role: "software_developer".into(),
+                    provider: "recording".into(),
+                    model: "test-model".into(),
+                    system_prompt: "implement".into(),
+                    tools: vec!["file.patch".into()],
+                    max_output_tokens: 4096,
+                    enabled: true,
+                    allowed_targets: vec![],
+                    delegation_limits: None,
+                })
+                .await
+                .unwrap();
+            }
             let recorded_choice = Arc::new(Mutex::new(None));
             let provider: Arc<dyn ModelProvider> = Arc::new(RequestRecorder {
                 max_output_tokens: Arc::new(Mutex::new(None)),
@@ -2318,6 +2490,116 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert!(children.iter().any(|task| task.owner == backend.id));
         assert!(children.iter().any(|task| task.owner == frontend.id));
+    }
+
+    #[tokio::test]
+    async fn provider_batch_delegation_creates_one_approval_per_role() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let lead = AgentProfile {
+            id: AgentId::new(),
+            name: "Team Lead".into(),
+            role: "technical_lead".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "coordinate specialists".into(),
+            tools: vec!["task.delegate".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec!["Backend Developer".into(), "Frontend Developer".into()],
+            delegation_limits: Some(TaskLimits {
+                max_delegation_depth: 2,
+                max_children: 2,
+                max_duration_seconds: 300,
+            }),
+        };
+        let backend = AgentProfile {
+            id: AgentId::new(),
+            name: "Backend Developer".into(),
+            role: "backend_developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "build backend".into(),
+            tools: vec!["file.patch".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        let frontend = AgentProfile {
+            id: AgentId::new(),
+            name: "Frontend Developer".into(),
+            role: "frontend_developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "build frontend".into(),
+            tools: vec!["file.patch".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        for agent in [&lead, &backend, &frontend] {
+            repo.save_agent(agent.clone()).await.unwrap();
+        }
+        let arguments = serde_json::json!({
+            "proposals": [
+                {
+                    "target_agent": backend.name.clone(),
+                    "objective": "Build the API",
+                    "acceptance_criteria": ["API contract passes"]
+                },
+                {
+                    "target_agent": frontend.name.clone(),
+                    "objective": "Build the interface",
+                    "acceptance_criteria": ["Interface calls the API"]
+                }
+            ]
+        });
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "task.delegate".into(),
+                arguments_json: arguments.to_string(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(64);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_formation_agents(&[lead.clone(), backend.clone(), frontend.clone()])
+            .with_team_lead(lead.id);
+        let root = engine
+            .create_task(lead.id, "Build a full-stack app", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(root.id).await.unwrap();
+
+        engine.run_task(root.id).await.unwrap();
+
+        let approvals = repo
+            .approvals(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|approval| approval.task_id == root.id)
+            .collect::<Vec<_>>();
+        assert_eq!(approvals.len(), 2);
+        let targets = approvals
+            .iter()
+            .map(|approval| {
+                serde_json::from_str::<DelegationProposal>(&approval.reason)
+                    .unwrap()
+                    .target_agent
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            targets,
+            HashSet::from(["Backend Developer".into(), "Frontend Developer".into()])
+        );
+        assert_eq!(
+            repo.task(root.id).await.unwrap().unwrap().status,
+            TaskStatus::WaitingApproval
+        );
     }
 
     #[tokio::test]

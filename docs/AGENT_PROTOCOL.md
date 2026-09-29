@@ -38,30 +38,33 @@ The engine generates trusted IDs and timestamps when accepting provider output. 
 - `task_failure`
 - `task_blocked`
 
-## 4. Delegation proposal
+## 4. Delegation plan
 
-Required payload:
+The coordinating agent submits the complete bounded plan in one structured
+`task.delegate` call. Each item remains a separate persisted task and a
+separate approval action:
 
 ```json
 {
-  "target_agent_id": "agt_backend",
-  "title": "Implement persistence repository",
-  "objective": "Add the repository required by the parent task",
-  "acceptance_criteria": [
-    "Repository contract tests pass",
-    "No provider-specific types enter core"
-  ],
-  "dependencies": [],
-  "requested_tools": ["file.read", "file.patch", "process.test"],
-  "limits": {
-    "max_duration_seconds": 1800,
-    "max_tokens": 50000,
-    "max_cost_usd": 3.0
-  },
-  "context_refs": ["artifact_or_message_id"],
-  "expected_output": "patch_and_test_report"
+  "proposals": [
+    {
+      "target_agent": "Backend Developer",
+      "objective": "Implement the persistence repository",
+      "acceptance_criteria": ["Repository contract tests pass"]
+    },
+    {
+      "target_agent": "Frontend Developer",
+      "objective": "Implement the independent user interface",
+      "acceptance_criteria": ["The interface uses the documented API"]
+    }
+  ]
 }
 ```
+
+This single-call batch avoids provider-dependent reliance on parallel function
+calling. The engine validates the whole batch before persisting any approval,
+then fans it out into individual proposal records. A version-1 direct proposal
+object remains accepted for adapter compatibility.
 
 Validation:
 
@@ -73,6 +76,8 @@ Validation:
   specialist never addresses or dispatches directly to that peer.
 - Sender may propose or dispatch to target.
 - Parent is not above depth/child/budget limits.
+- The batch plus existing children and pending child approvals does not exceed
+  the parent's child limit.
 - Requested tools are a subset of target and session permissions.
 - Context references belong to the session and are visible to the target.
 - Adding the task/dependencies does not create a cycle.
@@ -129,9 +134,10 @@ Default is `propose_only`, maximum depth 2 and explicit bounded budgets.
 
 When an enabled coordinating agent has both allowed targets and the
 `task.delegate` capability, the engine sets a provider-neutral specific-tool
-choice for `task.delegate`. Natural-language implementation output cannot
-substitute for the required structured proposal. Leaf implementation agents
-with `file.patch` are likewise required to produce a structured patch proposal.
+choice for `task.delegate` and supplies each enabled target's role and
+capabilities. Natural-language implementation output cannot substitute for the
+required structured plan. Leaf implementation agents with `file.patch` are
+likewise required to produce a structured patch proposal.
 
 ## 9. Review protocol
 

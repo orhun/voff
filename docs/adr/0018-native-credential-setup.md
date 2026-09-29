@@ -31,7 +31,7 @@ core domain types, persisted
 agents, events, diagnostics, prompts, and logs never receive it. Keyring work
 is performed outside the terminal render loop.
 
-Non-interactive `voff init`, CI, and headless systems continue to use
+Non-interactive configuration, CI, and headless systems continue to use
 environment variables. If a native credential store is unavailable, voff
 continues running without the credential and reports the storage error instead
 of falling back to plaintext storage.

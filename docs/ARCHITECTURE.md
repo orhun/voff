@@ -26,8 +26,8 @@ and Ratatui.
 
 ```mermaid
 flowchart TD
-    CLI["CLI / Composition"] --> TUI["Ratatui UI"]
-    CLI --> ENG["Orchestration Engine"]
+    APP["Application Composition"] --> TUI["Ratatui UI"]
+    APP --> ENG["Orchestration Engine"]
     TUI --> ENG
     ENG --> CORE["Core Domain"]
     ENG --> PORTS["Provider / Tool / Storage Ports"]
@@ -112,6 +112,8 @@ Responsibilities:
 - Enforce concurrency and budgets
 - Start/cancel provider runs
 - Validate structured tool/delegation requests
+- Expand one validated, bounded multi-role delegation plan into separate
+  approval-gated child tasks
 - Bind the configured entry agent as Team Lead and reject root/delegation
   decisions from specialists
 - Validate and register runtime specialists, updating only the Team Lead's
@@ -128,6 +130,8 @@ Use an actor-like event loop or command handler with bounded channels. State-cha
 - Per-provider and global concurrency semaphores.
 - Dependency-aware readiness.
 - Explicit retry policies by error class.
+- Provider planning emits one bounded proposal array; approved independent
+  children enter the existing parallel ready queue as separate tasks.
 - No recursive function that directly launches unbounded child agents.
 - Cancellation tokens per session, task and tool call.
 
@@ -183,7 +187,7 @@ Bottom: command input, shortcuts and status
 
 ## 12. Configuration precedence
 
-`CLI flags > environment references > workspace config > user config > built-in defaults`.
+`launch flags > environment references > workspace config > user config > built-in defaults`.
 
 Credential values use a narrower precedence: process/loaded `.env` value, then
 the workspace-local SQLite credential table. Configuration contains only the

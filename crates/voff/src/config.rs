@@ -77,6 +77,14 @@ pub enum ProviderConfig {
         #[serde(default = "default_openai_key_env")]
         api_key_env: String,
     },
+    /// Installed Codex CLI using its existing login. No API key is resolved.
+    CodexCli {
+        model: String,
+    },
+    /// Installed Claude Code CLI using its existing login. No API key is resolved.
+    ClaudeCli {
+        model: String,
+    },
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NamedProviderConfig {
@@ -379,17 +387,21 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::UnsafeOllamaEndpoint);
         }
     }
-    if let ProviderConfig::Openai { model, api_key_env } = provider {
-        if model.trim().is_empty() {
-            return Err(ConfigError::EmptyAgentField("provider.model"));
-        }
-        if api_key_env.trim().is_empty()
+    let (model, api_key_env) = match provider {
+        ProviderConfig::Openai { model, api_key_env } => (model, Some(api_key_env)),
+        ProviderConfig::CodexCli { model } | ProviderConfig::ClaudeCli { model } => (model, None),
+        ProviderConfig::Mock | ProviderConfig::Ollama { .. } => return Ok(()),
+    };
+    if model.trim().is_empty() {
+        return Err(ConfigError::EmptyAgentField("provider.model"));
+    }
+    if let Some(api_key_env) = api_key_env
+        && (api_key_env.trim().is_empty()
             || !api_key_env
                 .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        {
-            return Err(ConfigError::EmptyAgentField("provider.api_key_env"));
-        }
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+    {
+        return Err(ConfigError::EmptyAgentField("provider.api_key_env"));
     }
     Ok(())
 }
@@ -399,6 +411,8 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::Mock => "mock",
         ProviderConfig::Ollama { .. } => "ollama",
         ProviderConfig::Openai { .. } => "openai",
+        ProviderConfig::CodexCli { .. } => "codex_cli",
+        ProviderConfig::ClaudeCli { .. } => "claude_cli",
     }
 }
 
@@ -480,6 +494,31 @@ mod tests {
             Config::validate(c),
             Err(ConfigError::EmptyAgentField("provider.api_key_env"))
         ));
+    }
+
+    #[test]
+    fn local_cli_provider_round_trips_without_a_credential_field() {
+        for provider in [
+            ProviderConfig::CodexCli {
+                model: "default".into(),
+            },
+            ProviderConfig::ClaudeCli {
+                model: "sonnet".into(),
+            },
+        ] {
+            let config = Config::validate(Config {
+                provider,
+                ..Config::default()
+            })
+            .unwrap();
+            let encoded = toml::to_string(&config).unwrap();
+            assert!(!encoded.contains("api_key_env"));
+            let decoded: Config = toml::from_str(&encoded).unwrap();
+            assert!(matches!(
+                decoded.provider,
+                ProviderConfig::CodexCli { .. } | ProviderConfig::ClaudeCli { .. }
+            ));
+        }
     }
 
     #[test]

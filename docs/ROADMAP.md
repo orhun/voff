@@ -21,7 +21,7 @@ documented.
 - Session creation, SQLite migrations, atomic transitions/events and restart recovery: `voff-storage`, `voff`, ADR 0005.
 - Streaming, cancellation and usage: provider/engine contract tests and `usage_records`.
 - Scoped read/search: `voff-tools` security tests, ADR 0007.
-- Resumable single-agent composition: `voff run`, configured Ratatui projection.
+- Resumable single-agent composition: `voff` launch and configured Ratatui projection.
 - Bounded workspace evidence supplied to the model: `ScopedWorkspace::context_bundle`, engine workspace context, traversal/size tests.
 
 Phase 1 exit gate is complete: a configured Ollama agent can run and cancel a task, receives bounded workspace evidence, records streaming output/usage in SQLite, and restores the same session history after restart.
@@ -43,7 +43,7 @@ Phase 2 exit gate is complete: Qwen3/Ollama structured tool proposals enter dura
 ## Phase 3 evidence
 
 - Backward-compatible formation loader, entry-agent/target/tool validation and example: `voff` config module, `.voff/formation.example.toml`.
-- CLI composition persists all formation agents and selects the configured entry agent; each task uses its owner profile's prompt and tools.
+- Application composition persists all formation agents and selects the configured entry agent; each task uses its owner profile's prompt and tools.
 - Structured `task.delegate`/`review.request` proposals enforce enabled and allowed targets plus inherited depth/child limits.
 - Parent/child graph, cycle-safe dependencies, bounded wave scheduler, child result/evidence handoff and integration ordering: `voff-engine` acceptance tests.
 - Durable tasks, results, dependencies and local credentials with SQLite schema migration 4 and reopen tests: `voff-storage`.
@@ -58,7 +58,7 @@ Phase 3 exit gate is complete: a lead can dispatch bounded structured work to in
 - A provider run is retried only before the first streamed event, preventing duplicated text and tool side effects.
 - Health snapshots expose circuit state, consecutive failures, retry count and the last error.
 - Contract tests cover recovery, no retry after streaming and open-circuit fail-fast behavior.
-- CLI-created mock, Ollama and OpenAI providers are wrapped by the same resilience boundary.
+- Application-created mock, Ollama and OpenAI providers are wrapped by the same resilience boundary.
 - The OpenAI Responses API adapter maps canonical messages, SSE text, strict function calls and usage without engine changes; configuration retains only a credential lookup name (ADRs 0011 and 0018).
 - Adapter tests share the canonical streaming/cancellation/error vocabulary and include OpenAI text, usage and function-call mapping.
 - `doctor` reports discovered provider capabilities and connectivity or actionable credential/endpoint failures.
@@ -71,7 +71,7 @@ Phase 4 exit gate is complete: the same configured agent runtime can select Olla
 
 - Backward-compatible named provider registry and agent route/model validation: `voff` config module, `.voff/heterogeneous.example.toml`.
 - Task-owner routing without provider-specific engine branches: `Engine::with_provider_registry`, ADR 0012.
-- CLI builds one independently resilient adapter per named route and persists route/model identity in every agent profile.
+- Application composition builds one independently resilient adapter per named route and persists route/model identity in every agent profile.
 - The TUI lists each formation agent with its selected provider and model.
 - Acceptance tests run two agent-owned tasks through distinct routes in one bounded wave and prove that one provider failure does not cancel its sibling route.
 
@@ -100,14 +100,13 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   configuration (temporary plaintext-at-rest tradeoff, ADR 0019). The model
   catalog also supplies provider-qualified per-agent cost estimates, with
   explicit manual-rate overrides and honest unknown/partial states.
-  Existing configs and scripted `voff init` usage remain compatible.
-- A `ratatui-textarea` composer sends plain text to the entry Team Lead as a
-  persisted, tool-free conversation task; `/task <objective>` submits
-  executable work with delegation enabled, and `/tasks` focuses the current
-  task list without provider I/O. Enter focuses the composer; once focused, its
-  hint switches to the available conversation commands. `? help` sits beside
-  the working directory on the bottom-right border. Background submission
-  failures return to the composer visibly.
+  Existing versioned configs remain compatible.
+- A `ratatui-textarea` composer sends every non-empty submission to the entry
+  Team Lead as persisted executable work with delegation enabled. Slash-prefixed
+  text is ordinary task text; there is no composer command mode. Enter focuses
+  the composer and its hint remains task-oriented. `? help` sits beside the
+  working directory on the bottom-right border. Background submission failures
+  return to the composer visibly.
 - The workspace presents developers as status-rich cards connected by their
   explicit Team Lead-mediated delegation relationships. Each specialist has
   one connector to the lead for assignments, requests, and results, so a
@@ -119,13 +118,21 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   lines carry no text. Each card renders one icon-labeled role identity inside
   its border rather than repeating it as a title. `rataflow` owns route rendering, node
   dragging, selection, pan, zoom, and fit-view while voff supplies the
-  provider-neutral card and handoff projections. Cards support mouse selection
-  and dragging while all workflow controls remain keyboard-accessible.
-- `S` opens a centered runtime team editor that enables or disables idle
+  provider-neutral card and handoff projections. Cards show a bounded excerpt
+  of the latest provider text for each role, replace the CLI `default` sentinel
+  with `CLI automatic`, and omit delegation-capability prose. Cards support
+  mouse selection and dragging while all workflow controls remain
+  keyboard-accessible.
+- `t` opens a centered runtime team editor that enables or disables idle
   specialists or adds safe role presets inheriting the lead's provider/model.
   It keeps the Team Lead immutable, refuses availability changes around active
   or approval-pending work, strips peer-delegation authority, and persists team
   audit events. Rataflow immediately projects the updated lead routing.
+- `c` opens a setup-style provider/model editor for the selected Team role.
+  Configured provider routes and their discovered models can be browsed, and
+  exact model IDs can be entered; the persisted active profile is used on that
+  role's next task. List selection is conveyed by text styling, without
+  selector glyphs.
 - The Rataflow team canvas is the default fullscreen center view. `1` and `2`
   open Team and the combined task browser/inspector, while `Tab` toggles them.
   `e` opens session events as a temporary full-screen diagnostic viewer rather
@@ -138,24 +145,29 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   color, line style, and animation communicate delegation without
   collision-prone labels.
 - Launch and resume create no implicit objective. Users create work explicitly
-  with `/task <objective>` or capital `R`. `R` creates a persisted Quick Run
+  through the task-only composer or capital `R`. `R` creates a persisted Quick Run
   root task that asks the Team Lead to reconcile Markdown requirements, create
   bounded work, delegate it, execute it, and validate evidence. Delegation
   remains bounded by enabled membership, allowed targets, approvals, and task
   limits.
+- Team Lead planning uses one bounded structured proposal array rather than
+  relying on providers to emit repeated function calls. Voff validates the
+  complete plan, fans it out into per-role approvals, and schedules approved
+  independent children concurrently (ADR 0027).
 - Root README now provides local and heterogeneous-team onboarding, secure
   credential setup, TUI controls, and contributor quality commands.
-- `voff init` interactively creates a validated solo Ollama or OpenAI
-  configuration, supports non-interactive arguments, keeps credentials
-  outside project files, and refuses accidental overwrite.
+- First launch interactively creates a validated solo or team configuration
+  using Ollama, OpenAI, Codex CLI, or Claude CLI, keeps
+  credentials outside project files, and preserves an existing configuration
+  before replacement.
 - Tag-triggered release CI builds locked Linux x86-64 and macOS Intel/Apple
   Silicon archives, generates SHA-256 checksums, and publishes them only for
   version tags. The maintainer procedure is documented in `docs/RELEASING.md`.
-- A bare `voff` launch reopens the newest task-bearing session, while explicit
-  `voff run` creates a clean session by default and `--resume` reopens history.
-  The global `--workspace <DIR>` override selects that directory's local state
-  without rewriting configuration. Initial TUI projections and interruption
-  recovery remain scoped to the selected session.
+- `voff` reopens the newest task-bearing session, while `--new-session`
+  explicitly starts clean. The global `--workspace <DIR>` option selects that
+  directory's local configuration and state without rewriting configuration.
+  Initial TUI projections and interruption recovery remain scoped to the
+  selected session (ADR 0025).
 - `voff export` writes a session-scoped diagnostic JSON bundle, redacts the
   configured credential value and common secret forms, and refuses accidental
   overwrite.
@@ -173,5 +185,6 @@ Phase 4.5 exit gate is complete: a single formation can route concurrent agents 
   and a reproducible 10,000-event SQLite benchmark cover Phase 5 robustness.
 - Beta metadata is `0.1.0-beta.1`; changelog, release checklist, and release-CI
   archive self-verification are checked in.
-- Onboarding selects solo or lead/implementer/reviewer templates, while
-  `sessions` and `run --session` make stored runs discoverable and selectable.
+- Onboarding builds solo or custom Team Lead formations. Older session records
+  remain durable; a future session browser belongs in the TUI rather than the
+  public CLI.

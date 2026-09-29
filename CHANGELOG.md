@@ -11,6 +11,23 @@ All notable changes to voff are documented here. This project follows
   directory to `voff`.
 - Consolidated project documentation and removed bootstrap-only prompt files
   and local development configuration.
+- Reduced the public CLI to workspace launch, `doctor`, and `export`. Normal
+  launch resumes automatically; `--new-session` starts clean. The redundant
+  `init`, `run`, and `sessions` commands and command-specific `--config`,
+  `--resume`, and `--session` flags were removed before stable release.
+- Fixed local Codex requests by emitting a fully strict output schema and
+  encoding proposed tool arguments as validated JSON strings. Local CLI
+  failures now map bounded stderr to safe authentication, schema, rate-limit,
+  compatibility, or model guidance instead of reporting only exit status 1.
+- Made the Team Lead composer task-only, moved team management to `t` and task
+  cancellation to `x`, and added setup-style `c` provider/model configuration
+  for the selected role. Team cards now show bounded provider-response
+  excerpts, hide internal delegation prose, and label CLI-managed model
+  selection clearly.
+- Fixed broad Team Lead objectives stopping after one delegated role. One
+  bounded structured plan now expands into separate per-role approvals and
+  concurrently schedulable child tasks while retaining legacy single-proposal
+  compatibility.
 
 ### Added
 
@@ -19,6 +36,9 @@ All notable changes to voff are documented here. This project follows
 - Provider adapter guide and reusable contract assertions.
 - Task-graph property checks, malformed-input fuzz corpora, and large-history
   benchmarks.
+- Credential-free Codex CLI and Claude CLI providers. Existing version-1
+  configurations need no migration; the new `codex_cli` and `claude_cli` kinds
+  are additive.
 
 ## [0.1.0-beta.1] - Unreleased
 

@@ -11,6 +11,7 @@ const OPENAI: &str = "openai";
 const OLLAMA: &str = "ollama";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
+const DEFAULT_CLI_MODEL: &str = "default";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelOption {
@@ -37,6 +38,7 @@ impl ModelOption {
 pub struct ModelCatalog {
     openai: Vec<ModelOption>,
     ollama: Vec<ModelOption>,
+    other: HashMap<String, Vec<ModelOption>>,
     priced_openai: HashMap<String, FlatModel>,
     ollama_discovered: bool,
 }
@@ -58,6 +60,10 @@ impl Default for ModelCatalog {
                 input_price: None,
                 output_price: None,
             }],
+            other: HashMap::from([
+                ("codex_cli".into(), fallback(DEFAULT_CLI_MODEL)),
+                ("claude_cli".into(), fallback(DEFAULT_CLI_MODEL)),
+            ]),
             priced_openai: HashMap::new(),
             ollama_discovered: false,
         }
@@ -113,7 +119,8 @@ impl ModelCatalog {
     pub fn models(&self, provider: &str) -> &[ModelOption] {
         match provider {
             OPENAI => &self.openai,
-            _ => &self.ollama,
+            OLLAMA => &self.ollama,
+            _ => self.other.get(provider).map_or(&[], Vec::as_slice),
         }
     }
 
@@ -145,7 +152,9 @@ impl ModelCatalog {
             .map(|model| model.id.clone())
             .unwrap_or_else(|| match provider {
                 OPENAI => DEFAULT_OPENAI_MODEL.into(),
-                _ => DEFAULT_OLLAMA_MODEL.into(),
+                OLLAMA => DEFAULT_OLLAMA_MODEL.into(),
+                "codex_cli" | "claude_cli" => DEFAULT_CLI_MODEL.into(),
+                _ => String::new(),
             })
     }
 
@@ -161,7 +170,8 @@ impl ModelCatalog {
 
     #[must_use]
     pub fn model_is_editable(&self, provider: &str) -> bool {
-        provider == OLLAMA && !self.ollama_discovered
+        (provider == OLLAMA && !self.ollama_discovered)
+            || matches!(provider, "codex_cli" | "claude_cli")
     }
 
     #[must_use]
@@ -187,6 +197,16 @@ impl ModelCatalog {
         .ok()?;
         cost.total.to_string().parse().ok()
     }
+}
+
+fn fallback(model: &str) -> Vec<ModelOption> {
+    vec![ModelOption {
+        id: model.into(),
+        display_name: model.into(),
+        context_limit: None,
+        input_price: None,
+        output_price: None,
+    }]
 }
 
 fn compatible_with_voff(model: &&FlatModel) -> bool {

@@ -30,16 +30,20 @@ const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
 pub enum ProviderChoice {
     Ollama,
     OpenAi,
+    CodexCli,
+    ClaudeCli,
 }
 
 impl ProviderChoice {
-    const ALL: [Self; 2] = [Self::Ollama, Self::OpenAi];
+    const ALL: [Self; 4] = [Self::Ollama, Self::OpenAi, Self::CodexCli, Self::ClaudeCli];
 
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
             Self::Ollama => "ollama",
             Self::OpenAi => "openai",
+            Self::CodexCli => "codex_cli",
+            Self::ClaudeCli => "claude_cli",
         }
     }
 
@@ -48,6 +52,8 @@ impl ProviderChoice {
         match self {
             Self::Ollama => "Ollama · local",
             Self::OpenAi => "OpenAI · cloud",
+            Self::CodexCli => "Codex · CLI",
+            Self::ClaudeCli => "Claude · CLI",
         }
     }
 
@@ -768,6 +774,7 @@ fn suggested_role(index: usize, count: usize) -> DeveloperRole {
         2 => DeveloperRole::Frontend,
         3 => DeveloperRole::Reviewer,
         4 => DeveloperRole::Tester,
+        5 => DeveloperRole::DevOps,
         _ => DeveloperRole::FullStack,
     }
 }
@@ -1251,6 +1258,12 @@ mod tests {
     }
 
     #[test]
+    fn local_cli_providers_use_compact_labels() {
+        assert_eq!(ProviderChoice::CodexCli.label(), "Codex · CLI");
+        assert_eq!(ProviderChoice::ClaudeCli.label(), "Claude · CLI");
+    }
+
+    #[test]
     fn count_creates_friendly_role_defaults() {
         let mut wizard = Wizard {
             count_input: "4".into(),
@@ -1263,6 +1276,26 @@ mod tests {
         assert_eq!(wizard.developers[1].role, DeveloperRole::Backend);
         assert_eq!(wizard.developers[2].role, DeveloperRole::Frontend);
         assert_eq!(wizard.developers[3].role, DeveloperRole::Reviewer);
+    }
+
+    #[test]
+    fn larger_teams_cover_every_specialist_before_repeating_full_stack() {
+        let roles = (0..7)
+            .map(|index| suggested_role(index, 7))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            roles,
+            vec![
+                DeveloperRole::Lead,
+                DeveloperRole::Backend,
+                DeveloperRole::Frontend,
+                DeveloperRole::Reviewer,
+                DeveloperRole::Tester,
+                DeveloperRole::DevOps,
+                DeveloperRole::FullStack,
+            ]
+        );
     }
 
     #[test]

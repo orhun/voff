@@ -33,8 +33,9 @@ created with no-overwrite semantics. If OpenAI is selected and no credential is
 already resolvable, the builder offers one optional masked API token field for
 secure native storage; skipping it does not block launch. Existing configs
 default to 4096 output
-tokens, and explicit CLI commands retain their previous behavior;
-non-interactive setup remains available through `voff init`.
+tokens. Explicit CLI commands retained their previous behavior at the time;
+non-interactive setup was initially available through `voff init`; that CLI
+surface was later removed by ADR 0025 in favor of workspace-local configuration.
 
 Usage events are costed against the task owner's provider/model with the
 catalog crate's decimal calculator. User-configured input/output rates override

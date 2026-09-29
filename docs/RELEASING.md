@@ -52,7 +52,8 @@ After extracting, verify the binary before installation:
 
 ```bash
 ./voff --version
-./voff init --help
+./voff --help
+./voff doctor --help
 ```
 
 Release archives include a project distributed under the user's choice of the

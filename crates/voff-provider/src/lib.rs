@@ -1,7 +1,9 @@
 //! Provider-neutral model execution port.
 mod adapters;
+mod local_cli;
 
 pub use adapters::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
+pub use local_cli::{LocalCliKind, LocalCliProvider};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

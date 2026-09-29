@@ -134,12 +134,20 @@ Acceptance:
 - Root work and delegation decisions originate from the configured Team Lead;
   specialists return results to that coordinator.
 - Launch and resume create no implicit task; the user submits root work
-  explicitly with `/task <objective>` or capital `R` Quick Run.
+  explicitly through the task-only Team Lead composer or capital `R` Quick Run.
+- Team cards show a bounded excerpt of each role's latest provider response,
+  label CLI-managed model selection clearly, and omit internal delegation
+  capability prose.
+- With a Team role selected, `c` exposes setup-style Provider and Model fields.
+  The user can select any configured provider route, choose a discovered model,
+  or enter an exact model ID for that role's next task.
 - Quick Run passes a predefined Markdown-analysis objective to the Team Lead,
   persists the root task, exposes its child tasks in the task browser, and uses
   the same delegation and side-effect approvals as manually submitted work.
 - The Team Lead may delegate bounded, non-overlapping children only to enabled,
   allowed specialists and waits for every dispatched result.
+- A broad objective can be planned in one structured multi-role batch; every
+  item receives its own approval and independent ready items run concurrently.
 - The UI shows both tasks and their relationship.
 - Lowercase `r` in Tasks re-runs the selected terminal or blocked task as a new
   persisted, correlated attempt without rewriting the prior attempt's status.

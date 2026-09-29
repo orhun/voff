@@ -23,6 +23,7 @@ struct AgentCard {
     provider: String,
     model: String,
     detail: String,
+    response: Option<String>,
     status: &'static str,
     status_color: Color,
     role_color: Color,
@@ -82,6 +83,14 @@ impl NodeContent for AgentCard {
         } else {
             vec![identity, status]
         };
+        if ctx.area.height >= 5
+            && let Some(response) = &self.response
+        {
+            lines.push(Line::from(vec![
+                Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(response.as_str(), Style::default().fg(Color::Gray)),
+            ]));
+        }
         if ctx.area.height >= 6 {
             lines.push(Line::from(Span::styled(
                 self.model.as_str(),
@@ -116,6 +125,15 @@ pub(super) struct TeamFlow {
     mouse_highlight: Option<AgentId>,
 }
 
+pub(super) struct TeamSnapshot<'a> {
+    pub agents: &'a [AgentProfile],
+    pub tasks: &'a [Task],
+    pub approvals: &'a [Approval],
+    pub responses: &'a HashMap<AgentId, String>,
+    pub provider_kinds: &'a HashMap<AgentId, String>,
+    pub team_lead: Option<AgentId>,
+}
+
 pub(super) struct MouseInteraction {
     pub handled: bool,
     pub selected: Option<usize>,
@@ -136,22 +154,24 @@ impl Default for TeamFlow {
 }
 
 impl TeamFlow {
-    pub fn sync(
-        &mut self,
-        agents: &[AgentProfile],
-        tasks: &[Task],
-        approvals: &[Approval],
-        team_lead: Option<AgentId>,
-        selected: usize,
-        area: Rect,
-    ) {
-        let expected_ids = agents.iter().map(|agent| agent.id).collect::<Vec<_>>();
+    pub fn sync(&mut self, snapshot: TeamSnapshot<'_>, selected: usize, area: Rect) {
+        let expected_ids = snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
         if expected_ids != self.agent_ids {
-            self.rebuild_nodes(agents, tasks, approvals, selected, area);
+            self.rebuild_nodes(&snapshot, selected, area);
         } else {
-            for agent in agents {
+            for agent in snapshot.agents {
                 if let Some(content) = self.flow.node_content_mut(&node_id(agent.id)) {
-                    *content = agent_card(agent, tasks, approvals);
+                    *content = agent_card(
+                        agent,
+                        snapshot.tasks,
+                        snapshot.approvals,
+                        snapshot.responses,
+                        snapshot.provider_kinds,
+                    );
                 }
             }
             self.select(selected);
@@ -162,27 +182,27 @@ impl TeamFlow {
         {
             self.mouse_highlight = None;
         }
-        let edges = build_edges(agents, tasks, approvals, team_lead, self.mouse_highlight);
+        let edges = build_edges(
+            snapshot.agents,
+            snapshot.tasks,
+            snapshot.approvals,
+            snapshot.team_lead,
+            self.mouse_highlight,
+        );
         if self.flow.set_edges(edges).is_err() {
             self.flow.retain_edges(|_| false);
         }
     }
 
-    fn rebuild_nodes(
-        &mut self,
-        agents: &[AgentProfile],
-        tasks: &[Task],
-        approvals: &[Approval],
-        selected: usize,
-        area: Rect,
-    ) {
+    fn rebuild_nodes(&mut self, snapshot: &TeamSnapshot<'_>, selected: usize, area: Rect) {
         let existing_positions = self
             .flow
             .nodes()
             .map(|node| (node.id.clone(), node.position))
             .collect::<HashMap<_, _>>();
-        let layout = node_layout(area, agents.len());
-        let nodes = agents
+        let layout = node_layout(area, snapshot.agents.len());
+        let nodes = snapshot
+            .agents
             .iter()
             .enumerate()
             .map(|(index, agent)| {
@@ -195,7 +215,13 @@ impl TeamFlow {
                         .copied()
                         .unwrap_or(default_position),
                     (width, height),
-                    agent_card(agent, tasks, approvals),
+                    agent_card(
+                        agent,
+                        snapshot.tasks,
+                        snapshot.approvals,
+                        snapshot.responses,
+                        snapshot.provider_kinds,
+                    ),
                 )
                 .with_selected(index == selected)
                 .with_deletable(false)
@@ -205,7 +231,7 @@ impl TeamFlow {
             })
             .collect();
         if self.flow.set_nodes(nodes).is_ok() {
-            self.agent_ids = agents.iter().map(|agent| agent.id).collect();
+            self.agent_ids = snapshot.agents.iter().map(|agent| agent.id).collect();
             self.flow.request_fit_view();
         }
     }
@@ -305,7 +331,13 @@ impl TeamFlow {
     }
 }
 
-fn agent_card(agent: &AgentProfile, tasks: &[Task], approvals: &[Approval]) -> AgentCard {
+fn agent_card(
+    agent: &AgentProfile,
+    tasks: &[Task],
+    approvals: &[Approval],
+    responses: &HashMap<AgentId, String>,
+    provider_kinds: &HashMap<AgentId, String>,
+) -> AgentCard {
     let pending = pending_delegation_for_target(approvals, &agent.name);
     let (status, status_color) = agent_status(tasks, agent, pending.is_some());
     let display_task = agent_display_task(tasks, agent.id);
@@ -319,11 +351,27 @@ fn agent_card(agent: &AgentProfile, tasks: &[Task], approvals: &[Approval]) -> A
         format!("? {}", truncate_label(&sanitize(&proposal.objective), 24))
     } else if !agent.enabled {
         "Unavailable · no new assignments".into()
-    } else if agent.allowed_targets.is_empty() {
-        format!("{} tokens · no delegation", agent.max_output_tokens)
     } else {
-        format!("{} tokens · delegation", agent.max_output_tokens)
+        format!("{} token limit", agent.max_output_tokens)
     };
+    let provider_kind = provider_kinds
+        .get(&agent.id)
+        .map_or(agent.provider.as_str(), String::as_str);
+    let model = if agent.model == "default" && matches!(provider_kind, "codex_cli" | "claude_cli") {
+        "Model · CLI automatic".into()
+    } else {
+        format!("Model · {}", sanitize(&agent.model))
+    };
+    let response = responses
+        .get(&agent.id)
+        .filter(|response| !response.trim().is_empty())
+        .map(|response| {
+            let excerpt = sanitize(response)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            truncate_label(&excerpt, 30)
+        });
     let role = human_role(&agent.role);
     let name = sanitize(&agent.name);
     let identity = if name.eq_ignore_ascii_case(&role) {
@@ -334,8 +382,9 @@ fn agent_card(agent: &AgentProfile, tasks: &[Task], approvals: &[Approval]) -> A
     AgentCard {
         identity,
         provider: sanitize(&agent.provider),
-        model: sanitize(&agent.model),
+        model,
         detail,
+        response,
         status,
         status_color,
         role_color: role_color(&agent.role),

@@ -4,6 +4,9 @@
 
 Accepted as a temporary Phase 5 implementation.
 
+The composer routing portion is superseded by ADR 0026; the local credential
+decision remains active.
+
 ## Context
 
 The platform-native secret service used by ADR 0018 is not reliably available

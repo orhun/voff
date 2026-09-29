@@ -27,26 +27,26 @@ the solo team remains useful. OpenAI
 choices are filtered to text/tool-capable offerings from the bundled
 models.dev snapshot. Ollama choices come from the models installed on the
 loopback runtime when it responds within the bounded discovery window; an
-editable fallback remains available when it does not. It
+editable fallback remains available when it does not. Codex CLI and Claude CLI
+choices use editable provider defaults. It
 writes the same version 1 schema documented below. Existing configurations are
 loaded unchanged and default to `4096` output tokens, so this onboarding flow
-requires no migration. Non-interactive environments should use `voff init`
-with explicit flags.
+requires no TOML migration. Automated environments may write the documented
+schema directly to `.voff/config.toml`; there is no separate setup command.
 
 The selected working directory is written to `workspace.root`. It scopes
 workspace file access, process execution, and the local `.voff/voff.db`; the
 main Team Lead bar shows its resolved path while voff is running.
-The global `--workspace <DIR>` argument temporarily overrides this value for
-the current invocation and uses `<DIR>/.voff/voff.db` (or the configured
-relative `state_file`). It is accepted before or after a subcommand, applies to
-`run`, `sessions`, `doctor`, and `export`. For an already recognized workspace,
-the override does not rewrite configuration. On a bare launch, a missing
+The global `--workspace <DIR>` argument selects `<DIR>/.voff/config.toml` and
+uses `<DIR>/.voff/voff.db` (or the configured relative `state_file`). It is
+accepted before or after `doctor` and `export`. For an already recognized
+workspace, the override does not rewrite configuration. On launch, a missing
 workspace database marks the target as unrecognized and opens interactive
 setup rather than silently initializing state. A new `--workspace` target
 receives its own `.voff/config.toml`; if setup replaces an existing
 configuration because its database is missing, the prior file is preserved
 beside it as `config.toml.bak` (with a numeric suffix when needed). Explicit
-subcommands retain their non-interactive behavior.
+diagnostic subcommands remain non-interactive.
 Interactive setup selects it through a directory-only `ratatui-explorer`
 picker. Arrow keys and `hjkl` navigate, `/` starts a typed directory-name
 filter, and Enter accepts the highlighted directory. Right/`l` opens the
@@ -54,7 +54,7 @@ highlighted directory, Left/`h` returns to its parent, and Space accepts the
 currently displayed directory. Esc first finishes or clears an active filter
 and then preserves the previous workspace selection.
 
-After launch, `S` opens a modal team adjustment surface. It changes an idle
+After launch, `t` opens a modal team adjustment surface. It changes an idle
 specialist's enabled state for future assignments in the active runtime, and
 `n` adds another specialist from the safe Backend, Frontend, Full-stack,
 Reviewer, Tester, or DevOps presets. Added specialists inherit the Team Lead's
@@ -65,11 +65,19 @@ persisted agent profiles and append audit events. Runtime additions apply to the
 active run; durable membership/provider/model customization still requires a
 validated configuration update and a new run.
 
-Launching or resuming a workspace creates no implicit task. Submit explicit work
-with `/task <objective>`, or press capital `R` for Quick Run. The Team Lead may
+With a role highlighted in Team, `c` opens a setup-style provider and model
+configuration surface. Up/Down or Tab moves between fields. Left/Right selects
+one of the provider routes already configured for the workspace and then
+browses that provider's discovered models; typing in the Model field replaces
+it with an exact model ID. Enter persists the active role profile and Esc
+cancels. The engine loads that profile for the role's next task. This runtime
+choice applies to the active run; add durable provider routes and role defaults
+to `.voff/config.toml` when they must survive a restart.
+
+Launching or resuming a workspace creates no implicit task. Press Enter and
+describe explicit work, or press capital `R` for Quick Run. The Team Lead may
 then propose bounded delegation to enabled, allowed specialists through the
 normal approval flow.
-
 ## 2. Example
 
 ```toml
@@ -227,12 +235,32 @@ a deliberately simple temporary mechanism: the token is plaintext at rest,
 and the database must be treated as sensitive.
 
 Environment variables have precedence over the local database. OpenAI uses
-`OPENAI_API_KEY` by default, or the name configured in `api_key_env`; Ollama
-requires no token. Minimal non-interactive placeholder example:
+`OPENAI_API_KEY` by default, or the name configured in `api_key_env`. Ollama
+requires no token. Codex CLI and Claude CLI use the installed binary's existing
+login and never resolve or inherit an API key. Minimal non-interactive
+placeholder example:
 
 ```dotenv
 OPENAI_API_KEY=YOUR_API_KEY
 ```
+
+Provider configuration uses one of these version-1 shapes:
+
+```toml
+[provider]
+kind = "openai"
+model = "gpt-5-mini"
+api_key_env = "OPENAI_API_KEY"
+
+# Credential-free installed CLI alternative:
+# [provider]
+# kind = "codex_cli" # or "claude_cli"
+# model = "default"
+```
+
+`doctor` checks provider connectivity and verifies that a local binary supports
+the required structured-output and safety flags. An older CLI fails with an
+actionable update message instead of starting an unsafe or unstructured run.
 
 No TOML migration is required.
 
@@ -245,20 +273,18 @@ No TOML migration is required.
 ## 7. Team Lead composer
 
 The workspace footer is a `ratatui-textarea` input titled `Team Lead`. Press
-Enter or click the composer to start talking to the Team Lead. Once active,
+Enter or click the composer to start a Team Lead task. Once active,
 Enter sends, Shift+Enter inserts a newline and grows the composer, and Esc
 safely quits. The TUI requests modifier-aware keyboard reporting so Shift+Enter
 is distinguishable from Enter; Ctrl+J and Alt+Enter are newline fallbacks for
 terminals without that protocol. Long drafts soft-wrap and scroll; arrows,
 Home/End, Ctrl+arrows, Shift+arrows, Ctrl+W/Ctrl+K, and Ctrl+Z/Ctrl+Y provide
-navigation, selection, deletion, and undo/redo. Plain text
-creates a persisted root task owned by the formation entry agent (the Team
-Lead) and requests a direct, tool-free answer. `/task <objective>` creates
-executable work for the Team Lead, retaining its configured delegation policy.
-`/tasks` focuses the current session's live task list without calling a
-provider. The resolved working directory stays on the bottom-right border.
-Submission failures are reported in the composer instead of being discarded by
-a background task.
+navigation, selection, deletion, and undo/redo. Every non-empty submission
+creates executable, persisted root work owned by the formation entry agent (the
+Team Lead), retaining its configured delegation policy. There is no composer
+command mode; leading `/` characters remain ordinary task text. The resolved
+working directory stays on the bottom-right border. Submission failures are
+reported in the composer instead of being discarded by a background task.
 
 Capital `R` starts Quick Run only while the composer is inactive. It creates a
 persisted Team Lead root task with a predefined prompt to reconcile relevant

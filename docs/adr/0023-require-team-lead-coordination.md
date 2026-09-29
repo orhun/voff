@@ -1,5 +1,8 @@
 # ADR 0023: Require Team Lead coordination
 
+The composer and runtime-control bindings described here are superseded by ADR
+0026. The Team Lead coordination policy remains active.
+
 ## Context
 
 Parallel specialists reduce latency, but peer-originated root tasks and nested

@@ -65,6 +65,15 @@ Resilience retries and circuit breaking belong in `ResilientProvider`, not in
 individual adapters. A provider must not retry after emitting an event because
 that could duplicate text or tool side effects.
 
+## Installed CLI adapters
+
+Codex and Claude CLI routes are process adapters, not Rig transports. They use
+the installed binary's existing login and never require an API key. Launch them
+without a shell, clear inherited API-key variables, isolate their working
+directory, request schema-validated JSON, bound captured output, and translate
+only proposed text or tool calls into the canonical provider contract. Voff's
+engine still validates and approval-gates every delegation or side effect.
+
 ## Review boundary
 
 Adding a provider changes the external data boundary and requires tests,
