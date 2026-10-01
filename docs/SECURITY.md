@@ -18,6 +18,14 @@ Treat model output, provider responses, repository content, tool output, importe
 
 ## 3. Permission model
 
+ADR 0032 adds explicit delegated review for routine workspace work. The app
+defaults `runtime.automatic_review` to true; false restores manual review.
+Coordinator verdicts consume exact one-time grants, never change policy, and
+cannot approve application configuration or account changes. Unsupported and
+out-of-scope operations remain denied. This is not an OS process sandbox:
+allowlisted Cargo commands can execute project build scripts/tests. Use manual
+review for untrusted projects.
+
 Effective permission is the intersection of:
 
 `administrator policy ∩ session policy ∩ agent policy ∩ task grant ∩ tool capability`.

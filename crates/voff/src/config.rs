@@ -63,6 +63,12 @@ pub struct WorkspaceConfig {
 pub struct RuntimeConfig {
     pub default_timeout_seconds: u64,
     pub event_channel_capacity: usize,
+    /// Delegate routine approval and bounded repair decisions to the Team Lead.
+    #[serde(default = "default_automatic_review")]
+    pub automatic_review: bool,
+}
+fn default_automatic_review() -> bool {
+    true
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -169,6 +175,7 @@ impl Default for Config {
                 state_file: ".voff/voff.db".into(),
             },
             runtime: RuntimeConfig {
+                automatic_review: true,
                 default_timeout_seconds: 1800,
                 event_channel_capacity: 128,
             },
@@ -530,7 +537,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let restored: Config = toml::from_str(&legacy).unwrap();
-        assert_eq!(restored.agent.max_output_tokens, 4096);
+        assert_eq!(restored.agent.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
 
         let mut zero = Config::default();
         zero.agent.max_output_tokens = 0;

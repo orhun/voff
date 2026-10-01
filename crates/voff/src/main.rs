@@ -1,5 +1,6 @@
 mod config;
 mod credential;
+mod logging;
 mod model_catalog;
 mod onboarding;
 mod tui;
@@ -76,11 +77,16 @@ fn main() -> Result<()> {
 }
 
 async fn application() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(false)
-        .init();
     let cli = Cli::parse();
+    let log_workspace = match workspace_config_path(cli.workspace.as_deref()) {
+        Ok(path) if path.is_file() => {
+            load_for_workspace(&path, cli.workspace.as_deref())?
+                .workspace
+                .root
+        }
+        _ => cli.workspace.clone().unwrap_or(std::env::current_dir()?),
+    };
+    let _log_guard = logging::init(&log_workspace)?;
     let workspace = cli.workspace;
     match cli.command {
         None => launch(workspace.as_deref(), cli.new_session).await,
@@ -445,6 +451,20 @@ fn apply_workspace_override(mut config: Config, workspace: Option<&Path>) -> Res
     Config::validate(config).context("workspace override produced invalid configuration")
 }
 
+fn resumed_agent_id(
+    name: &str,
+    role: &str,
+    agents: &[AgentProfile],
+    tasks: &[voff_core::Task],
+) -> Option<AgentId> {
+    tasks.iter().find_map(|task| {
+        agents
+            .iter()
+            .find(|agent| agent.id == task.owner && agent.name == name && agent.role == role)
+            .map(|agent| agent.id)
+    })
+}
+
 async fn run(path: &Path, workspace: Option<&Path>, resume: bool) -> Result<()> {
     let config = load_for_workspace(path, workspace)?;
     let default_provider = default_provider_id(&config);
@@ -464,6 +484,15 @@ async fn run(path: &Path, workspace: Option<&Path>, resume: bool) -> Result<()> 
         repo.save_session(value.clone()).await?;
         value
     };
+    let existing_agents = repo.agents().await?;
+    let session_tasks = session_task_ids(repo.as_ref(), session.id).await?;
+    let mut existing_tasks = repo
+        .tasks()
+        .await?
+        .into_iter()
+        .filter(|task| session_tasks.contains(&task.id))
+        .collect::<Vec<_>>();
+    existing_tasks.sort_by_key(|task| std::cmp::Reverse(task.created_at));
     let mut agent_profiles = Vec::new();
     let mut agent_provider_kinds = HashMap::new();
     let owner = if let Some(formation) = &config.formation {
@@ -481,7 +510,13 @@ async fn run(path: &Path, workspace: Option<&Path>, resume: bool) -> Result<()> 
             let selected_provider = provider_config(&config, &provider_id)
                 .with_context(|| format!("provider route {provider_id} is missing"))?;
             let profile = AgentProfile {
-                id: AgentId::new(),
+                id: resumed_agent_id(
+                    &configured.name,
+                    &configured.role,
+                    &existing_agents,
+                    &existing_tasks,
+                )
+                .unwrap_or_default(),
                 name: configured.name.clone(),
                 role: configured.role.clone(),
                 provider: provider_id,
@@ -515,7 +550,13 @@ async fn run(path: &Path, workspace: Option<&Path>, resume: bool) -> Result<()> 
         entry.context("validated formation entry agent missing")?
     } else {
         let profile = AgentProfile {
-            id: AgentId::new(),
+            id: resumed_agent_id(
+                &config.agent.name,
+                &config.agent.role,
+                &existing_agents,
+                &existing_tasks,
+            )
+            .unwrap_or_default(),
             name: config.agent.name.clone(),
             role: config.agent.role.clone(),
             provider: default_provider.clone(),
@@ -602,6 +643,7 @@ async fn run(path: &Path, workspace: Option<&Path>, resume: bool) -> Result<()> 
     let workspace = ScopedWorkspace::new(&workspace_root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
     tui::run_configured(tui::ConfiguredRun {
+        automatic_review: config.runtime.automatic_review,
         repo,
         provider,
         providers,
@@ -652,12 +694,60 @@ async fn run(path: &Path, workspace: Option<&Path>, resume: bool) -> Result<()> 
 
 async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Result<()> {
     let task_ids = session_task_ids(repo, session).await?;
-    for task in repo
-        .tasks()
+    let tasks = repo.tasks().await?;
+    // A coordinator waiting on a durable approval decision is not an
+    // interrupted provider request. Preserve that delegation chain on reopen.
+    let mut waiting_ancestors = HashSet::new();
+    let events = repo.events(session).await?;
+    // A persisted revision is queued work, not an interrupted parent request.
+    for task in tasks.iter().filter(|task| task_ids.contains(&task.id)) {
+        let revision_waiting = task.status == TaskStatus::Blocked
+            && task.attempt < 3
+            && events.iter().any(|event| {
+                event.task_id == Some(task.id)
+                    && matches!(event.kind, CanonicalEventKind::RevisionRequested { .. })
+            })
+            && !events.iter().any(|event| {
+                event.task_id == Some(task.id)
+                    && matches!(
+                        event.kind,
+                        CanonicalEventKind::TaskCancelled | CanonicalEventKind::RevisionStopped(_)
+                    )
+            });
+        let retry_queued = task.retry_of.is_some()
+            && matches!(task.status, TaskStatus::Queued | TaskStatus::Ready);
+        if revision_waiting || retry_queued {
+            let mut current = Some(task);
+            while let Some(parent) = current.and_then(|task| task.parent) {
+                if !task_ids.contains(&parent) || !waiting_ancestors.insert(parent) {
+                    break;
+                }
+                current = tasks.iter().find(|task| task.id == parent);
+            }
+        }
+    }
+    for approval in repo
+        .approvals(session)
         .await?
         .into_iter()
-        .filter(|task| task_ids.contains(&task.id) && task.status == TaskStatus::Running)
+        .filter(|a| a.decision == voff_core::ApprovalDecision::Pending)
     {
+        let mut current = tasks.iter().find(|task| task.id == approval.task_id);
+        if !current.is_some_and(|task| task.status == TaskStatus::WaitingApproval) {
+            continue;
+        }
+        while let Some(parent) = current.and_then(|task| task.parent) {
+            if !task_ids.contains(&parent) || !waiting_ancestors.insert(parent) {
+                break;
+            }
+            current = tasks.iter().find(|task| task.id == parent);
+        }
+    }
+    for task in tasks.into_iter().filter(|task| {
+        task_ids.contains(&task.id)
+            && task.status == TaskStatus::Running
+            && !waiting_ancestors.contains(&task.id)
+    }) {
         let event = CanonicalEvent {
             id: EventId::new(),
             session_id: session,
@@ -1021,6 +1111,87 @@ mod tests {
     use voff_core::{Task, TaskLimits};
     use voff_storage::InMemoryRepository;
 
+    #[tokio::test]
+    async fn resumed_lead_can_retry_and_start_new_delegation_without_identity_drift() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let lead = AgentProfile {
+            id: AgentId::new(),
+            name: "Team Lead".into(),
+            role: "technical_lead".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: "coordinate".into(),
+            tools: vec!["task.delegate".into()],
+            max_output_tokens: 16384,
+            enabled: true,
+            allowed_targets: vec!["Backend".into()],
+            delegation_limits: Some(TaskLimits::default()),
+        };
+        let specialist = AgentProfile {
+            id: AgentId::new(),
+            name: "Backend".into(),
+            role: "backend_developer".into(),
+            tools: vec!["file.patch".into()],
+            allowed_targets: vec![],
+            ..lead.clone()
+        };
+        for agent in [&lead, &specialist] {
+            repo.save_agent(agent.clone()).await.unwrap();
+        }
+        let mut old = Task::root(lead.id, "build app", vec![], TaskLimits::default());
+        old.transition(TaskStatus::Ready).unwrap();
+        old.transition(TaskStatus::Running).unwrap();
+        old.transition(TaskStatus::Failed).unwrap();
+        repo.save_task(old.clone()).await.unwrap();
+        let agents = repo.agents().await.unwrap();
+        let tasks = repo.tasks().await.unwrap();
+        let restored = resumed_agent_id(&lead.name, &lead.role, &agents, &tasks).unwrap();
+        assert_eq!(restored, old.owner);
+        assert!(resumed_agent_id(&lead.name, "different_role", &agents, &tasks).is_none());
+        assert!(resumed_agent_id(&lead.name, &lead.role, &agents, &[]).is_none());
+        let provider = MockProvider::new(vec![
+            MockStep::Event(voff_provider::ProviderEvent::ToolRequest(voff_provider::StructuredToolRequest {
+                id:voff_core::ToolCallId::new(), name:"task.delegate".into(),
+                arguments_json:serde_json::json!({"proposals":[{"target_agent":"Backend","objective":"implement API","acceptance_criteria":["API works"]}]}).to_string(),
+            })), MockStep::Event(voff_provider::ProviderEvent::Completed),
+        ]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let session = SessionId::new();
+        let engine = voff_engine::Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_formation_agents(&[lead, specialist])
+            .with_team_lead(restored);
+        let retry = engine.retry_task(old.id).await.unwrap();
+        let mut historical_lead = repo.agent(restored).await.unwrap().unwrap();
+        historical_lead.id = AgentId::new();
+        repo.save_agent(historical_lead.clone()).await.unwrap();
+        let mut ancient = old.clone();
+        ancient.id = voff_core::TaskId::new();
+        ancient.owner = historical_lead.id;
+        repo.save_task(ancient.clone()).await.unwrap();
+        let legacy_retry = engine.retry_task(ancient.id).await.unwrap();
+        assert_eq!(legacy_retry.owner, restored);
+        assert_eq!(
+            repo.task(ancient.id).await.unwrap().unwrap().owner,
+            historical_lead.id
+        );
+        historical_lead.role = "different_role".into();
+        repo.save_agent(historical_lead).await.unwrap();
+        assert_ne!(engine.retry_task(ancient.id).await.unwrap().owner, restored);
+        let quick_run = engine
+            .create_task(restored, "Quick Run: analyze Markdown and delegate", vec![])
+            .await
+            .unwrap();
+        for task in [retry, legacy_retry, quick_run] {
+            engine.mark_ready(task.id).await.unwrap();
+            engine.run_task(task.id).await.unwrap();
+            assert_eq!(
+                repo.task(task.id).await.unwrap().unwrap().status,
+                TaskStatus::WaitingApproval
+            );
+        }
+        assert_eq!(repo.approvals(session).await.unwrap().len(), 3);
+    }
+
     #[test]
     fn launch_resumes_by_default_and_new_session_is_explicit() {
         let cli = Cli::try_parse_from(["voff"]).unwrap();
@@ -1237,6 +1408,97 @@ mod tests {
         assert_eq!(
             repo.task(other_task.id).await.unwrap().unwrap().status,
             TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_coordinator_waiting_on_output_limit_consent() {
+        let repo = InMemoryRepository::default();
+        let session = SessionId::new();
+        let mut parent = Task::root(AgentId::new(), "parent", vec![], TaskLimits::default());
+        parent.transition(TaskStatus::Ready).unwrap();
+        parent.transition(TaskStatus::Running).unwrap();
+        let mut child = Task::root(AgentId::new(), "child", vec![], TaskLimits::default());
+        child.parent = Some(parent.id);
+        child.transition(TaskStatus::Ready).unwrap();
+        child.transition(TaskStatus::Running).unwrap();
+        child.transition(TaskStatus::WaitingApproval).unwrap();
+        for task in [&parent, &child] {
+            repo.save_task(task.clone()).await.unwrap();
+            repo.append_event(CanonicalEvent {
+                id: EventId::new(),
+                session_id: session,
+                task_id: Some(task.id),
+                created_at: chrono::Utc::now(),
+                kind: CanonicalEventKind::TaskCreated,
+            })
+            .await
+            .unwrap();
+        }
+        repo.save_approval(voff_core::Approval {
+            id: voff_core::ApprovalId::new(),
+            task_id: child.id,
+            tool_call_id: voff_core::ToolCallId::new(),
+            action: "provider.continue".into(),
+            working_directory: "current task".into(),
+            reason: "{}".into(),
+            decision: voff_core::ApprovalDecision::Pending,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+        recover_interrupted(&repo, session).await.unwrap();
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            repo.task(child.id).await.unwrap().unwrap().status,
+            TaskStatus::WaitingApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_parent_waiting_for_a_persisted_revision() {
+        let repo = InMemoryRepository::default();
+        let session = SessionId::new();
+        let mut parent = Task::root(AgentId::new(), "parent", vec![], TaskLimits::default());
+        parent.status = TaskStatus::Running;
+        let mut child = Task::root(AgentId::new(), "child", vec![], TaskLimits::default());
+        child.parent = Some(parent.id);
+        child.status = TaskStatus::Blocked;
+        for task in [&parent, &child] {
+            repo.save_task(task.clone()).await.unwrap();
+            repo.append_event(CanonicalEvent {
+                id: EventId::new(),
+                session_id: session,
+                task_id: Some(task.id),
+                created_at: chrono::Utc::now(),
+                kind: CanonicalEventKind::TaskCreated,
+            })
+            .await
+            .unwrap();
+        }
+        repo.append_event(CanonicalEvent {
+            id: EventId::new(),
+            session_id: session,
+            task_id: Some(child.id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::RevisionRequested {
+                approval_id: voff_core::ApprovalId::new(),
+                feedback: "Correct the patch".into(),
+            },
+        })
+        .await
+        .unwrap();
+        recover_interrupted(&repo, session).await.unwrap();
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            repo.task(child.id).await.unwrap().unwrap().status,
+            TaskStatus::Blocked
         );
     }
 

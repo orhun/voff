@@ -198,10 +198,42 @@ and `q` to quit. All core actions remain keyboard-accessible.
 
 ## Development checks
 
+Application diagnostics are appended to the selected workspace's
+`.voff/logs/voff.log` using `tracing` and `tracing_subscriber`, without writing
+over the TUI. They include task IDs, state transitions, request attempts and
+approval decisions, but not prompts, response bodies or credentials. Set
+`RUST_LOG=debug` for more detail; third-party SDK traces are excluded even at
+trace level. On launch, logs of at least 10 MiB rotate to `voff.previous.log`.
+There is no configuration migration required.
+
+OpenAI, Ollama, Codex and compatible Claude CLIs stream text or structured-output
+previews as they are generated. Previews are display-only: a successful terminal response
+and full validation are required before any executable proposal is published.
+Interrupted output stays visible with the failed/cancelled task status; it is
+not treated as successful work. Transient failures retry up to three attempts
+with backoff; a retry resets the preview and never releases the failed attempt's
+actions. Codex uses its app-server protocol; Claude requires a recent CLI with
+restricted mode and streaming structured-output support. Both use existing CLI
+login without an API key. See [provider limitations](docs/PROVIDER_ADAPTERS.md).
+
+Output-token exhaustion pauses for `[y] Continue` / `[n] Cancel` instead of
+immediately failing the task. Continue regenerates with a higher task-local
+allowance and may cost more; partial tool calls are never applied. New/omitted
+defaults are 16,384 tokens; explicit existing limits are preserved. In Tasks and
+Events, `[v]` expands/collapses long output, and Summary shows the latest preview
+first. Stream persistence is batched to reduce application-side overhead.
+
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+```
+
+For a real two-role Codex delegation/patch/persistence smoke test (requires
+installed Codex login and consumes account usage; no API key required):
+
+```bash
+cargo test -p voff-engine --test local_codex -- --ignored --nocapture
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/ARCHITECTURE.md),

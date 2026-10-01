@@ -1,6 +1,10 @@
 //! Provider-neutral model execution port.
 mod adapters;
+mod codex_server;
 mod local_cli;
+mod openai_stream;
+mod response;
+pub use response::{collect_response, collect_response_with_preview};
 
 pub use adapters::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 pub use local_cli::{LocalCliKind, LocalCliProvider};
@@ -87,6 +91,12 @@ pub struct Usage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderEvent {
     TextDelta(String),
+    /// Display-only generated tool/structured-output fragments. Never actionable.
+    OutputDelta(String),
+    /// Starts a new bounded attempt; previous previews are not completed output.
+    Retrying {
+        attempt: u16,
+    },
     ToolRequest(StructuredToolRequest),
     Usage(Usage),
     Warning(String),
@@ -103,6 +113,8 @@ pub enum ProviderErrorKind {
     RateLimit,
     Timeout,
     InvalidResponse,
+    /// Generation exhausted its output allowance; requires user consent to raise it.
+    OutputLimit,
     Cancelled,
     Internal,
 }
@@ -226,10 +238,14 @@ impl ResilientProvider {
     }
     async fn failure(&self, error: &ProviderError) {
         let mut state = self.state.lock().await;
-        state.failures = state.failures.saturating_add(1);
         state.last_error = Some(error.to_string());
-        if state.failures >= self.policy.failure_threshold {
-            state.opened_at = Some(Instant::now());
+        // A bad model/schema/task is not a provider-wide outage. It must not
+        // prevent another role using a healthy model on the same route.
+        if retry_allowed(error) {
+            state.failures = state.failures.saturating_add(1);
+            if state.failures >= self.policy.failure_threshold {
+                state.opened_at = Some(Instant::now());
+            }
         }
     }
     async fn backoff(
@@ -241,7 +257,17 @@ impl ResilientProvider {
         let factor = 1_u32
             .checked_shl(u32::from(attempt.saturating_sub(1)))
             .unwrap_or(u32::MAX);
-        let delay = self.policy.initial_backoff.saturating_mul(factor);
+        let delay = self
+            .policy
+            .initial_backoff
+            .saturating_mul(factor)
+            .min(Duration::from_secs(30));
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+            % (delay.as_millis() as u64 / 4 + 1);
+        let delay = delay.saturating_add(Duration::from_millis(jitter));
         tokio::select! { ()=cancellation.cancelled()=>Err(ProviderError { kind: ProviderErrorKind::Cancelled, message:"cancelled during retry backoff".into(), retryable:false }), ()=tokio::time::sleep(delay)=>Ok(()) }
     }
 }
@@ -283,48 +309,68 @@ impl ModelProvider for ResilientProvider {
         self.permit().await?;
         for attempt in 1..=self.policy.max_attempts.max(1) {
             let (attempt_tx, mut attempt_rx) = mpsc::channel(64);
-            let inner = Arc::clone(&self.inner);
-            let req = request.clone();
-            let cancel = cancellation.clone();
-            let run = tokio::spawn(async move { inner.start(req, attempt_tx, cancel).await });
-            let mut emitted = false;
-            let mut emitted_tool_request = false;
-            while let Some(event) = attempt_rx.recv().await {
-                emitted = true;
-                emitted_tool_request |= matches!(&event, ProviderEvent::ToolRequest(_));
-                sink.send(event).await.map_err(|_| ProviderError {
-                    kind: ProviderErrorKind::Internal,
-                    message: "event receiver closed".into(),
-                    retryable: false,
-                })?;
-            }
-            let result = run.await.map_err(|error| ProviderError {
-                kind: ProviderErrorKind::Internal,
-                message: error.to_string(),
-                retryable: true,
-            })?;
+            tracing::info!(task_id = %request.task_id, attempt, "provider attempt");
+            let run = collect_response_with_preview(
+                self.inner.as_ref(),
+                request.clone(),
+                cancellation.child_token(),
+                Duration::from_secs(300),
+                Some(attempt_tx),
+            );
+            let forward = async {
+                while let Some(event) = attempt_rx.recv().await {
+                    if let Err(error) = crate::adapters::send(&sink, event, &cancellation).await {
+                        // Wake a producer blocked on this bounded channel when
+                        // the downstream collector has gone away.
+                        attempt_rx.close();
+                        return Err(error);
+                    }
+                }
+                Ok::<(), ProviderError>(())
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(crate::adapters::cancelled()),
+                result = async {
+                    let (result, forwarded) = tokio::join!(run, forward);
+                    forwarded?;
+                    result
+                } => result,
+            };
             match result {
-                Ok(value) => {
+                Ok(events) => {
+                    let mut usage = None;
+                    for event in events {
+                        match event {
+                            ProviderEvent::TextDelta(_)
+                            | ProviderEvent::OutputDelta(_)
+                            | ProviderEvent::Retrying { .. } => continue,
+                            ProviderEvent::Usage(ref value) => usage = Some(value.clone()),
+                            _ => {}
+                        }
+                        crate::adapters::send(&sink, event, &cancellation).await?;
+                    }
                     self.success().await;
-                    return Ok(value);
+                    return Ok(ProviderCompletion { usage });
                 }
-                Err(error)
-                    if emitted_tool_request && error.kind == ProviderErrorKind::InvalidResponse =>
-                {
-                    // A structured tool proposal is already durable at the engine
-                    // boundary. A malformed trailing frame remains auditable, but
-                    // must not poison the shared route used to execute that tool.
-                    self.success().await;
-                    return Err(error);
-                }
-                Err(error)
-                    if !emitted && retry_allowed(&error) && attempt < self.policy.max_attempts =>
-                {
+                Err(error) if retry_allowed(&error) && attempt < self.policy.max_attempts => {
                     self.failure(&error).await;
+                    tracing::warn!(task_id = %request.task_id, attempt, ?error.kind, "retrying unsuccessful provider turn");
+                    crate::adapters::send(
+                        &sink,
+                        ProviderEvent::Retrying {
+                            attempt: attempt + 1,
+                        },
+                        &cancellation,
+                    )
+                    .await?;
                     self.backoff(attempt, &cancellation).await?;
                 }
                 Err(error) => {
-                    self.failure(&error).await;
+                    if error.kind != ProviderErrorKind::Cancelled {
+                        self.failure(&error).await;
+                    }
+                    tracing::warn!(task_id = %request.task_id, ?error.kind, "provider attempt failed");
                     return Err(error);
                 }
             }
@@ -436,6 +482,7 @@ pub mod contract {
             ProviderErrorKind::Authentication
                 | ProviderErrorKind::Authorization
                 | ProviderErrorKind::InvalidResponse
+                | ProviderErrorKind::OutputLimit
                 | ProviderErrorKind::Cancelled
         ) {
             assert!(
@@ -532,11 +579,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            rx.recv().await,
+            Some(ProviderEvent::Retrying { attempt: 2 })
+        );
         assert_eq!(rx.recv().await, Some(ProviderEvent::Completed));
         assert_eq!(provider.health().await.retries, 1);
     }
     #[tokio::test]
-    async fn never_retries_after_stream_output() {
+    async fn retries_preview_only_failures_with_a_bounded_attempt_count() {
         let inner = Arc::new(Flaky {
             calls: AtomicUsize::new(0),
             fail_until: 3,
@@ -550,7 +601,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 3);
     }
     #[tokio::test]
     async fn circuit_opens_after_threshold() {
@@ -590,7 +641,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_tool_output_does_not_poison_the_circuit_on_a_bad_terminal_frame() {
+    async fn closed_downstream_does_not_deadlock_a_busy_provider() {
+        let inner = Arc::new(MockProvider::new(
+            (0..128)
+                .map(|_| MockStep::Event(ProviderEvent::TextDelta("chunk".into())))
+                .collect(),
+        ));
+        let provider = ResilientProvider::new(inner, policy());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.start(request(), tx, CancellationToken::new()),
+        )
+        .await
+        .expect("provider must stop when its consumer closes");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_task_output_never_leaks_tools_or_trips_the_shared_circuit() {
         let inner = Arc::new(MockProvider::new(vec![
             MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
                 id: ToolCallId::new(),
@@ -601,20 +671,80 @@ mod tests {
         ]));
         let provider = ResilientProvider::new(inner, policy());
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             let (tx, mut rx) = mpsc::channel(4);
             let error = provider
                 .start(request(), tx, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
-            assert!(matches!(
-                rx.recv().await,
-                Some(ProviderEvent::ToolRequest(_))
-            ));
+            assert!(rx.recv().await.is_none());
             let health = provider.health().await;
             assert_eq!(health.circuit, CircuitStatus::Closed);
             assert_eq!(health.consecutive_failures, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn retry_discards_failed_attempt_text_and_actions() {
+        struct Interrupted(AtomicUsize);
+        #[async_trait]
+        impl ModelProvider for Interrupted {
+            fn descriptor(&self) -> ProviderDescriptor {
+                ProviderDescriptor {
+                    id: "interrupted".into(),
+                    display_name: "Interrupted".into(),
+                    capabilities: ProviderCapabilities::default(),
+                }
+            }
+            async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+                Ok(vec![])
+            }
+            async fn start(
+                &self,
+                _: CanonicalRequest,
+                sink: ProviderEventSink,
+                _: CancellationToken,
+            ) -> Result<ProviderCompletion, ProviderError> {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                let label = if first { "discarded" } else { "accepted" };
+                sink.send(ProviderEvent::TextDelta(label.into()))
+                    .await
+                    .unwrap();
+                sink.send(ProviderEvent::ToolRequest(StructuredToolRequest {
+                    id: ToolCallId::new(),
+                    name: label.into(),
+                    arguments_json: "{}".into(),
+                }))
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if first {
+                    Err(ProviderError {
+                        kind: ProviderErrorKind::Internal,
+                        message: "disconnected".into(),
+                        retryable: true,
+                    })
+                } else {
+                    sink.send(ProviderEvent::Completed).await.unwrap();
+                    Ok(ProviderCompletion { usage: None })
+                }
+            }
+        }
+        let inner = Arc::new(Interrupted(AtomicUsize::new(0)));
+        let provider = ResilientProvider::new(inner.clone(), policy());
+        let events = collect_response(
+            &provider,
+            request(),
+            CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inner.0.load(Ordering::SeqCst), 2);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], ProviderEvent::TextDelta("accepted".into()));
+        assert!(matches!(&events[1], ProviderEvent::ToolRequest(call) if call.name == "accepted"));
+        assert_eq!(events[2], ProviderEvent::Completed);
     }
 }

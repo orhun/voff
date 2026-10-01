@@ -133,13 +133,33 @@ Formation-level policy fields:
 Default is `propose_only`, maximum depth 2 and explicit bounded budgets.
 
 When an enabled coordinating agent has both allowed targets and the
-`task.delegate` capability, the engine sets a provider-neutral specific-tool
-choice for `task.delegate` and supplies each enabled target's role and
-capabilities. Natural-language implementation output cannot substitute for the
-required structured plan. Leaf implementation agents with `file.patch` are
-likewise required to produce a structured patch proposal.
+`task.delegate` capability, the engine supplies each enabled target's role and
+capabilities with automatic tool choice. The coordinator answers simple questions
+directly without delegation, and uses a structured plan for specialist work.
+Natural-language claims are not evidence of implementation. Leaf implementation
+agents with `file.patch` are required to produce a structured patch proposal.
+A configured solo coordinator also uses automatic tool choice so a question
+does not force a workspace patch.
 
 ## 9. Review protocol
+
+With `runtime.automatic_review = true`, routine proposal approvals return to the
+configured coordinator through a separate restricted `workflow.decide` request.
+The coordinator's own `task.delegate` and `review.request` assignments are an
+exception: their validated decisions dispatch directly, retaining audit records
+and runtime limits without requesting self-approval. Explicit manual mode
+continues to require human decisions. Previously interrupted reviews still
+fail closed rather than being silently authorized on resume.
+The strict response is `{ "approve": true|false, "reason": "..." }`. Review has
+no executable tools. Start/verdict events are persisted, and an affirmative
+verdict still passes through the normal scoped dispatcher. Invalid verdicts
+and review failures deny without execution. A valid Lead rejection of a patch or
+test proposal returns feedback to its owner for a new attempt and fresh review
+(ADR 0033); the denied action itself is not retried. Identical denied proposals,
+human/runtime denials, cancellation and invalid reviews cannot enter this loop.
+Repairable failures return to the coordinator for concrete corrective guidance,
+bounded to three total attempts. Account/configuration issues notify the user;
+output-token increases retain human consent. See ADR 0032.
 
 A review request references immutable artifacts/diffs and acceptance criteria. Reviewer returns findings with severity (`blocking`, `major`, `minor`, `note`), location, rationale and suggested resolution. Only the integrator or user applies resolutions.
 
@@ -158,13 +178,17 @@ A review request references immutable artifacts/diffs and acceptance criteria. R
 - Authentication, permission denial, budget exhaustion and user cancellation do not auto-retry.
 - A tool-proposal error before approval emits failure evidence and transitions
   an already-running task to `Failed`; it cannot remain indefinitely active.
-- If a fully validated tool proposal is already persisted for approval, an
-  invalid terminal stream frame is audited but does not overwrite the pending
-  approval with `Failed`.
-- If usable text or a structured tool proposal was streamed and only the
-  terminal frame is undecodable, preserve the output, record a warning, and
-  complete with unknown usage. The same decode failure before usable output is
-  terminal.
+- Collect a bounded, complete provider response before publishing proposals.
+  Invalid or incomplete responses cannot leave actionable partial approvals.
+  Text and structured-output previews may be displayed during generation, but
+  cannot authorize execution or prove completion. Every adapter requires a
+  successful terminal record; truncated or filtered completions fail explicitly.
+  Transient failures may retry within the attempt budget even after a preview:
+  `ProviderRetrying` resets that preview, and failed-attempt proposals are
+  discarded. Warnings are distinct from failures.
+- Serialize scheduler waves and approval decisions. Independent child requests
+  within a wave may run concurrently; a consumed approval cannot execute twice.
+- Parent failure evidence identifies unsuccessful children by task ID/status.
 - Scheduler waves operate only on tasks created or delegated in the active
   session; persisted queued tasks from older sessions are not resumed implicitly.
 - Every attempt retains an attempt number and correlation ID.

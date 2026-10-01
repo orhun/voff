@@ -7,15 +7,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    env, fs,
-    io::Write,
+    env,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
-use tempfile::NamedTempFile;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
@@ -68,6 +66,7 @@ impl LocalCliKind {
 pub struct LocalCliProvider {
     kind: LocalCliKind,
     executable: PathBuf,
+    probed: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl LocalCliProvider {
@@ -90,6 +89,7 @@ impl LocalCliProvider {
         Ok(Self {
             kind,
             executable: kind.executable().into(),
+            probed: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 }
@@ -101,7 +101,7 @@ impl ModelProvider for LocalCliProvider {
             id: self.kind.id().into(),
             display_name: self.kind.display_name().into(),
             capabilities: ProviderCapabilities {
-                streaming: false,
+                streaming: true,
                 tools: true,
                 structured_output: true,
                 images: false,
@@ -131,15 +131,16 @@ impl ModelProvider for LocalCliProvider {
         let tool_required = matches!(request.tool_choice, ToolChoice::Specific(_));
         let output = match self.kind {
             LocalCliKind::Codex => {
-                self.run_codex(&request.model, &prompt, &schema, &cancellation)
+                self.run_codex(&request.model, &prompt, &schema, &sink, &cancellation)
                     .await?
             }
             LocalCliKind::Claude => {
-                self.run_claude(&request.model, &prompt, &schema, &cancellation)
+                self.run_claude(&request.model, &prompt, &schema, &sink, &cancellation)
                     .await?
             }
         };
         let output = parse_local_output(&output, &tools, tool_required)?;
+        tracing::info!(task_id = %request.task_id, provider = self.kind.id(), tool_calls = output.tool_calls.len(), "local CLI response decoded");
         if output.text.is_empty() && output.tool_calls.is_empty() {
             return Err(invalid_cli_response("local CLI returned no usable output"));
         }
@@ -165,12 +166,19 @@ impl ModelProvider for LocalCliProvider {
 
 impl LocalCliProvider {
     async fn probe(&self, cancellation: &CancellationToken) -> Result<(), ProviderError> {
+        self.probed
+            .get_or_try_init(|| self.probe_uncached(cancellation))
+            .await
+            .map(|_| ())
+    }
+
+    async fn probe_uncached(&self, cancellation: &CancellationToken) -> Result<(), ProviderError> {
         let execution_directory = tempfile::tempdir().map_err(local_io_error)?;
         let mut command = Command::new(&self.executable);
         command.current_dir(execution_directory.path());
         match self.kind {
             LocalCliKind::Codex => {
-                command.args(["exec", "--help"]);
+                command.args(["app-server", "--help"]);
             }
             LocalCliKind::Claude => {
                 command.arg("--help");
@@ -178,7 +186,7 @@ impl LocalCliProvider {
         }
         configure_environment(&mut command);
         let output =
-            tokio::time::timeout(PROBE_TIMEOUT, run_process(command, b"", true, cancellation))
+            tokio::time::timeout(PROBE_TIMEOUT, run_process(command, b"", cancellation, None))
                 .await
                 .map_err(|_| ProviderError {
                     kind: ProviderErrorKind::Timeout,
@@ -187,18 +195,14 @@ impl LocalCliProvider {
                 })??;
         let help = String::from_utf8_lossy(&output);
         let required: &[&str] = match self.kind {
-            LocalCliKind::Codex => &[
-                "--ephemeral",
-                "--ignore-user-config",
-                "--output-schema",
-                "--output-last-message",
-            ],
+            LocalCliKind::Codex => &["--listen"],
             LocalCliKind::Claude => &[
                 "--json-schema",
                 "--restricted",
                 "--safe-mode",
                 "--permission-prompts",
                 "--no-session-persistence",
+                "--include-partial-messages",
             ],
         };
         let missing = required
@@ -226,38 +230,10 @@ impl LocalCliProvider {
         model: &str,
         prompt: &[u8],
         schema: &Value,
+        sink: &ProviderEventSink,
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>, ProviderError> {
-        let mut schema_file = NamedTempFile::new().map_err(local_io_error)?;
-        serde_json::to_writer(&mut schema_file, schema).map_err(|error| {
-            invalid_cli_response(&format!("could not encode local output schema: {error}"))
-        })?;
-        schema_file.flush().map_err(local_io_error)?;
-        let output_file = NamedTempFile::new().map_err(local_io_error)?;
-        let execution_directory = tempfile::tempdir().map_err(local_io_error)?;
-
-        let mut command = Command::new(&self.executable);
-        command.args([
-            "exec",
-            "--ephemeral",
-            "--color",
-            "never",
-            "--sandbox",
-            "read-only",
-            "--ignore-user-config",
-            "--skip-git-repo-check",
-            "--cd",
-        ]);
-        command.arg(execution_directory.path());
-        command.arg("--output-schema").arg(schema_file.path());
-        command.arg("--output-last-message").arg(output_file.path());
-        if model != "default" {
-            command.arg("--model").arg(model);
-        }
-        command.arg("-");
-        configure_environment(&mut command);
-        run_process(command, prompt, false, cancellation).await?;
-        read_bounded_file(output_file.path())
+        crate::codex_server::run(&self.executable, model, prompt, schema, sink, cancellation).await
     }
 
     async fn run_claude(
@@ -265,6 +241,7 @@ impl LocalCliProvider {
         model: &str,
         prompt: &[u8],
         schema: &Value,
+        sink: &ProviderEventSink,
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>, ProviderError> {
         let schema = serde_json::to_string(schema).map_err(|error| {
@@ -275,7 +252,9 @@ impl LocalCliProvider {
         command.current_dir(execution_directory.path()).args([
             "-p",
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--json-schema",
             &schema,
             "--restricted",
@@ -293,7 +272,7 @@ impl LocalCliProvider {
             command.arg("--model").arg(model);
         }
         configure_environment(&mut command);
-        let envelope = run_process(command, prompt, true, cancellation).await?;
+        let envelope = run_process(command, prompt, cancellation, Some(sink)).await?;
         let envelope: Value = serde_json::from_slice(&envelope).map_err(|error| {
             invalid_cli_response(&format!("Claude CLI returned invalid JSON: {error}"))
         })?;
@@ -306,7 +285,7 @@ impl LocalCliProvider {
     }
 }
 
-fn configure_environment(command: &mut Command) {
+pub(super) fn configure_environment(command: &mut Command) {
     command
         .env_clear()
         .stdin(Stdio::piped())
@@ -323,12 +302,9 @@ fn configure_environment(command: &mut Command) {
 async fn run_process(
     mut command: Command,
     prompt: &[u8],
-    capture_stdout: bool,
     cancellation: &CancellationToken,
+    preview: Option<&ProviderEventSink>,
 ) -> Result<Vec<u8>, ProviderError> {
-    if !capture_stdout {
-        command.stdout(Stdio::null());
-    }
     let program = command
         .as_std()
         .get_program()
@@ -344,77 +320,122 @@ async fn run_process(
         message: format!("{program} stdin was unavailable"),
         retryable: false,
     })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let io = async {
+        let write = async {
+            stdin.write_all(prompt).await.map_err(local_io_error)?;
+            stdin.shutdown().await.map_err(local_io_error)?;
+            drop(stdin);
+            Ok::<(), ProviderError>(())
+        };
+        let read_stdout = async {
+            match (stdout, preview) {
+                (Some(stdout), Some(sink)) => read_claude_stream(stdout, sink, cancellation).await,
+                (stdout, _) => read_pipe(stdout).await,
+            }
+        };
+        let read_stderr = read_pipe(stderr);
+        let wait = async { child.wait().await.map_err(local_io_error) };
+        let ((), output, diagnostic, status) =
+            tokio::try_join!(write, read_stdout, read_stderr, wait)?;
+        if !status.success() {
+            return Err(classify_process_failure(&program, status, &diagnostic));
+        }
+        Ok(output)
+    };
     tokio::select! {
-        () = cancellation.cancelled() => {
-            let _ = child.kill().await;
-            return Err(cancelled());
-        }
-        result = async {
-            stdin.write_all(prompt).await?;
-            stdin.shutdown().await
-        } => result.map_err(local_io_error)?,
+        biased;
+        () = cancellation.cancelled() => Err(cancelled()),
+        () = tokio::time::sleep(Duration::from_secs(300)) => Err(ProviderError {
+            kind: ProviderErrorKind::Timeout,
+            message: "local CLI exceeded the five-minute request deadline".into(),
+            retryable: true,
+        }),
+        result = io => result,
     }
-    drop(stdin);
+}
 
-    let stdout = child.stdout.take().map(|stdout| {
-        tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stdout
-                .take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await
-                .map(|_| bytes)
-        })
-    });
-    let stderr = child.stderr.take().map(|stderr| {
-        tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stderr
-                .take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await
-                .map(|_| bytes)
-        })
-    });
-    let status = tokio::select! {
-        () = cancellation.cancelled() => {
-            let _ = child.kill().await;
-            return Err(cancelled());
+async fn read_claude_stream<R: tokio::io::AsyncRead + Unpin>(
+    stdout: R,
+    sink: &ProviderEventSink,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut reader = BufReader::new(stdout);
+    let mut total = 0usize;
+    let mut result = None;
+    loop {
+        let mut line = Vec::new();
+        let size = (&mut reader)
+            .take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(local_io_error)?;
+        if size == 0 {
+            break;
         }
-        status = child.wait() => status,
+        total = total.saturating_add(size);
+        if size > MAX_CLI_OUTPUT_BYTES || total > 16 * MAX_CLI_OUTPUT_BYTES {
+            return Err(invalid_cli_response(
+                "Claude stream exceeded bounded output limits",
+            ));
+        }
+        let value: Value = serde_json::from_slice(&line)
+            .map_err(|_| invalid_cli_response("Claude returned malformed stream JSON"))?;
+        match value["type"].as_str() {
+            Some("stream_event") if result.is_none() => {
+                let delta = &value["event"]["delta"];
+                let text = match delta["type"].as_str() {
+                    Some("text_delta") => delta["text"].as_str(),
+                    Some("input_json_delta") => delta["partial_json"].as_str(),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    send(sink, ProviderEvent::OutputDelta(text.into()), cancellation).await?;
+                }
+            }
+            Some("result") => {
+                if result.is_some() {
+                    return Err(invalid_cli_response(
+                        "Claude returned multiple terminal results",
+                    ));
+                }
+                if value["is_error"] == true || value["subtype"] != "success" {
+                    return Err(invalid_cli_response(
+                        "Claude failed its structured turn; check login, model availability and limits",
+                    ));
+                }
+                if value.get("structured_output").is_none() {
+                    return Err(invalid_cli_response("Claude omitted structured_output"));
+                }
+                result = Some(line);
+            }
+            _ => {} // Metadata and reasoning are never interpreted as Voff actions.
+        }
     }
-    .map_err(local_io_error)?;
-    let output = match stdout {
-        Some(stdout) => stdout
+    result.ok_or_else(|| ProviderError {
+        kind: ProviderErrorKind::Internal,
+        message: "Claude stream ended before a terminal result".into(),
+        retryable: true,
+    })
+}
+
+pub(super) async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut bytes = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
             .await
-            .map_err(|error| ProviderError {
-                kind: ProviderErrorKind::Internal,
-                message: format!("local CLI output reader failed: {error}"),
-                retryable: false,
-            })?
-            .map_err(local_io_error)?,
-        None => Vec::new(),
-    };
-    let diagnostic = match stderr {
-        Some(stderr) => stderr
-            .await
-            .map_err(|error| ProviderError {
-                kind: ProviderErrorKind::Internal,
-                message: format!("local CLI diagnostic reader failed: {error}"),
-                retryable: false,
-            })?
-            .map_err(local_io_error)?,
-        None => Vec::new(),
-    };
-    if !status.success() {
-        return Err(classify_process_failure(&program, status, &diagnostic));
+            .map_err(local_io_error)?;
     }
-    if output.len() > MAX_CLI_OUTPUT_BYTES {
+    if bytes.len() > MAX_CLI_OUTPUT_BYTES {
         return Err(invalid_cli_response(
             "local CLI output exceeded 2097152 bytes",
         ));
     }
-    Ok(output)
+    Ok(bytes)
 }
 
 fn classify_process_failure(
@@ -481,17 +502,7 @@ fn classify_process_failure(
     }
 }
 
-fn read_bounded_file(path: &Path) -> Result<Vec<u8>, ProviderError> {
-    let metadata = fs::metadata(path).map_err(local_io_error)?;
-    if metadata.len() > MAX_CLI_OUTPUT_BYTES as u64 {
-        return Err(invalid_cli_response(
-            "local CLI output exceeded 2097152 bytes",
-        ));
-    }
-    fs::read(path).map_err(local_io_error)
-}
-
-fn local_io_error(error: std::io::Error) -> ProviderError {
+pub(super) fn local_io_error(error: std::io::Error) -> ProviderError {
     ProviderError {
         kind: ProviderErrorKind::Internal,
         message: format!("local CLI I/O failed: {error}"),
@@ -666,6 +677,7 @@ fn parse_local_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use voff_core::{MessageId, TaskId};
@@ -791,29 +803,31 @@ mod tests {
             (
                 LocalCliKind::Codex,
                 r#"#!/bin/sh
-if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
-  printf '%s\n' '--ephemeral --ignore-user-config --output-schema --output-last-message'
+if [ "$2" = "--help" ]; then
+  printf '%s\n' '--listen'
   exit 0
 fi
-output=''
-previous=''
-for argument in "$@"; do
-  if [ "$previous" = 'output' ]; then output="$argument"; previous=''; continue; fi
-  if [ "$argument" = '--output-last-message' ]; then previous='output'; fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{"notify":[],"web_search":"disabled","features":{"hooks":false,"shell_tool":false,"plugins":false,"enable_mcp_apps":false,"unified_exec":false,"shell_snapshot":false,"multi_agent":false,"multi_agent_v2":false,"code_mode":false,"js_repl":false,"memories":false,"view_image":false}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-test","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn-test"}}}' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","delta":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"type":"agentMessage","text":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}}' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
+      ;;
+  esac
 done
-cat >/dev/null
-printf '%s' '{"text":"codex ok","tool_calls":[]}' > "$output"
 "#,
             ),
             (
                 LocalCliKind::Claude,
                 r#"#!/bin/sh
 if [ "$1" = '--help' ]; then
-  printf '%s\n' '--json-schema --restricted --safe-mode --permission-prompts --no-session-persistence'
+  printf '%s\n' '--json-schema --restricted --safe-mode --permission-prompts --no-session-persistence --include-partial-messages'
   exit 0
 fi
 cat >/dev/null
-printf '%s' '{"structured_output":{"text":"claude ok","tool_calls":[]}}'
+printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"claude"}}}' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"claude ok","tool_calls":[]}}'
 "#,
             ),
         ] {

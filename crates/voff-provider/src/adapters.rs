@@ -5,13 +5,13 @@ use futures_util::StreamExt;
 use rig_core::{
     client::{CompletionClient, ModelListingClient, Nothing},
     completion::{
-        CompletionError, CompletionModel, CompletionRequest as RigCompletionRequest,
+        CompletionError, CompletionModel, CompletionRequest as RigCompletionRequest, FinishReason,
         ToolDefinition as RigToolDefinition,
     },
     message::{AssistantContent, Message, Text, ToolChoice as RigToolChoice, UserContent},
     model::{ModelList, ModelListingError},
     providers::{ollama, openai},
-    streaming::StreamedAssistantContent,
+    streaming::{StreamedAssistantContent, ToolCallDeltaContent},
 };
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -166,6 +166,7 @@ impl ModelProvider for OllamaProvider {
 pub struct OpenAiProvider {
     base_url: String,
     api_key: OpenAiApiKey,
+    http: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -198,6 +199,7 @@ impl OpenAiProvider {
         Ok(Self {
             base_url,
             api_key: OpenAiApiKey::Static(api_key),
+            http: crate::openai_stream::client()?,
         })
     }
 
@@ -217,11 +219,12 @@ impl OpenAiProvider {
         Ok(Self {
             base_url,
             api_key: OpenAiApiKey::Dynamic(api_key),
+            http: crate::openai_stream::client()?,
         })
     }
 
-    fn client(&self) -> Result<openai::Client, ProviderError> {
-        let api_key = match &self.api_key {
+    fn credential(&self) -> Result<String, ProviderError> {
+        match &self.api_key {
             OpenAiApiKey::Static(value) => Some(value.clone()),
             OpenAiApiKey::Dynamic(resolve) => resolve(),
         }
@@ -230,7 +233,11 @@ impl OpenAiProvider {
             kind: ProviderErrorKind::Authentication,
             message: "OpenAI API key is missing".into(),
             retryable: false,
-        })?;
+        })
+    }
+
+    fn client(&self) -> Result<openai::Client, ProviderError> {
+        let api_key = self.credential()?;
         openai::Client::builder()
             .api_key(api_key)
             .base_url(format!("{}/v1", self.base_url))
@@ -263,9 +270,32 @@ impl ModelProvider for OpenAiProvider {
         sink: ProviderEventSink,
         cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError> {
-        let client = self.client()?;
-        let model = client.completion_model(&request.model).with_strict_tools();
-        stream_model(&model, request, sink, cancellation, ToolNames::OpenAi).await
+        let key = self.credential()?;
+        let mapped = rig_request(request.clone(), ToolNames::OpenAi)?;
+        mapped
+            .validate_message_content()
+            .map_err(completion_error)?;
+        let mut body =
+            openai::responses_api::CompletionRequest::try_from((request.model.clone(), mapped))
+                .map_err(completion_error)?;
+        body.stream = Some(true);
+        body.tools = body
+            .tools
+            .into_iter()
+            .map(|tool| tool.with_strict())
+            .collect();
+        let body = serde_json::to_value(body)
+            .map_err(|_| crate::response::invalid("could not encode OpenAI request"))?;
+        crate::openai_stream::run(
+            &self.http,
+            &self.base_url,
+            &key,
+            body,
+            &request,
+            &sink,
+            &cancellation,
+        )
+        .await
     }
 }
 
@@ -282,194 +312,125 @@ async fn stream_model<M: CompletionModel>(
     cancellation: CancellationToken,
     tool_names: ToolNames,
 ) -> Result<ProviderCompletion, ProviderError> {
+    let task_id = request.task_id;
+    let canonical = request.clone();
     let request = rig_request(request, tool_names)?;
     request
         .validate_message_content()
         .map_err(completion_error)?;
-    let recovery_request = request.clone();
+    tracing::info!(%task_id, "streaming request started");
     let mut stream = tokio::select! {
+        biased;
         () = cancellation.cancelled() => return Err(cancelled()),
         result = model.stream(request) => result.map_err(completion_error)?,
     };
-    let mut completion = None;
-    let mut last_error = None;
-    let mut emitted_usable_output = false;
+    let mut tools = Vec::new();
+    let mut terminal = None;
+    let mut has_text = false;
+    let mut bytes = 0usize;
+    let mut count = 0usize;
     loop {
         let item = tokio::select! {
-            () = cancellation.cancelled() => {
-                stream.cancel();
-                return Err(cancelled());
-            }
+            biased;
+            () = cancellation.cancelled() => return Err(cancelled()),
             item = stream.next() => item,
         };
-        let Some(item) = item else {
-            break;
+        let Some(item) = item else { break };
+        let item = item.map_err(completion_error)?;
+        count += 1;
+        if terminal.is_some() {
+            return Err(crate::response::invalid(
+                "provider emitted data after terminal response",
+            ));
+        }
+        let event = match item {
+            StreamedAssistantContent::Text(text) => {
+                has_text |= !text.text.is_empty();
+                Some(ProviderEvent::TextDelta(text.text))
+            }
+            StreamedAssistantContent::ToolCallDelta { content, .. } => {
+                let text = match content {
+                    ToolCallDeltaContent::Name(name) => {
+                        format!("\nGenerating {} (preview):\n", canonical_tool_name(&name))
+                    }
+                    ToolCallDeltaContent::Delta(delta) => delta,
+                };
+                Some(ProviderEvent::OutputDelta(text))
+            }
+            StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                let name = match tool_names {
+                    ToolNames::Canonical => tool_call.function.name,
+                    ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
+                };
+                let arguments_json = tool_call.function.arguments.to_string();
+                bytes = bytes.saturating_add(name.len() + arguments_json.len());
+                tools.push(ProviderEvent::ToolRequest(StructuredToolRequest {
+                    id: voff_core::ToolCallId::new(),
+                    name,
+                    arguments_json,
+                }));
+                None
+            }
+            StreamedAssistantContent::Final(final_response) => {
+                validate_finish(final_response.finish_reason.as_ref())?;
+                terminal = Some(final_response);
+                None
+            }
+            // Never expose private reasoning or provider-native payloads.
+            _ => None,
         };
-        match item {
-            Ok(StreamedAssistantContent::Text(text)) => {
-                emitted_usable_output |= !text.text.is_empty();
-                send(&sink, ProviderEvent::TextDelta(text.text), &cancellation).await?;
-            }
-            Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
-                emitted_usable_output = true;
-                let name = match tool_names {
-                    ToolNames::Canonical => tool_call.function.name,
-                    ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
-                };
-                send(
-                    &sink,
-                    ProviderEvent::ToolRequest(StructuredToolRequest {
-                        id: voff_core::ToolCallId::new(),
-                        name,
-                        arguments_json: tool_call.function.arguments.to_string(),
-                    }),
-                    &cancellation,
-                )
-                .await?;
-            }
-            Ok(StreamedAssistantContent::Final(final_response)) => {
-                let usage = final_response.usage.has_values().then_some(Usage {
-                    input_tokens: final_response.usage.input_tokens,
-                    output_tokens: final_response.usage.output_tokens,
-                });
-                if let Some(usage) = &usage {
-                    send(&sink, ProviderEvent::Usage(usage.clone()), &cancellation).await?;
-                }
-                send(&sink, ProviderEvent::Completed, &cancellation).await?;
-                completion = Some(ProviderCompletion { usage });
-            }
-            Ok(StreamedAssistantContent::Unknown(_)) => {
-                send(
-                    &sink,
-                    ProviderEvent::Warning("provider returned an unsupported output item".into()),
-                    &cancellation,
-                )
-                .await?;
-            }
-            Ok(
-                StreamedAssistantContent::ToolCallDelta { .. }
-                | StreamedAssistantContent::Reasoning { .. }
-                | StreamedAssistantContent::ReasoningDelta { .. },
-            ) => {}
-            Err(error) => {
-                last_error = Some(completion_error(error));
-            }
+        if let Some(ProviderEvent::TextDelta(text) | ProviderEvent::OutputDelta(text)) = &event {
+            bytes = bytes.saturating_add(text.len());
+        }
+        if bytes > 4 * 1024 * 1024 || count > 131_072 {
+            return Err(crate::response::invalid(
+                "provider stream exceeded bounded output limits",
+            ));
+        }
+        if let Some(event) = event {
+            send(&sink, event, &cancellation).await?;
         }
     }
-    if let Some(completion) = completion {
-        Ok(completion)
-    } else if let Some(error) = last_error {
-        if emitted_usable_output && error.kind == ProviderErrorKind::InvalidResponse {
-            send(
-                &sink,
-                ProviderEvent::Warning(
-                    "provider terminal event could not be decoded; preserving already streamed output with usage unavailable"
-                        .into(),
-                ),
-                &cancellation,
-            )
-            .await?;
-            send(&sink, ProviderEvent::Completed, &cancellation).await?;
-            Ok(ProviderCompletion { usage: None })
-        } else if matches!(tool_names, ToolNames::OpenAi)
-            && is_responses_stream_decode_error(&error)
-        {
-            recover_with_completion(
-                model,
-                recovery_request,
-                sink,
-                cancellation,
-                tool_names,
-                &error,
-            )
-            .await
-        } else {
-            Err(error)
-        }
-    } else {
-        Err(ProviderError {
-            kind: ProviderErrorKind::InvalidResponse,
-            message: "provider stream ended without a terminal response".into(),
-            retryable: true,
-        })
+    let terminal = terminal.ok_or_else(|| crate::response::invalid(
+        "provider stream ended without a successful terminal response; partial output is preview only"
+    ))?;
+    if !has_text && tools.is_empty() {
+        return Err(crate::response::invalid(
+            "provider returned no text or tool calls",
+        ));
     }
-}
-
-async fn recover_with_completion<M: CompletionModel>(
-    model: &M,
-    request: RigCompletionRequest,
-    sink: ProviderEventSink,
-    cancellation: CancellationToken,
-    tool_names: ToolNames,
-    stream_error: &ProviderError,
-) -> Result<ProviderCompletion, ProviderError> {
-    let response = tokio::select! {
-        () = cancellation.cancelled() => return Err(cancelled()),
-        result = model.completion(request) => result.map_err(|error| {
-            let mut error = completion_error(error);
-            error.message = format!(
-                "stream decoding failed ({}); non-streaming recovery failed: {}",
-                stream_error.message, error.message
-            );
-            error
-        })?,
-    };
-
-    let mut emitted_usable_output = false;
-    for content in response.choice {
-        match content {
-            AssistantContent::Text(text) if !text.text.is_empty() => {
-                emitted_usable_output = true;
-                send(&sink, ProviderEvent::TextDelta(text.text), &cancellation).await?;
-            }
-            AssistantContent::ToolCall(tool_call) => {
-                emitted_usable_output = true;
-                let name = match tool_names {
-                    ToolNames::Canonical => tool_call.function.name,
-                    ToolNames::OpenAi => canonical_tool_name(&tool_call.function.name),
-                };
-                send(
-                    &sink,
-                    ProviderEvent::ToolRequest(StructuredToolRequest {
-                        id: voff_core::ToolCallId::new(),
-                        name,
-                        arguments_json: tool_call.function.arguments.to_string(),
-                    }),
-                    &cancellation,
-                )
-                .await?;
-            }
-            AssistantContent::Text(_)
-            | AssistantContent::Reasoning(_)
-            | AssistantContent::Image(_) => {}
-        }
+    crate::response::validate_output(&canonical, &tools)?;
+    // Text is live; actionable output is released only after a valid terminal.
+    for tool in tools {
+        send(&sink, tool, &cancellation).await?;
     }
-
-    if !emitted_usable_output {
-        return Err(ProviderError {
-            kind: ProviderErrorKind::InvalidResponse,
-            message: format!(
-                "stream decoding failed ({}); non-streaming recovery returned no usable text or tool calls",
-                stream_error.message
-            ),
-            retryable: false,
-        });
-    }
-
-    let usage = response.usage.has_values().then_some(Usage {
-        input_tokens: response.usage.input_tokens,
-        output_tokens: response.usage.output_tokens,
+    let usage = terminal.usage.has_values().then_some(Usage {
+        input_tokens: terminal.usage.input_tokens,
+        output_tokens: terminal.usage.output_tokens,
     });
     if let Some(usage) = &usage {
         send(&sink, ProviderEvent::Usage(usage.clone()), &cancellation).await?;
     }
     send(&sink, ProviderEvent::Completed, &cancellation).await?;
+    tracing::info!(%task_id, "streaming request completed");
     Ok(ProviderCompletion { usage })
 }
 
-fn is_responses_stream_decode_error(error: &ProviderError) -> bool {
-    error.kind == ProviderErrorKind::InvalidResponse
-        && error.message.contains("StreamingCompletionChunk")
+fn validate_finish(reason: Option<&FinishReason>) -> Result<(), ProviderError> {
+    match reason {
+        Some(FinishReason::Length) => Err(ProviderError {
+            kind: ProviderErrorKind::OutputLimit,
+            message: "provider reached the response output-token limit".into(),
+            retryable: false,
+        }),
+        Some(FinishReason::ContentFilter) => Err(crate::response::invalid(
+            "provider filtered the response; revise the task",
+        )),
+        Some(FinishReason::Other(_)) => Err(crate::response::invalid(
+            "provider did not report a successful completion",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn rig_request(
@@ -619,7 +580,7 @@ fn completion_error(error: CompletionError) -> ProviderError {
     }
 }
 
-fn status_error(status: u16) -> (ProviderErrorKind, bool) {
+pub(super) fn status_error(status: u16) -> (ProviderErrorKind, bool) {
     match status {
         401 => (ProviderErrorKind::Authentication, false),
         403 => (ProviderErrorKind::Authorization, false),
@@ -670,184 +631,50 @@ mod tests {
     use super::*;
     use rig_core::{
         completion::{CompletionResponse, Usage as RigUsage},
-        message::{ToolCall as RigToolCall, ToolFunction},
-        streaming::{
-            RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamingCompletionResponse,
-        },
+        streaming::StreamingCompletionResponse,
+        streaming::{RawStreamingChoice, RawStreamingToolCall, StreamFinal},
     };
     use voff_core::{MessageId, TaskId};
 
     #[derive(Clone)]
     struct RigFixtureModel;
-
-    #[derive(Clone)]
-    struct RigToolThenJsonErrorModel;
-
-    #[derive(Clone)]
-    struct RigTextThenJsonErrorModel;
-
-    #[derive(Clone)]
-    struct RigJsonErrorModel;
-
-    #[derive(Clone)]
-    struct RigRecoveringResponsesModel;
-
     impl CompletionModel for RigFixtureModel {
         async fn completion(
             &self,
             _: RigCompletionRequest,
         ) -> Result<CompletionResponse, CompletionError> {
-            Err(CompletionError::ResponseError(
-                "fixture only supports streaming".into(),
-            ))
+            panic!("live output must use the streaming API");
         }
-
         async fn stream(
             &self,
             _: RigCompletionRequest,
         ) -> Result<StreamingCompletionResponse, CompletionError> {
-            let usage = RigUsage {
+            Ok(fixture_stream(None))
+        }
+    }
+    fn fixture_stream(reason: Option<FinishReason>) -> StreamingCompletionResponse {
+        let terminal = StreamFinal::new(
+            "fixture",
+            RigUsage {
                 input_tokens: 7,
                 output_tokens: 3,
                 total_tokens: 10,
                 ..RigUsage::default()
-            };
-            let items = vec![
+            },
+        )
+        .with_optional_finish_reason(reason);
+        StreamingCompletionResponse::stream(
+            "fixture",
+            Box::pin(futures_util::stream::iter(vec![
                 Ok(RawStreamingChoice::Message("hello".into())),
                 Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
                     "call-1",
                     "file__patch".into(),
-                    serde_json::json!({"path": "README.md"}),
+                    serde_json::json!({"path":"README.md"}),
                 ))),
-                Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(
-                    "fixture", usage,
-                ))),
-            ];
-            Ok(StreamingCompletionResponse::stream(
-                "fixture",
-                Box::pin(futures_util::stream::iter(items)),
-            ))
-        }
-    }
-
-    impl CompletionModel for RigToolThenJsonErrorModel {
-        async fn completion(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<CompletionResponse, CompletionError> {
-            Err(CompletionError::ResponseError(
-                "fixture only supports streaming".into(),
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<StreamingCompletionResponse, CompletionError> {
-            let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-            let items = vec![
-                Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
-                    "call-1",
-                    "task__delegate".into(),
-                    serde_json::json!({"target_agent": "Developer", "objective": "work"}),
-                ))),
-                Err(CompletionError::JsonError(json_error)),
-            ];
-            Ok(StreamingCompletionResponse::stream(
-                "fixture",
-                Box::pin(futures_util::stream::iter(items)),
-            ))
-        }
-    }
-
-    impl CompletionModel for RigTextThenJsonErrorModel {
-        async fn completion(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<CompletionResponse, CompletionError> {
-            Err(CompletionError::ResponseError(
-                "fixture only supports streaming".into(),
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<StreamingCompletionResponse, CompletionError> {
-            let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-            let items = vec![
-                Ok(RawStreamingChoice::Message("complete review".into())),
-                Err(CompletionError::JsonError(json_error)),
-            ];
-            Ok(StreamingCompletionResponse::stream(
-                "fixture",
-                Box::pin(futures_util::stream::iter(items)),
-            ))
-        }
-    }
-
-    impl CompletionModel for RigJsonErrorModel {
-        async fn completion(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<CompletionResponse, CompletionError> {
-            Err(CompletionError::ResponseError(
-                "fixture only supports streaming".into(),
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<StreamingCompletionResponse, CompletionError> {
-            let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-            let items = vec![Err(CompletionError::JsonError(json_error))];
-            Ok(StreamingCompletionResponse::stream(
-                "fixture",
-                Box::pin(futures_util::stream::iter(items)),
-            ))
-        }
-    }
-
-    impl CompletionModel for RigRecoveringResponsesModel {
-        async fn completion(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<CompletionResponse, CompletionError> {
-            Ok(CompletionResponse::new(
-                vec![
-                    AssistantContent::Text(Text::new("recovered response")),
-                    AssistantContent::ToolCall(RigToolCall::from_wire(
-                        "call-1",
-                        ToolFunction::new(
-                            "file__patch".into(),
-                            serde_json::json!({"path": "README.md"}),
-                        ),
-                    )),
-                ],
-                RigUsage {
-                    input_tokens: 11,
-                    output_tokens: 4,
-                    total_tokens: 15,
-                    ..RigUsage::default()
-                },
-                "fixture",
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _: RigCompletionRequest,
-        ) -> Result<StreamingCompletionResponse, CompletionError> {
-            let json_error = <serde_json::Error as serde::de::Error>::custom(
-                "data did not match any variant of untagged enum StreamingCompletionChunk",
-            );
-            let items = vec![Err(CompletionError::JsonError(json_error))];
-            Ok(StreamingCompletionResponse::stream(
-                "fixture",
-                Box::pin(futures_util::stream::iter(items)),
-            ))
-        }
+                Ok(RawStreamingChoice::FinalResponse(terminal)),
+            ])),
+        )
     }
 
     fn request() -> CanonicalRequest {
@@ -859,7 +686,11 @@ mod tests {
                 role: MessageRole::User,
                 content: "hello".into(),
             }],
-            tools: vec![],
+            tools: vec![ToolDefinition {
+                name: "file.patch".into(),
+                description: "patch".into(),
+                input_schema: r#"{"type":"object"}"#.into(),
+            }],
             tool_choice: ToolChoice::Auto,
             max_output_tokens: Some(10),
         }
@@ -905,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_rig_streams_to_voff_events() {
+    async fn maps_rig_stream_with_validated_terminal() {
         let (sink, mut events) = tokio::sync::mpsc::channel(16);
         let completion = stream_model(
             &RigFixtureModel,
@@ -938,126 +769,6 @@ mod tests {
         );
         assert_eq!(received[3], ProviderEvent::Completed);
         assert_eq!(completion.usage.unwrap().output_tokens, 3);
-    }
-
-    #[tokio::test]
-    async fn preserves_a_structured_tool_call_when_only_the_terminal_frame_is_invalid() {
-        let (sink, mut events) = tokio::sync::mpsc::channel(16);
-        let completion = stream_model(
-            &RigToolThenJsonErrorModel,
-            request(),
-            sink,
-            CancellationToken::new(),
-            ToolNames::OpenAi,
-        )
-        .await
-        .unwrap();
-        let mut received = Vec::new();
-        while let Some(event) = events.recv().await {
-            received.push(event);
-        }
-
-        assert!(completion.usage.is_none());
-        assert!(matches!(
-            &received[0],
-            ProviderEvent::ToolRequest(tool) if tool.name == "task.delegate"
-        ));
-        assert!(
-            matches!(&received[1], ProviderEvent::Warning(message) if message.contains("terminal event"))
-        );
-        assert_eq!(received[2], ProviderEvent::Completed);
-    }
-
-    #[tokio::test]
-    async fn preserves_streamed_text_when_only_the_terminal_frame_is_invalid() {
-        let (sink, mut events) = tokio::sync::mpsc::channel(16);
-        let completion = stream_model(
-            &RigTextThenJsonErrorModel,
-            request(),
-            sink,
-            CancellationToken::new(),
-            ToolNames::OpenAi,
-        )
-        .await
-        .unwrap();
-        let mut received = Vec::new();
-        while let Some(event) = events.recv().await {
-            received.push(event);
-        }
-
-        assert!(completion.usage.is_none());
-        assert_eq!(
-            received[0],
-            ProviderEvent::TextDelta("complete review".into())
-        );
-        assert!(
-            matches!(&received[1], ProviderEvent::Warning(message) if message.contains("preserving already streamed output"))
-        );
-        assert_eq!(received[2], ProviderEvent::Completed);
-    }
-
-    #[tokio::test]
-    async fn rejects_an_invalid_stream_before_any_usable_output() {
-        let (sink, mut events) = tokio::sync::mpsc::channel(16);
-        let error = stream_model(
-            &RigJsonErrorModel,
-            request(),
-            sink,
-            CancellationToken::new(),
-            ToolNames::OpenAi,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
-        assert!(events.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn recovers_an_openai_responses_stream_decoder_failure_without_output() {
-        let (sink, mut events) = tokio::sync::mpsc::channel(16);
-        let completion = stream_model(
-            &RigRecoveringResponsesModel,
-            request(),
-            sink,
-            CancellationToken::new(),
-            ToolNames::OpenAi,
-        )
-        .await
-        .unwrap();
-
-        let mut received = Vec::new();
-        while let Some(event) = events.recv().await {
-            received.push(event);
-        }
-
-        assert_eq!(
-            received[0],
-            ProviderEvent::TextDelta("recovered response".into())
-        );
-        let ProviderEvent::ToolRequest(tool) = &received[1] else {
-            panic!("expected a recovered tool request");
-        };
-        assert_eq!(tool.name, "file.patch");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&tool.arguments_json).unwrap()["path"],
-            "README.md"
-        );
-        assert_eq!(
-            received[2],
-            ProviderEvent::Usage(Usage {
-                input_tokens: 11,
-                output_tokens: 4,
-            })
-        );
-        assert_eq!(received[3], ProviderEvent::Completed);
-        assert_eq!(
-            completion.usage,
-            Some(Usage {
-                input_tokens: 11,
-                output_tokens: 4,
-            })
-        );
     }
 
     #[test]
@@ -1109,6 +820,70 @@ mod tests {
         assert_eq!(canonical_tool_name("review__request"), "review.request");
     }
 
+    #[derive(Clone)]
+    struct TruncatedFixture;
+    impl CompletionModel for TruncatedFixture {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            panic!("must stream");
+        }
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            Ok(fixture_stream(Some(FinishReason::Length)))
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_completion_does_not_publish_partial_tools() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let error = stream_model(
+            &TruncatedFixture,
+            request(),
+            tx,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("output-token limit"));
+        assert_eq!(
+            rx.recv().await,
+            Some(ProviderEvent::TextDelta("hello".into()))
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn omitted_required_tool_never_publishes_an_action() {
+        let mut request = request();
+        request.tools.push(ToolDefinition {
+            name: "task.delegate".into(),
+            description: "delegate".into(),
+            input_schema: r#"{"type":"object"}"#.into(),
+        });
+        request.tool_choice = ToolChoice::Specific(vec!["task.delegate".into()]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let error = stream_model(
+            &RigFixtureModel,
+            request,
+            tx,
+            CancellationToken::new(),
+            ToolNames::OpenAi,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("omitted the required tool"));
+        assert_eq!(
+            rx.recv().await,
+            Some(ProviderEvent::TextDelta("hello".into()))
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
     #[test]
     fn deferred_openai_credential_can_be_added_after_startup() {
         let credential = Arc::new(std::sync::RwLock::new(None::<String>));
@@ -1124,5 +899,64 @@ mod tests {
 
         *credential.write().unwrap() = Some("sk-test-not-real".into());
         assert!(provider.client().is_ok());
+    }
+
+    #[derive(Clone)]
+    struct IncompleteStreamFixture(bool);
+
+    impl CompletionModel for IncompleteStreamFixture {
+        async fn completion(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<CompletionResponse, CompletionError> {
+            panic!("must not resubmit a partially visible request");
+        }
+
+        async fn stream(
+            &self,
+            _: RigCompletionRequest,
+        ) -> Result<StreamingCompletionResponse, CompletionError> {
+            let mut items = vec![
+                Ok(RawStreamingChoice::Message("partial".into())),
+                Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+                    "call-1",
+                    "file__patch".into(),
+                    serde_json::json!({"path":"README.md"}),
+                ))),
+            ];
+            if self.0 {
+                items.push(Err(CompletionError::JsonError(
+                    serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                )));
+            }
+            Ok(StreamingCompletionResponse::stream(
+                "fixture",
+                Box::pin(futures_util::stream::iter(items)),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_or_missing_terminal_never_releases_a_tool() {
+        for decode_error in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let result = stream_model(
+                &IncompleteStreamFixture(decode_error),
+                request(),
+                tx,
+                CancellationToken::new(),
+                ToolNames::OpenAi,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                rx.recv().await,
+                Some(ProviderEvent::TextDelta("partial".into()))
+            );
+            assert!(
+                rx.recv().await.is_none(),
+                "tool and completion must remain unpublished"
+            );
+        }
     }
 }

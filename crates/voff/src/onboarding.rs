@@ -24,7 +24,7 @@ use std::{
 };
 
 const MAX_DEVELOPERS: usize = 32;
-const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
+const DEFAULT_OUTPUT_TOKENS: u64 = voff_core::DEFAULT_MAX_OUTPUT_TOKENS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderChoice {
@@ -117,7 +117,7 @@ impl DeveloperRole {
     pub const fn prompt(self) -> &'static str {
         match self {
             Self::Lead => {
-                "Own every team decision. Plan bounded work, delegate every required specialty as an explicit child task, prevent overlapping ownership, and integrate only verified results."
+                "Own every team decision. Classify requests as information, review, diagnosis, implementation, or high-risk action. Answer simple questions directly from available evidence without delegation or workspace changes. For implementation, plan bounded work, delegate required specialties as explicit child tasks, prevent overlapping ownership, and integrate only verified results. Return actionable rejection feedback and require revisions to address each finding; never treat repeated failed attempts as success."
             }
             Self::FullStack => {
                 "Implement small end-to-end changes, follow repository rules, and return test evidence to the Team Lead without coordinating peers directly."
@@ -1093,10 +1093,11 @@ fn form_line<'a>(label: &'a str, value: &'a str, selected: bool, choice: bool) -
             format!("{marker} {label:<13}"),
             if selected {
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::White)
             },
         ),
         Span::raw(value),
@@ -1400,7 +1401,7 @@ mod tests {
             basics_field: BasicsField::Tokens,
             ..Wizard::default()
         };
-        for _ in 0..4 {
+        for _ in 0..DEFAULT_OUTPUT_TOKENS.to_string().len() {
             wizard.handle_key(key(KeyCode::Backspace));
         }
         wizard.handle_key(key(KeyCode::Enter));

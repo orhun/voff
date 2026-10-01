@@ -49,7 +49,7 @@ typed_id!(ArtifactId, "art");
 typed_id!(EventId, "evt");
 
 /// Backward-compatible per-response generation limit for agent profiles.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4096;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 16_384;
 /// Hard safety ceiling for one provider response.
 pub const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
 
@@ -218,7 +218,11 @@ impl Task {
                     | TaskStatus::Cancelled
             ) | (
                 TaskStatus::WaitingApproval,
-                TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Failed
+                TaskStatus::Running
+                    | TaskStatus::Ready
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Blocked
+                    | TaskStatus::Failed
             ) | (TaskStatus::Blocked, TaskStatus::Ready)
         );
         if !valid {
@@ -256,12 +260,47 @@ pub enum CanonicalEventKind {
     },
     ProviderStarted,
     TextDelta(String),
+    /// Live structured-output preview, not an approved action or task result.
+    GenerationDelta(String),
+    /// A failed request attempt was discarded before any actionable output.
+    ProviderRetrying {
+        attempt: u16,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
     },
     ProviderCompleted,
     ProviderFailed(String),
+    /// Nonfatal provider diagnostic; does not imply task failure.
+    ProviderWarning(String),
+    /// An application/account problem requiring user intervention, not model repair.
+    ApplicationIssue(String),
+    /// Recoverable work failure awaiting a bounded coordinator decision.
+    WorkRecoveryRequested {
+        reason: String,
+        /// False permits diagnosis only; the coordinator cannot override a denial.
+        retry_allowed: bool,
+    },
+    /// A validated Lead rejection returned to the same owner for new work.
+    RevisionRequested {
+        approval_id: ApprovalId,
+        feedback: String,
+    },
+    /// Automatic revision stopped without applying the rejected proposal.
+    RevisionStopped(String),
+    /// Persisted start of a tool-free coordinator review. None means failure review.
+    LeadReviewStarted {
+        lead: AgentId,
+        approval_id: Option<ApprovalId>,
+    },
+    /// Auditable coordinator verdict; this alone never authorizes execution.
+    LeadReviewFinished {
+        lead: AgentId,
+        approval_id: Option<ApprovalId>,
+        approved: bool,
+        reason: String,
+    },
     TaskCancelled,
     ToolProposed {
         tool_call_id: ToolCallId,
@@ -424,7 +463,7 @@ impl TaskGraph {
         self.tasks
             .values()
             .filter(|t| {
-                t.status == TaskStatus::Queued
+                matches!(t.status, TaskStatus::Queued | TaskStatus::Ready)
                     && self
                         .dependencies
                         .iter()

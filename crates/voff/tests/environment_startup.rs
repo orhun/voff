@@ -44,3 +44,47 @@ fn unreadable_file_is_a_safe_startup_error() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("could not load .env"));
 }
+
+#[test]
+fn diagnostics_are_written_to_the_workspace_log_without_secrets_or_ansi() {
+    let invocation = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join(".voff")).unwrap();
+    std::fs::write(
+        workspace.path().join(".voff/config.toml"),
+        r#"
+config_version = 1
+[workspace]
+root = "."
+state_file = ".voff/voff.db"
+[runtime]
+default_timeout_seconds = 60
+event_channel_capacity = 64
+[provider]
+kind = "mock"
+[agent]
+name = "Team Lead"
+role = "team_lead"
+system_prompt = "Test fixture"
+tools = []
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_voff"))
+        .args(["--workspace", workspace.path().to_str().unwrap(), "doctor"])
+        .current_dir(invocation.path())
+        .env("OPENAI_API_KEY", "fake-secret-must-not-be-logged")
+        .env("RUST_LOG", "trace")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = std::fs::read_to_string(workspace.path().join(".voff/logs/voff.log")).unwrap();
+    assert!(log.contains("application started"));
+    assert!(!log.contains("fake-secret"));
+    assert!(!log.contains('\u{1b}'));
+    assert!(!invocation.path().join(".voff/logs/voff.log").exists());
+}

@@ -30,8 +30,9 @@ loopback runtime when it responds within the bounded discovery window; an
 editable fallback remains available when it does not. Codex CLI and Claude CLI
 choices use editable provider defaults. It
 writes the same version 1 schema documented below. Existing configurations are
-loaded unchanged and default to `4096` output tokens, so this onboarding flow
-requires no TOML migration. Automated environments may write the documented
+loaded unchanged; omitted token limits now default to `16384` output tokens.
+Explicit limits such as `4096` are preserved. No TOML schema migration is
+required. Automated environments may write the documented
 schema directly to `.voff/config.toml`; there is no separate setup command.
 
 The selected working directory is written to `workspace.root`. It scopes
@@ -79,6 +80,40 @@ describe explicit work, or press capital `R` for Quick Run. The Team Lead may
 then propose bounded delegation to enabled, allowed specialists through the
 normal approval flow.
 ## 2. Example
+
+Routine work now defaults to Team Lead review instead of human Y/N approval.
+This also applies to version-1 files that omit the new field:
+
+```toml
+[runtime]
+automatic_review = true # false restores manual per-action review
+default_timeout_seconds = 1800
+event_channel_capacity = 256
+```
+
+The configured Lead's task assignments (including review assignments) dispatch
+directly after runtime validation, without a popup or a second model review.
+The Lead reviews patches and allowlisted verification commands using its own
+provider/model. Decisions and reasons are persisted in
+Activity; the diagram reverses the specialist's edge during review, using the
+same connection points (Lead bottom / specialist top) in both directions.
+An active return-for-review arrow takes visual priority at the shared Lead port
+over outgoing assignment diamonds.
+Activity starts with a chronological review-loop overview for the selected task
+and its retry chain: latest attempt/status, review, verdict, returned feedback,
+new attempt and re-review. It shows the six latest handoffs separately from the
+newest-first role log; `v` expands feedback. This is a view of recorded events,
+not a promise that every rejection will retry or that approval means completion.
+Recoverable
+work failures can receive two corrective attempts, preserving their history.
+Valid Lead rejections return feedback to the same owner for a revised proposal
+and fresh review, within that same three-attempt budget. The rejected action
+is never executed; unchanged resubmissions stop the loop. Human/runtime denials
+and failed or malformed reviews do not retry. Login problems show an application notice; token
+increases still require your decision. This does not authorize arbitrary
+commands, sensitive configuration writes, or external publication. Review adds
+model latency and cost. Use manual mode for untrusted workspaces: the executor
+is not an OS sandbox. See ADR 0032 for restart behavior and remaining limits.
 
 ```toml
 config_version = 1
@@ -171,7 +206,29 @@ catalog pricing and `currency` controls the displayed unit.
 `max_output_tokens` is a per-response generation cap passed through the
 provider-neutral request contract. It is not an API credential or a cumulative
 billing budget. Values must be between `1` and `1_000_000`; configurations that
-omit it retain the backward-compatible `4096` default.
+omit it use the `16384` default (increased from `4096`). To retain the former
+allowance, set `max_output_tokens = 4096` explicitly. Larger limits can permit
+longer, more expensive responses; they do not increase model generation speed.
+
+When a provider explicitly reports output-token exhaustion, the task waits for
+a persisted **Continue / Cancel** decision. `y` regenerates the incomplete
+response with twice the task-local allowance; `n` cancels that task. Partial
+proposals are never executed, and all normal tool approvals still apply. This
+does not change the role's configured limit or other tasks. Continuation is
+bounded to three increases and at most 131072 tokens; if exhausted, reduce the
+task scope or change its model before re-running. Provider model limits still
+apply. Pending decisions survive restart. Content filtering and malformed
+responses are not treated as permission to increase the allowance.
+
+Approval/confirmation requests normally appear as compact top-right notices
+with a short caption and border controls `[y] [n] [d] details`. `d` maximizes
+the selected request; `d` or Esc minimizes it again, and PgUp/PgDn scroll its
+full details. Up/Down selects another pending request. Configuration/help
+surfaces remain full editing or inspection dialogs.
+In automatic mode, routine work requests appear in the graph/activity instead
+of this popup; only application decisions such as token continuation interrupt.
+Application issues use a dismissible top-right notice (`Esc` dismisses; `e`
+shows full event details).
 
 ## 3. Agent prompt contract
 
@@ -302,6 +359,12 @@ prior terminal history is never reset or overwritten. Active and
 approval-pending tasks must be cancelled or resolved before they can be
 re-run.
 
+Resume reuses session-owned agent IDs for matching configured names and roles.
+Older root attempts from before this fix can be re-run under the current Team
+Lead only when old and current names and roles match exactly. Historical task
+ownership stays unchanged; specialists are never promoted by this compatibility
+handling.
+
 The task browser puts Team Lead roots first, orders peer tasks newest first, and
 keeps every delegated task directly beneath its parent. Each delegated task
 card, including its owner and objective, is indented by two columns per
@@ -311,6 +374,15 @@ role activity view stay flat and identify events with short task IDs. Event text
 uses semantic colors while retaining textual status: actions and approvals are
 yellow, failures red, completions green, task lifecycle events cyan, and usage
 magenta.
+
+Summary places the latest generated output before the task brief. Long output,
+acceptance lists, artifact previews and activity entries are compact by default;
+`v` expands/collapses them without altering persisted content. Compact live
+output shows its newest tail. Summary/Activity and Team/Tasks use a filled active
+tab without marker icons, while inactive choices remain readable. Generation
+fragments are coalesced into at most one normal persistence update per 50 ms
+(also flushing at type changes, bounded chunk size and completion), reducing
+per-token database overhead without simulating streaming.
 
 ## 8. Formation examples
 

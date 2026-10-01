@@ -9,7 +9,6 @@ test-support = []
 [dependencies]
 voff-core.workspace = true
 async-trait.workspace = true
-futures-util = "0.3"
 rig-core = { version = "0.42", default-features = false, features = [
   "reqwest",
   "rustls",
@@ -20,5 +19,9 @@ tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+eventsource-stream = "0.2"
 [lints]
 workspace = true

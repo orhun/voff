@@ -7,3 +7,4 @@
 .voff/diagnostic*.json
 .voff/backups/
 .voff/config.toml
+.voff/logs/

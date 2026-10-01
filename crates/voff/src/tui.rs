@@ -33,7 +33,7 @@ use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
     CanonicalEventKind, EventId, SessionId, Task, TaskStatus,
 };
-use voff_engine::{DelegationProposal, Engine, EngineEvent};
+use voff_engine::{DelegationProposal, Engine, EngineEvent, OutputContinuation};
 use voff_provider::ProviderHealth;
 use voff_storage::{Repository, SqliteRepository};
 
@@ -75,6 +75,8 @@ pub enum Action {
     ShowTasks,
     ShowTaskDetails,
     ShowRoleActivity,
+    ToggleExpanded,
+    ToggleApprovalDetails,
     Escape,
     Quit,
     Mouse(MouseEvent),
@@ -85,6 +87,8 @@ pub enum Action {
 struct ScopedEvent {
     task_id: Option<voff_core::TaskId>,
     text: String,
+    is_output: bool,
+    workflow: Option<&'static str>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -136,6 +140,9 @@ const ADDABLE_ROLES: [DeveloperRole; 6] = [
 ];
 
 pub struct AppModel {
+    automatic_review: bool,
+    lead_reviews: HashMap<voff_core::TaskId, String>,
+    application_notice: Option<String>,
     pub session: SessionId,
     pub tasks: Vec<Task>,
     pub events: Vec<String>,
@@ -167,6 +174,7 @@ pub struct AppModel {
     scoped_events: Vec<ScopedEvent>,
     task_inspector: TaskInspector,
     task_inspector_scroll: u16,
+    expanded_output: bool,
     task_list_hitbox: Rect,
     task_window_start: usize,
     credential_target: Option<(String, crate::credential::CredentialSlot)>,
@@ -181,6 +189,8 @@ pub struct AppModel {
     retry_starting: bool,
     selected_agent: usize,
     approval_selected: usize,
+    approval_details: bool,
+    approval_scroll: u16,
     team_lead: Option<AgentId>,
     team_adjustment_open: bool,
     team_adjustment_selected: usize,
@@ -231,6 +241,9 @@ impl AppModel {
             agents: vec![],
             known_agents: HashMap::new(),
             approvals: vec![],
+            automatic_review: false,
+            lead_reviews: HashMap::new(),
+            application_notice: None,
             artifacts: vec![],
             provider_health: ProviderHealth::default(),
             input_cost_per_million: None,
@@ -251,6 +264,7 @@ impl AppModel {
             scoped_events: vec![],
             task_inspector: TaskInspector::Details,
             task_inspector_scroll: 0,
+            expanded_output: false,
             task_list_hitbox: Rect::default(),
             task_window_start: 0,
             credential_target: None,
@@ -265,6 +279,8 @@ impl AppModel {
             retry_starting: false,
             selected_agent: 0,
             approval_selected: 0,
+            approval_details: false,
+            approval_scroll: 0,
             team_lead: None,
             team_adjustment_open: false,
             team_adjustment_selected: 0,
@@ -286,6 +302,9 @@ impl AppModel {
         }
     }
     pub fn reduce(&mut self, action: Action) {
+        if action == Action::Escape && self.application_notice.take().is_some() {
+            return;
+        }
         if self.navigate_approvals(action) {
             return;
         }
@@ -363,6 +382,11 @@ impl AppModel {
                 self.task_inspector = TaskInspector::RoleActivity;
                 self.task_inspector_scroll = 0;
             }
+            Action::ToggleExpanded => {
+                self.expanded_output = !self.expanded_output;
+                self.task_inspector_scroll = 0;
+                self.event_scroll = 0;
+            }
             Action::NextPanel => {
                 self.panel = match self.panel {
                     Panel::Agents => Panel::Tasks,
@@ -402,6 +426,7 @@ impl AppModel {
             Action::Quit => self.quit = true,
             Action::Mouse(mouse) => self.handle_mouse(mouse),
             Action::QuickRun
+            | Action::ToggleApprovalDetails
             | Action::RetryTask
             | Action::Cancel
             | Action::Approve
@@ -852,6 +877,15 @@ impl AppModel {
     }
 
     fn handle_composer_event(&mut self, event: &Event) -> ComposerEvent {
+        if self.application_notice.is_some()
+            && matches!(event, Event::Key(key) if key.code == KeyCode::Esc)
+        {
+            self.application_notice = None;
+            return ComposerEvent::Consumed;
+        }
+        if self.pending_approval().is_some() {
+            return ComposerEvent::Ignored;
+        }
         if !self.composer_active {
             return ComposerEvent::Ignored;
         }
@@ -959,6 +993,56 @@ impl AppModel {
                 }
             }
             EngineEvent::Canonical(e) => {
+                if let Some(task_id) = e.task_id {
+                    match &e.kind {
+                        CanonicalEventKind::LeadReviewStarted { approval_id, .. } => {
+                            self.lead_reviews.insert(
+                                task_id,
+                                if approval_id.is_some() {
+                                    "Reviewing proposal"
+                                } else {
+                                    "Diagnosing failure"
+                                }
+                                .into(),
+                            );
+                        }
+                        CanonicalEventKind::LeadReviewFinished {
+                            lead,
+                            approved,
+                            reason,
+                            ..
+                        } => {
+                            self.lead_reviews.remove(&task_id);
+                            self.agent_responses.insert(
+                                *lead,
+                                format!(
+                                    "{}: {}",
+                                    if *approved { "Approved" } else { "Rejected" },
+                                    sanitize(reason)
+                                ),
+                            );
+                            self.composer_notice = Some(format!(
+                                "Team Lead {}: {}",
+                                if *approved { "approved" } else { "rejected" },
+                                sanitize(reason)
+                            ));
+                        }
+                        CanonicalEventKind::RevisionRequested { .. } => {
+                            self.composer_notice = Some(
+                                "Team Lead returned feedback → developer revising → fresh review."
+                                    .into(),
+                            );
+                        }
+                        CanonicalEventKind::RevisionStopped(reason) => {
+                            self.composer_notice =
+                                Some(format!("Revision stopped: {}", sanitize(reason)));
+                        }
+                        CanonicalEventKind::ApplicationIssue(message) => {
+                            self.application_notice = Some(sanitize(message));
+                        }
+                        _ => {}
+                    }
+                }
                 if let CanonicalEventKind::Usage {
                     input_tokens,
                     output_tokens,
@@ -974,6 +1058,12 @@ impl AppModel {
                 self.push_scoped_event(e.task_id, &e.kind)
             }
             EngineEvent::ApprovalUpdated(approval) => {
+                if approval.decision != ApprovalDecision::Pending
+                    && self.pending_approval().is_some_and(|a| a.id == approval.id)
+                {
+                    self.approval_details = false;
+                    self.approval_scroll = 0;
+                }
                 if let Some(old) = self.approvals.iter_mut().find(|v| v.id == approval.id) {
                     *old = approval
                 } else {
@@ -1029,13 +1119,19 @@ impl AppModel {
         let selected = self.approval_selected.min(pending_count.saturating_sub(1));
         self.approvals
             .iter()
-            .filter(|approval| approval.decision == ApprovalDecision::Pending)
+            .filter(|approval| {
+                approval.decision == ApprovalDecision::Pending
+                    && (!self.automatic_review || approval.action == "provider.continue")
+            })
             .nth(selected)
     }
     fn pending_approval_count(&self) -> usize {
         self.approvals
             .iter()
-            .filter(|approval| approval.decision == ApprovalDecision::Pending)
+            .filter(|approval| {
+                approval.decision == ApprovalDecision::Pending
+                    && (!self.automatic_review || approval.action == "provider.continue")
+            })
             .count()
     }
     fn navigate_approvals(&mut self, action: Action) -> bool {
@@ -1048,10 +1144,30 @@ impl AppModel {
         match action {
             Action::Up => {
                 self.approval_selected = self.approval_selected.saturating_sub(1);
+                self.approval_scroll = 0;
                 true
             }
             Action::Down => {
                 self.approval_selected = (self.approval_selected + 1).min(count - 1);
+                self.approval_scroll = 0;
+                true
+            }
+            Action::ToggleApprovalDetails => {
+                self.approval_details = !self.approval_details;
+                self.approval_scroll = 0;
+                true
+            }
+            Action::Escape if self.approval_details => {
+                self.approval_details = false;
+                self.approval_scroll = 0;
+                true
+            }
+            Action::PageUp if self.approval_details => {
+                self.approval_scroll = self.approval_scroll.saturating_sub(10);
+                true
+            }
+            Action::PageDown if self.approval_details => {
+                self.approval_scroll = self.approval_scroll.saturating_add(10);
                 true
             }
             _ => false,
@@ -1069,10 +1185,12 @@ impl AppModel {
                 .map(|task| task.owner)
         }) {
             match kind {
-                CanonicalEventKind::ProviderStarted => {
+                CanonicalEventKind::ProviderStarted
+                | CanonicalEventKind::ProviderRetrying { .. } => {
                     self.agent_responses.insert(owner, String::new());
                 }
-                CanonicalEventKind::TextDelta(delta) => {
+                CanonicalEventKind::TextDelta(delta)
+                | CanonicalEventKind::GenerationDelta(delta) => {
                     let response = self.agent_responses.entry(owner).or_default();
                     response.push_str(&sanitize(delta));
                     trim_response_buffer(response);
@@ -1081,8 +1199,14 @@ impl AppModel {
             }
         }
         self.event_task_ids.resize(self.events.len(), None);
-        let was_streaming = self.streaming_text;
-        if let CanonicalEventKind::TextDelta(delta) = kind {
+        let was_streaming = self.streaming_text
+            && self
+                .event_task_ids
+                .last()
+                .is_some_and(|last| *last == task_id);
+        if let CanonicalEventKind::TextDelta(delta) | CanonicalEventKind::GenerationDelta(delta) =
+            kind
+        {
             let clean = sanitize(delta);
             if was_streaming {
                 if let Some(last) = self.events.last_mut() {
@@ -1098,7 +1222,9 @@ impl AppModel {
             self.events.push(format_event(kind));
             self.event_task_ids.push(task_id);
         }
-        if let CanonicalEventKind::TextDelta(delta) = kind {
+        if let CanonicalEventKind::TextDelta(delta) | CanonicalEventKind::GenerationDelta(delta) =
+            kind
+        {
             let clean = sanitize(delta);
             if was_streaming
                 && self
@@ -1113,12 +1239,16 @@ impl AppModel {
                 self.scoped_events.push(ScopedEvent {
                     task_id,
                     text: clean,
+                    is_output: true,
+                    workflow: None,
                 });
             }
         } else {
             self.scoped_events.push(ScopedEvent {
                 task_id,
                 text: format_event(kind),
+                is_output: false,
+                workflow: workflow_step(kind),
             });
         }
         self.on_events_changed();
@@ -1203,6 +1333,8 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('2') => Action::ShowTasks,
         KeyCode::Char('s') => Action::ShowTaskDetails,
         KeyCode::Char('a') => Action::ShowRoleActivity,
+        KeyCode::Char('v') => Action::ToggleExpanded,
+        KeyCode::Char('d') => Action::ToggleApprovalDetails,
         KeyCode::Esc => Action::Escape,
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -1216,6 +1348,30 @@ fn action_for_event(value: Event) -> Action {
         Event::FocusGained | Event::FocusLost | Event::Paste(_) | Event::Resize(_, _) => {
             Action::None
         }
+    }
+}
+
+fn workflow_step(kind: &CanonicalEventKind) -> Option<&'static str> {
+    match kind {
+        CanonicalEventKind::LeadReviewStarted {
+            approval_id: Some(_),
+            ..
+        } => Some("Developer → Team Lead · REVIEW"),
+        CanonicalEventKind::LeadReviewStarted {
+            approval_id: None, ..
+        } => Some("Developer → Team Lead · DIAGNOSIS"),
+        CanonicalEventKind::LeadReviewFinished { approved: true, .. } => {
+            Some("Team Lead · APPROVED")
+        }
+        CanonicalEventKind::LeadReviewFinished {
+            approved: false, ..
+        } => Some("Team Lead · REJECTED"),
+        CanonicalEventKind::RevisionRequested { .. } => {
+            Some("Team Lead → Developer · REVISE & RESUBMIT")
+        }
+        CanonicalEventKind::RevisionStopped(_) => Some("STOPPED · needs attention"),
+        CanonicalEventKind::TaskRetried { .. } => Some("Developer · NEW ATTEMPT"),
+        _ => None,
     }
 }
 
@@ -1233,13 +1389,45 @@ fn format_event(kind: &CanonicalEventKind) -> String {
         ),
         CanonicalEventKind::TaskTransition { from, to } => format!("task: {from:?} -> {to:?}"),
         CanonicalEventKind::ProviderStarted => "provider started".into(),
-        CanonicalEventKind::TextDelta(s) => sanitize(s),
+        CanonicalEventKind::TextDelta(s) | CanonicalEventKind::GenerationDelta(s) => sanitize(s),
+        CanonicalEventKind::ProviderRetrying { attempt } => {
+            format!("retrying provider · attempt {attempt} · previous preview was incomplete")
+        }
         CanonicalEventKind::Usage {
             input_tokens,
             output_tokens,
         } => format!("usage: {input_tokens} in / {output_tokens} out"),
         CanonicalEventKind::ProviderCompleted => "provider completed".into(),
         CanonicalEventKind::ProviderFailed(e) => format!("provider failed: {}", sanitize(e)),
+        CanonicalEventKind::ProviderWarning(e) => format!("provider warning: {}", sanitize(e)),
+        CanonicalEventKind::ApplicationIssue(e) => {
+            format!("application needs attention: {}", sanitize(e))
+        }
+        CanonicalEventKind::WorkRecoveryRequested { reason, .. } => {
+            format!("failure → Team Lead: {}", sanitize(reason))
+        }
+        CanonicalEventKind::RevisionRequested { feedback, .. } => format!(
+            "Team Lead → developer: revise and resubmit · {}",
+            sanitize(feedback)
+        ),
+        CanonicalEventKind::RevisionStopped(reason) => {
+            format!("revision blocked: {}", sanitize(reason))
+        }
+        CanonicalEventKind::LeadReviewStarted { approval_id, .. } => format!(
+            "→ Team Lead: {}",
+            if approval_id.is_some() {
+                "reviewing proposal"
+            } else {
+                "diagnosing failure"
+            }
+        ),
+        CanonicalEventKind::LeadReviewFinished {
+            approved, reason, ..
+        } => format!(
+            "Team Lead → {}: {}",
+            if *approved { "approved" } else { "rejected" },
+            sanitize(reason)
+        ),
         CanonicalEventKind::TaskCancelled => "task cancelled".into(),
         CanonicalEventKind::ToolProposed { name, .. } => format!("tool proposed: {name}"),
         CanonicalEventKind::ApprovalRequested { summary, .. } => {
@@ -1355,7 +1543,16 @@ fn task_browser_order(tasks: &[Task], team_lead: Option<AgentId>) -> Vec<voff_co
 
 fn event_text_color(text: &str) -> Color {
     let text = text.to_ascii_lowercase();
-    if text.starts_with("tool proposed:")
+    if text.starts_with("team lead → approved") {
+        Color::Green
+    } else if text.starts_with("team lead → rejected")
+        || text.starts_with("application needs attention")
+        || text.starts_with("revision blocked:")
+    {
+        Color::LightRed
+    } else if text.contains("→ team lead") || text.starts_with("team lead → developer:") {
+        Color::LightCyan
+    } else if text.starts_with("tool proposed:")
         || text.starts_with("approval requested:")
         || text.starts_with("approval:")
     {
@@ -1391,7 +1588,7 @@ fn event_viewer_lines(app: &AppModel) -> Vec<Line<'static>> {
         let task_id = app.event_task_ids.get(index).copied().flatten();
         let color = event_text_color(event);
         let mut first = true;
-        for event_line in event.split('\n') {
+        for event_line in compact_text(event, app.expanded_output, true).split('\n') {
             let mut spans = Vec::new();
             if first {
                 spans.push(Span::styled(
@@ -1456,6 +1653,7 @@ pub enum TuiError {
     Io(#[from] io::Error),
 }
 pub(crate) struct ConfiguredRun {
+    pub automatic_review: bool,
     pub repo: Arc<SqliteRepository>,
     pub provider: Arc<dyn voff_provider::ModelProvider>,
     pub providers: std::collections::HashMap<String, Arc<dyn voff_provider::ModelProvider>>,
@@ -1495,6 +1693,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
             .with_provider_registry(config.providers, config.default_provider)
             .with_formation_agents(&agent_profiles)
             .with_team_lead(config.team_lead)
+            .with_automatic_review(config.automatic_review)
             .with_runtime(config.model_name, config.system_prompt)
             .with_workspace_context(config.workspace_context)
             .with_safe_workflow(&config.workspace_root)
@@ -1502,6 +1701,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
     );
     let (input_tx, input_rx) = mpsc::channel(32);
     let mut app = AppModel::new(config.session);
+    app.automatic_review = config.automatic_review;
     app.workspace_root = config.workspace_root.clone();
     app.provider_label = config.provider_label;
     app.agent_name = config.agent_name;
@@ -1565,6 +1765,9 @@ fn restore_initial_history(
     app.approvals = approvals;
     app.artifacts = artifacts;
     for event in events {
+        if let CanonicalEventKind::ApplicationIssue(message) = &event.kind {
+            app.application_notice = Some(sanitize(message));
+        }
         app.push_scoped_event(event.task_id, &event.kind);
     }
     if !app.tasks.is_empty() {
@@ -1636,6 +1839,15 @@ async fn terminal_loop<R: Repository + 'static>(
         mpsc::channel::<Result<&'static str, String>>(8);
     let (quick_run_tx, mut quick_run_rx) = mpsc::channel::<Result<(), String>>(1);
     let (retry_tx, mut retry_rx) = mpsc::channel::<Result<(voff_core::TaskId, u16), String>>(1);
+    if model.automatic_review {
+        let engine = Arc::clone(&engine);
+        let notices = lead_submission_tx.clone();
+        tokio::spawn(async move {
+            if let Err(error) = engine.run_until_idle_bounded(max_parallel_tasks).await {
+                let _ = notices.send(Err(error.to_string())).await;
+            }
+        });
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut loop_result = Ok(());
     'terminal: while !model.quit {
@@ -1735,7 +1947,7 @@ async fn terminal_loop<R: Repository + 'static>(
                                         )
                                         .await?;
                                     engine.mark_ready(task.id).await?;
-                                    engine.run_task(task.id).await
+                                    engine.run_task_and_schedule(task.id, max_parallel_tasks).await
                                 }
                                 .await
                                 .map(|()| "Task accepted by Team Lead.")
@@ -1781,7 +1993,7 @@ async fn terminal_loop<R: Repository + 'static>(
                                                     )
                                                     .await?;
                                                 engine.mark_ready(task.id).await?;
-                                                engine.run_task(task.id).await
+                                                engine.run_task_and_schedule(task.id, max_parallel_tasks).await
                                             }
                                             .await
                                             .map_err(|error| error.to_string());
@@ -1818,7 +2030,9 @@ async fn terminal_loop<R: Repository + 'static>(
                                                         let _ = retry_tx
                                                             .send(Ok((retry_id, attempt)))
                                                             .await;
-                                                        let _ = engine.run_task(retry_id).await;
+                                                        if let Err(error) = engine.run_task_and_schedule(retry_id, max_parallel_tasks).await {
+                                                            let _ = retry_tx.send(Err(error.to_string())).await;
+                                                        }
                                                     }
                                                     Err(error) => {
                                                         let _ = retry_tx.send(Err(error)).await;
@@ -1845,7 +2059,8 @@ async fn terminal_loop<R: Repository + 'static>(
                                                 TaskStatus::Queued
                                                     | TaskStatus::Ready
                                                     | TaskStatus::Running
-                                            )
+                                                    | TaskStatus::WaitingApproval
+                                            ) || model.lead_reviews.contains_key(&task.id)
                                         })
                                         .map(|task| task.id)
                                     {
@@ -1868,7 +2083,6 @@ async fn terminal_loop<R: Repository + 'static>(
                                                 .decide_approval(id, decision)
                                                 .await
                                                 .is_ok()
-                                                && decision == ApprovalDecision::ApprovedOnce
                                             {
                                                 let _ = engine
                                                     .run_until_idle_bounded(max_parallel_tasks)
@@ -1999,7 +2213,7 @@ async fn terminal_loop<R: Repository + 'static>(
                 match result {
                     Ok(()) => {
                         model.composer_notice = Some(
-                            "Quick Run planned. Review and approve its visible actions.".into()
+                            if model.automatic_review { "Quick Run settled. Team Lead decisions are in Activity." } else { "Quick Run planned. Review and approve its visible actions." }.into()
                         );
                     }
                     Err(error) => {
@@ -2130,16 +2344,20 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
                     &session[..session.len().min(8)]
                 )),
             ]),
-            Line::from(Span::styled(
-                format!(
-                    " [1 Team] [2 Tasks] · {} · {} · circuit {:?} · {} retries · {cost}{credential}",
-                    app.provider_label,
-                    app.model_label,
-                    app.provider_health.circuit,
-                    app.provider_health.retries
+            Line::from(vec![
+                menu_tab("[1 Team]", app.panel == Panel::Agents),
+                menu_tab("[2 Tasks]", app.panel == Panel::Tasks),
+                Span::styled(
+                    format!(
+                        " · {} · {} · circuit {:?} · {} retries · {cost}{credential}",
+                        app.provider_label,
+                        app.model_label,
+                        app.provider_health.circuit,
+                        app.provider_health.retries
+                    ),
+                    Style::default().fg(Color::Gray),
                 ),
-                Style::default().fg(Color::DarkGray),
-            )),
+            ]),
         ])
         .block(
             Block::default()
@@ -2374,21 +2592,35 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
         );
         return;
     };
-    let (title, lines) = match app.task_inspector {
-        TaskInspector::Details => (
-            " Summary · [r] re-run · [s] summary · [a] activity · PgUp/PgDn scroll ",
-            task_detail_lines(app, &task),
-        ),
-        TaskInspector::RoleActivity => (
-            " Activity · [r] re-run · [s] summary · [a] activity · PgUp/PgDn scroll ",
-            role_activity_lines(app, &task),
-        ),
+    let lines = match app.task_inspector {
+        TaskInspector::Details => task_detail_lines(app, &task),
+        TaskInspector::RoleActivity => role_activity_lines(app, &task),
     };
+    let title = Line::from(vec![
+        menu_tab("[s] summary", app.task_inspector == TaskInspector::Details),
+        Span::raw(" "),
+        menu_tab(
+            "[a] activity",
+            app.task_inspector == TaskInspector::RoleActivity,
+        ),
+    ]);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((app.task_inspector_scroll, 0))
-            .block(panel(title, true).border_type(BorderType::Rounded)),
+            .block(
+                panel("", true)
+                    .title(title)
+                    .title_bottom(format!(
+                        " [v] {} · [r] re-run · PgUp/PgDn scroll ",
+                        if app.expanded_output {
+                            "collapse"
+                        } else {
+                            "expand"
+                        }
+                    ))
+                    .border_type(BorderType::Rounded),
+            ),
         inspector,
     );
 }
@@ -2418,8 +2650,30 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         )));
     }
     lines.push(Line::from(""));
+    if let Some(output) = app
+        .scoped_events
+        .iter()
+        .rev()
+        .find(|e| e.task_id == Some(task.id) && e.is_output)
+    {
+        push_section(
+            &mut lines,
+            "LATEST OUTPUT · preview, not applied",
+            Color::LightCyan,
+        );
+        push_text_lines(
+            &mut lines,
+            &compact_text(&output.text, app.expanded_output, true),
+            "  ",
+        );
+        lines.push(Line::from(""));
+    }
     push_section(&mut lines, "OBJECTIVE", Color::LightCyan);
-    push_text_lines(&mut lines, &sanitize(&task.objective), "  ");
+    push_text_lines(
+        &mut lines,
+        &compact_text(&sanitize(&task.objective), app.expanded_output, false),
+        "  ",
+    );
 
     lines.push(Line::from(""));
     push_section(&mut lines, "ACCEPTANCE", Color::LightCyan);
@@ -2429,15 +2683,27 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for criterion in &task.acceptance_criteria {
-            lines.push(Line::from(format!("  • {}", sanitize(criterion))));
-        }
+        let criteria = task
+            .acceptance_criteria
+            .iter()
+            .map(|c| format!("• {}", sanitize(c)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        push_text_lines(
+            &mut lines,
+            &compact_text(&criteria, app.expanded_output, false),
+            "  ",
+        );
     }
 
     if let Some(result) = &task.result {
         lines.push(Line::from(""));
         push_section(&mut lines, "RESULT", Color::Green);
-        push_text_lines(&mut lines, &sanitize(&result.summary), "  ");
+        push_text_lines(
+            &mut lines,
+            &compact_text(&sanitize(&result.summary), app.expanded_output, false),
+            "  ",
+        );
         if !result.evidence.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!(
@@ -2475,7 +2741,11 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
                 ),
             ]));
             if !artifact.preview.trim().is_empty() {
-                push_text_lines(&mut lines, &sanitize(&artifact.preview), "    ");
+                push_text_lines(
+                    &mut lines,
+                    &compact_text(&sanitize(&artifact.preview), app.expanded_output, false),
+                    "    ",
+                );
             }
         }
     }
@@ -2514,6 +2784,7 @@ fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
         )),
         Line::from(""),
     ];
+    push_review_loop(&mut lines, app, selected);
     let mut count = 0usize;
     for event in app.scoped_events.iter().rev() {
         let Some(task_id) = event.task_id else {
@@ -2544,7 +2815,7 @@ fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
             Span::styled(objective, Style::default().add_modifier(Modifier::BOLD)),
         ]));
         let event_style = Style::default().fg(event_text_color(&event.text));
-        for event_line in event.text.lines() {
+        for event_line in compact_text(&event.text, app.expanded_output, event.is_output).lines() {
             lines.push(Line::from(Span::styled(event_line.to_owned(), event_style)));
         }
         lines.push(Line::from(""));
@@ -2558,11 +2829,146 @@ fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
     lines
 }
 
+// A chronological, bounded overview separate from the newest-first raw activity.
+// Membership comes from persisted retry links, never from provider prose.
+fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &Task) {
+    let mut attempts = HashSet::from([selected.id]);
+    for _ in 0..app.tasks.len() {
+        let previous_len = attempts.len();
+        for task in &app.tasks {
+            if let Some(previous) = task.retry_of
+                && (attempts.contains(&task.id) || attempts.contains(&previous))
+            {
+                attempts.insert(previous);
+                attempts.insert(task.id);
+            }
+        }
+        if attempts.len() == previous_len {
+            break;
+        }
+    }
+    let steps = app
+        .scoped_events
+        .iter()
+        .filter(|event| {
+            event.workflow.is_some() && event.task_id.is_some_and(|id| attempts.contains(&id))
+        })
+        .collect::<Vec<_>>();
+    if steps.is_empty() {
+        return;
+    }
+    push_section(
+        lines,
+        "REVIEW LOOP · selected task + its attempts",
+        Color::LightCyan,
+    );
+    let latest = app
+        .tasks
+        .iter()
+        .filter(|task| attempts.contains(&task.id))
+        .max_by_key(|task| task.attempt)
+        .unwrap_or(selected);
+    let (_, status, color) = task_status_visual(latest.status);
+    let status = if app.lead_reviews.contains_key(&latest.id) {
+        "Team Lead reviewing"
+    } else {
+        status
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            " Attempt {} · {} · {status}",
+            latest.attempt,
+            short_task_id(latest.id)
+        ),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(
+        " Develop → Lead review → feedback → revise → Lead review",
+    ));
+    lines.push(Line::from(
+        " Recent handoffs · oldest → newest · [v] full feedback",
+    ));
+    for event in steps.iter().skip(steps.len().saturating_sub(6)) {
+        let task = app.tasks.iter().find(|task| Some(task.id) == event.task_id);
+        let attempt = task.map_or_else(|| "?".into(), |task| task.attempt.to_string());
+        let style = Style::default().fg(event_text_color(&event.text));
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Attempt {attempt} · {}",
+                event.workflow.unwrap_or_default()
+            ),
+            style.add_modifier(Modifier::BOLD),
+        )));
+        let detail = if app.expanded_output {
+            event.text.clone()
+        } else {
+            truncate_text(&one_line(&event.text), 180)
+        };
+        for line in detail.lines() {
+            lines.push(Line::from(Span::styled(format!(" {line}"), style)));
+        }
+    }
+    lines.push(Line::from(""));
+    push_section(lines, "ROLE ACTIVITY · newest first", Color::LightMagenta);
+}
+
 fn push_section(lines: &mut Vec<Line<'static>>, title: &str, color: Color) {
     lines.push(Line::from(Span::styled(
         format!(" {title}"),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
+}
+
+// Display-only folding: full persisted output remains available with `v`.
+fn compact_text(text: &str, expanded: bool, tail: bool) -> String {
+    if expanded {
+        return text.to_owned();
+    }
+    // Inspect only the visible edge, not megabytes of earlier code per frame.
+    let bounded = if tail {
+        let start = text
+            .char_indices()
+            .rev()
+            .nth(959)
+            .map_or(0, |(index, _)| index);
+        &text[start..]
+    } else {
+        let end = text
+            .char_indices()
+            .nth(960)
+            .map_or(text.len(), |(index, _)| index);
+        &text[..end]
+    };
+    let lines = bounded.lines().collect::<Vec<_>>();
+    let hidden = bounded.len() < text.len() || lines.len() > 8;
+    let excerpt = if tail {
+        lines[lines.len().saturating_sub(8)..].join("\n")
+    } else {
+        lines.into_iter().take(8).collect::<Vec<_>>().join("\n")
+    };
+    if hidden {
+        if tail {
+            format!("… earlier output hidden · [v] expand\n{excerpt}")
+        } else {
+            format!("{excerpt}\n… more hidden · [v] expand")
+        }
+    } else {
+        excerpt
+    }
+}
+
+fn menu_tab(label: &str, active: bool) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
+        if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        },
+    )
 }
 
 fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, prefix: &str) {
@@ -2690,6 +3096,7 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
             agents: &app.agents,
             tasks: &app.tasks,
             approvals: &app.approvals,
+            reviews: &app.lead_reviews,
             responses: &app.agent_responses,
             provider_kinds: &app.agent_provider_kinds,
             team_lead: app.team_lead,
@@ -2715,9 +3122,9 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             " Events · paused "
         };
         let footer = if app.event_follow {
-            " ↓/PgDn older · e/Esc close "
+            " [v] expand/collapse · ↓/PgDn older · e/Esc close "
         } else {
-            " ↑/PgUp newer · e/Esc close "
+            " [v] expand/collapse · ↑/PgUp newer · e/Esc close "
         };
         frame.render_widget(
             Paragraph::new(text)
@@ -2755,6 +3162,8 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             popup_section("TASK DEBUGGING"),
             Line::from("  s             Selected task summary"),
             Line::from("  a             Owning role's activity"),
+            Line::from("  v             Expand/collapse long output and details"),
+            Line::from("  d             Expand/collapse pending approval details"),
             Line::from("  PgUp/PgDn     Scroll details or events"),
             Line::from("  x             Cancel selected active task"),
             Line::from("  r             Re-run selected terminal/blocked task"),
@@ -2791,6 +3200,21 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
     }
     if let Some(approval) = app.pending_approval() {
         render_approval_popup(frame, app, approval);
+    } else if let Some(notice) = &app.application_notice {
+        let popup = compact_approval_area(frame.area());
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(notice.as_str())
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::LightRed))
+                        .title(" Application needs attention ")
+                        .title_bottom(" [e] events · [A] token · [Esc] dismiss "),
+                ),
+            popup,
+        );
     }
     if let Some(input) = &app.credential_input {
         let area = frame.area();
@@ -2995,10 +3419,11 @@ fn role_config_line<'a>(label: &'a str, value: &'a str, selected: bool, choice: 
             format!("  {label:<13}"),
             if selected {
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::White)
             },
         ),
         Span::styled(
@@ -3147,7 +3572,114 @@ fn render_team_adjustment_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) 
     );
 }
 
+fn compact_approval_area(area: Rect) -> Rect {
+    let width = area.width.min(56);
+    Rect::new(
+        area.right().saturating_sub(width),
+        area.y,
+        width,
+        area.height.min(5),
+    )
+}
+
+fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
+    let popup = compact_approval_area(frame.area());
+    let owner = app
+        .tasks
+        .iter()
+        .find(|task| task.id == approval.task_id)
+        .and_then(|task| app.agent_for_owner(task.owner))
+        .map_or("Task", |agent| agent.name.as_str());
+    let caption = if approval.action == "provider.continue" {
+        serde_json::from_str::<OutputContinuation>(&approval.reason)
+            .map(|c| {
+                format!(
+                    "Output limit · {} → {} tokens. Continue?",
+                    c.previous_tokens, c.next_tokens
+                )
+            })
+            .unwrap_or_else(|_| "Output limit · continue or cancel?".into())
+    } else {
+        format!("{} · {}", sanitize(owner), sanitize(&approval.action))
+    };
+    let subtitle = if approval.action == "provider.continue" {
+        "Regenerate; may cost more. y continue / n cancel".to_owned()
+    } else {
+        let summary = serde_json::from_str::<serde_json::Value>(&approval.reason)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .or_else(|| v.get("target_agent"))
+                    .or_else(|| v.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| short_task_id(approval.task_id));
+        sanitize(&summary)
+    };
+    let title = if app.pending_approval_count() > 1 {
+        format!(
+            " Decision {}/{} · ↑/↓ ",
+            app.approval_selected + 1,
+            app.pending_approval_count()
+        )
+    } else {
+        " Decision ".into()
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                truncate_text(&caption, usize::from(popup.width.saturating_sub(2))),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(truncate_text(
+                &subtitle,
+                usize::from(popup.width.saturating_sub(2)),
+            )),
+        ])
+        .style(Style::default().bg(Color::Black).fg(Color::White))
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(title)
+                .title_bottom(Line::from(vec![
+                    Span::styled(
+                        " [y] ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "[n] ",
+                        Style::default()
+                            .fg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "[d] details ",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                ])),
+        ),
+        popup,
+    );
+}
+
 fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
+    if !app.approval_details {
+        render_compact_approval(frame, app, approval);
+        return;
+    }
+    if approval.action == "provider.continue" {
+        render_continuation_popup(frame, app, approval);
+        return;
+    }
     let delegation = serde_json::from_str::<DelegationProposal>(&approval.reason)
         .ok()
         .filter(|_| approval.action == "task.delegate");
@@ -3237,8 +3769,8 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
     let area = frame.area();
     let popup = centered_popup(
         area,
-        area.width.saturating_sub(4).clamp(1, 82),
-        area.height.saturating_sub(4).clamp(1, 24),
+        area.width.saturating_sub(2).max(1),
+        area.height.saturating_sub(2).max(1),
     );
     let mut footer = vec![
         Span::styled(
@@ -3253,6 +3785,7 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     ];
+    footer.push(Span::raw(" · [d] minimize · PgUp/PgDn scroll "));
     if pending_count > 1 {
         footer.push(Span::styled(
             "· ↑/↓ request ",
@@ -3263,6 +3796,7 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
+            .scroll((app.approval_scroll, 0))
             .style(Style::default().bg(Color::Black))
             .block(
                 Block::default()
@@ -3270,10 +3804,83 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
                         " Approval {} of {pending_count} · User decision ",
                         selected.saturating_add(1)
                     ))
-                    .title_bottom(Line::from(footer).alignment(ratatui::layout::Alignment::Center))
+                    .title_bottom(Line::from(footer).alignment(ratatui::layout::Alignment::Left))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Yellow)),
+            ),
+        popup,
+    );
+}
+
+fn render_continuation_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
+    let task = app.tasks.iter().find(|task| task.id == approval.task_id);
+    let owner = task
+        .and_then(|task| app.agent_for_owner(task.owner))
+        .map_or("Agent", |agent| agent.name.as_str());
+    let allowance = serde_json::from_str::<OutputContinuation>(&approval.reason)
+        .map(|c| format!("{} → {} output tokens", c.previous_tokens, c.next_tokens))
+        .unwrap_or_else(|_| "See the persisted continuation request".into());
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" {} · {}", sanitize(owner), short_task_id(approval.task_id)),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(task.map_or_else(String::new, |task| {
+            truncate_text(&one_line(&sanitize(&task.objective)), 110)
+        })),
+        Line::from(""),
+        Line::from("The model reached its output limit. No partial actions were applied."),
+        Line::from(Span::styled(
+            allowance,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Continue regenerates this response with a higher allowance."),
+        Line::from("It may take longer and cost more. Tool approvals still apply."),
+        Line::from("Cancel stops this task; its history and partial preview are kept."),
+    ];
+    let popup = centered_popup(
+        frame.area(),
+        frame.area().width.saturating_sub(2).max(1),
+        frame.area().height.saturating_sub(2).max(1),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.approval_scroll, 0))
+            .style(Style::default().bg(Color::Black).fg(Color::White))
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Output limit · Continue task? ")
+                    .title_bottom(Line::from(vec![
+                        Span::styled(
+                            " [y] Continue ",
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " [n] Cancel ",
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" · [d] minimize · PgUp/PgDn scroll "),
+                        Span::raw(if app.pending_approval_count() > 1 {
+                            " · ↑/↓ request "
+                        } else {
+                            ""
+                        }),
+                    ])),
             ),
         popup,
     );
@@ -3336,6 +3943,219 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
+    #[test]
+    fn automatic_approvals_do_not_prompt_but_application_limits_do() {
+        let mut app = AppModel::new(SessionId::new());
+        app.automatic_review = true;
+        let approval = Approval {
+            id: voff_core::ApprovalId::new(),
+            task_id: voff_core::TaskId::new(),
+            tool_call_id: voff_core::ToolCallId::new(),
+            action: "file.patch".into(),
+            working_directory: ".".into(),
+            reason: "{}".into(),
+            decision: ApprovalDecision::Pending,
+            created_at: chrono::Utc::now(),
+        };
+        app.approvals.push(approval.clone());
+        assert!(app.pending_approval().is_none());
+        app.approvals.push(Approval {
+            action: "provider.continue".into(),
+            ..approval
+        });
+        assert_eq!(app.pending_approval_count(), 1);
+        assert_eq!(app.pending_approval().unwrap().action, "provider.continue");
+    }
+
+    #[test]
+    fn lead_review_reverses_the_live_edge_and_shows_review_cards() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Lead", "technical_lead", vec!["Backend".into()]);
+        let worker = agent("Backend", "backend_developer", vec![]);
+        app.team_lead = Some(lead.id);
+        let root = Task::root(lead.id, "Build", vec![], Default::default());
+        let mut child = Task::root(worker.id, "Implement", vec![], Default::default());
+        child.parent = Some(root.id);
+        child.status = TaskStatus::WaitingApproval;
+        app.tasks = vec![root, child.clone()];
+        app.agents = vec![lead.clone(), worker.clone()];
+        app.lead_reviews
+            .insert(child.id, "Reviewing proposal".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let edge = &app.team_flow.edges()[0];
+        assert_eq!(edge.source, worker.id.to_string());
+        assert_eq!(edge.target, lead.id.to_string());
+        assert!(edge.animated);
+        assert_eq!(
+            app.team_flow.connection_positions(0),
+            Some((
+                rataflow::HandlePosition::Bottom,
+                rataflow::HandlePosition::Bottom
+            ))
+        );
+        assert_eq!(
+            app.team_flow.connection_positions(1),
+            Some((rataflow::HandlePosition::Top, rataflow::HandlePosition::Top))
+        );
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..36)
+            .flat_map(|y| (0..120).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("REVIEW"), "{rendered}");
+        app.lead_reviews.clear();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.team_flow.edges()[0].source, lead.id.to_string());
+        assert_eq!(
+            app.team_flow.connection_positions(0).unwrap().0,
+            app.team_flow.connection_positions(0).unwrap().1
+        );
+    }
+
+    #[test]
+    fn review_arrow_is_visible_at_shared_lead_port_with_other_assignments() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent(
+            "Lead",
+            "technical_lead",
+            vec!["Backend".into(), "Frontend".into()],
+        );
+        let worker = agent("Backend", "backend_developer", vec![]);
+        let other = agent("Frontend", "frontend_developer", vec![]);
+        app.team_lead = Some(lead.id);
+        let root = Task::root(lead.id, "Build", vec![], Default::default());
+        let mut child = Task::root(worker.id, "Implement", vec![], Default::default());
+        child.parent = Some(root.id);
+        child.status = TaskStatus::WaitingApproval;
+        let mut sibling = Task::root(other.id, "Other work", vec![], Default::default());
+        sibling.parent = Some(root.id);
+        sibling.status = TaskStatus::Completed;
+        app.tasks = vec![root, child.clone(), sibling];
+        app.agents = vec![lead.clone(), worker, other];
+        app.lead_reviews
+            .insert(child.id, "Reviewing proposal".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.team_flow.edges().last().unwrap().target,
+            lead.id.to_string()
+        );
+        let (left, _, right, bottom) = app.team_flow.node_terminal_rect(0).unwrap();
+        let buffer = terminal.backend().buffer();
+        let port = (bottom..=(bottom + 2))
+            .flat_map(|y| (left..=right).map(move |x| buffer[(x as u16, y as u16)].symbol()))
+            .collect::<String>();
+        assert!(
+            port.contains('▲'),
+            "Lead bottom port must show an incoming arrow: {port}"
+        );
+    }
+
+    #[test]
+    fn activity_explains_review_loop_across_attempts_without_mixing_other_work() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = AgentId::new();
+        let lead = AgentId::new();
+        let original = Task::root(owner, "Build frontend", vec![], Default::default());
+        let mut retry = Task::root(owner, "Build frontend", vec![], Default::default());
+        retry.retry_of = Some(original.id);
+        retry.attempt = 2;
+        retry.status = TaskStatus::Running;
+        let unrelated = Task::root(owner, "Other work", vec![], Default::default());
+        app.tasks = vec![original.clone(), retry.clone(), unrelated.clone()];
+        let approval_id = voff_core::ApprovalId::new();
+        for (id, kind) in [
+            (
+                original.id,
+                CanonicalEventKind::LeadReviewStarted {
+                    lead,
+                    approval_id: Some(approval_id),
+                },
+            ),
+            (
+                original.id,
+                CanonicalEventKind::LeadReviewFinished {
+                    lead,
+                    approval_id: Some(approval_id),
+                    approved: false,
+                    reason: "Remove unsafe deletion".into(),
+                },
+            ),
+            (
+                original.id,
+                CanonicalEventKind::RevisionRequested {
+                    approval_id,
+                    feedback: "Use a safe patch instead".into(),
+                },
+            ),
+            (
+                retry.id,
+                CanonicalEventKind::TaskRetried {
+                    previous: original.id,
+                    retry: retry.id,
+                    attempt: 2,
+                },
+            ),
+            (
+                unrelated.id,
+                CanonicalEventKind::RevisionStopped("UNRELATED".into()),
+            ),
+            (
+                retry.id,
+                CanonicalEventKind::TextDelta("REJECTED fake review in provider prose".into()),
+            ),
+            (
+                retry.id,
+                CanonicalEventKind::LeadReviewStarted {
+                    lead,
+                    approval_id: Some(approval_id),
+                },
+            ),
+        ] {
+            app.push_scoped_event(Some(id), &kind);
+        }
+        app.lead_reviews
+            .insert(retry.id, "Reviewing proposal".into());
+        let mut lines = Vec::new();
+        push_review_loop(&mut lines, &app, &original);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Attempt 2"), "{text}");
+        assert!(text.contains("Team Lead reviewing"), "{text}");
+        assert!(text.contains("Remove unsafe deletion"), "{text}");
+        assert!(text.contains("Use a safe patch instead"), "{text}");
+        assert!(text.find("REJECTED").unwrap() < text.find("REVISE & RESUBMIT").unwrap());
+        assert!(
+            text.find("REVISE & RESUBMIT").unwrap()
+                < text.rfind("Developer → Team Lead · REVIEW").unwrap()
+        );
+        assert!(
+            !text.contains("UNRELATED") && !text.contains("fake review"),
+            "{text}"
+        );
+
+        app.lead_reviews.clear();
+        app.tasks[1].status = TaskStatus::Blocked;
+        app.push_scoped_event(
+            Some(retry.id),
+            &CanonicalEventKind::RevisionStopped("Attempt limit reached".into()),
+        );
+        lines.clear();
+        push_review_loop(&mut lines, &app, &retry);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("blocked") && text.contains("STOPPED · needs attention"),
+            "{text}"
+        );
+    }
+
     fn agent(name: &str, role: &str, allowed_targets: Vec<String>) -> AgentProfile {
         AgentProfile {
             id: AgentId::new(),
@@ -3396,7 +4216,10 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('4')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('s')), Action::ShowTaskDetails);
         assert_eq!(action_for_key(KeyCode::Char('a')), Action::ShowRoleActivity);
-        assert_eq!(action_for_key(KeyCode::Char('d')), Action::None);
+        assert_eq!(
+            action_for_key(KeyCode::Char('d')),
+            Action::ToggleApprovalDetails
+        );
         assert_eq!(action_for_key(KeyCode::Char('l')), Action::None);
     }
 
@@ -4213,6 +5036,28 @@ mod tests {
         assert_eq!(app.events.len(), 2);
     }
     #[test]
+    fn interleaved_task_streams_are_not_merged() {
+        let mut app = AppModel::new(SessionId::new());
+        let first = voff_core::TaskId::new();
+        let second = voff_core::TaskId::new();
+        app.push_scoped_event(Some(first), &CanonicalEventKind::TextDelta("hello".into()));
+        app.push_scoped_event(
+            Some(second),
+            &CanonicalEventKind::GenerationDelta("{\"path\":".into()),
+        );
+        app.push_scoped_event(
+            Some(second),
+            &CanonicalEventKind::GenerationDelta("\"a.rs\"}".into()),
+        );
+        app.push_scoped_event(Some(first), &CanonicalEventKind::TextDelta(" world".into()));
+        assert_eq!(app.events, vec!["hello", "{\"path\":\"a.rs\"}", " world"]);
+        assert_eq!(
+            app.event_task_ids,
+            vec![Some(first), Some(second), Some(first)]
+        );
+        assert_eq!(app.scoped_events.len(), 3);
+    }
+    #[test]
     fn streaming_preserves_spaces_and_markdown_lines() {
         let mut app = AppModel::new(SessionId::new());
         app.push_event(&CanonicalEventKind::TextDelta("Repo küçük,".into()));
@@ -4274,7 +5119,10 @@ mod tests {
         assert!(rendered.contains("Model · qwen-test"));
         assert!(rendered.contains("4096 token limit"));
         assert!(!rendered.contains("no delegation"));
-        assert!(rendered.contains("[1 Team] [2 Tasks]"), "{rendered}");
+        assert!(
+            rendered.contains("[1 Team]") && rendered.contains("[2 Tasks]"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("[R Quick Run]"), "{rendered}");
         assert!(!rendered.contains("[3 Events]"), "{rendered}");
         assert!(rendered.contains("· Team · session"), "{rendered}");
@@ -4485,7 +5333,7 @@ mod tests {
         );
         assert!(rendered.contains("Backend"), "{rendered}");
         assert!(app.agents.iter().any(|agent| agent.name == "Frontend"));
-        assert!(rendered.contains("Approval 1 of 2"), "{rendered}");
+        assert!(rendered.contains("Decision 1/2"), "{rendered}");
         assert_eq!(app.team_flow.edges().len(), 2);
         let lead_id = app.team_lead.unwrap().to_string();
         let backend_id = backend_id.to_string();
@@ -4512,6 +5360,7 @@ mod tests {
     #[test]
     fn approval_popup_navigates_one_pending_request_at_a_time() {
         let mut app = AppModel::new(SessionId::new());
+        app.approval_details = true;
         let owner = AgentId::new();
         let task = Task::root(
             owner,
@@ -4571,6 +5420,7 @@ mod tests {
     #[test]
     fn approval_border_keeps_decisions_visible_and_highlights_the_action() {
         let mut app = AppModel::new(SessionId::new());
+        app.approval_details = true;
         let owner = AgentId::new();
         let task = Task::root(
             owner,
@@ -4811,5 +5661,88 @@ mod tests {
             })
             .count();
         assert!(yellow_route_cells > 0);
+    }
+    #[test]
+    fn compact_output_keeps_latest_text_and_expands_without_loss() {
+        let text = (0..50)
+            .map(|n| format!("line {n} 🦀\n"))
+            .collect::<String>();
+        let collapsed = compact_text(&text, false, true);
+        assert!(collapsed.contains("line 49"));
+        assert!(!collapsed.contains("line 0 "));
+        assert!(collapsed.contains("[v] expand"));
+        assert_eq!(compact_text(&text, true, true), text);
+        let mut app = AppModel::new(SessionId::new());
+        app.reduce(Action::ToggleExpanded);
+        assert!(app.expanded_output);
+        assert_eq!(menu_tab("summary", false).style.fg, Some(Color::White));
+        assert_eq!(menu_tab("summary", true).style.bg, Some(Color::LightCyan));
+        assert_eq!(
+            menu_tab("summary", true).content,
+            menu_tab("summary", false).content
+        );
+    }
+
+    #[test]
+    fn continuation_choices_remain_on_border_and_override_composer_input() {
+        let mut app = AppModel::new(SessionId::new());
+        let approval = Approval {
+            id: voff_core::ApprovalId::new(),
+            task_id: voff_core::TaskId::new(),
+            tool_call_id: voff_core::ToolCallId::new(),
+            action: "provider.continue".into(),
+            working_directory: "current task only".into(),
+            reason: serde_json::to_string(&OutputContinuation {
+                previous_tokens: 4096,
+                next_tokens: 8192,
+                conversation: false,
+            })
+            .unwrap(),
+            decision: ApprovalDecision::Pending,
+            created_at: chrono::Utc::now(),
+        };
+        app.approvals.push(approval.clone());
+        app.composer_active = true;
+        assert_eq!(
+            app.handle_composer_event(&Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE
+            ))),
+            ComposerEvent::Ignored
+        );
+        for (width, height) in [(80, 24), (40, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            app.approval_details = false;
+            terminal
+                .draw(|frame| render_approval_popup(frame, &app, &approval))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = (0..height)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(rendered.contains("[y] [n] [d] details"), "{rendered}");
+            let area = compact_approval_area(buffer.area);
+            assert_eq!(area.right(), width);
+            assert_eq!(area.y, 0);
+            assert_eq!(area.height, 5);
+            assert_eq!(buffer[(area.x, 0)].symbol(), "╭");
+            assert_eq!(buffer[(area.x, 5)].symbol(), " ");
+            app.reduce(Action::ToggleApprovalDetails);
+            assert!(app.approval_details);
+            terminal
+                .draw(|frame| render_approval_popup(frame, &app, &approval))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = (0..height)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(rendered.contains("[y] Continue"), "{rendered}");
+            assert!(rendered.contains("[n] Cancel"), "{rendered}");
+            app.reduce(Action::PageDown);
+            assert_eq!(app.approval_scroll, 10);
+            app.reduce(Action::Escape);
+            assert!(!app.approval_details);
+            assert!(!app.quit);
+        }
     }
 }

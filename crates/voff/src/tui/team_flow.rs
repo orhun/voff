@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
 use std::collections::HashMap;
-use voff_core::{AgentId, AgentProfile, Approval, ApprovalDecision, Task, TaskStatus};
+use voff_core::{AgentId, AgentProfile, Approval, ApprovalDecision, Task, TaskId, TaskStatus};
 use voff_engine::DelegationProposal;
 
 const WORKING_FRAMES: [&str; 4] = ["◒", "◐", "◓", "◑"];
@@ -31,7 +31,8 @@ struct AgentCard {
 
 impl NodeContent for AgentCard {
     fn render(&self, ctx: &NodeRenderContext<'_>, buf: &mut Buffer) {
-        let live_pulse = self.status == "working" && ctx.animation_phase % 8 < 4;
+        let live_pulse =
+            matches!(self.status, "working" | "reviewing") && ctx.animation_phase % 8 < 4;
         let border_style = if ctx.selected || live_pulse {
             Style::default()
                 .fg(if live_pulse {
@@ -52,6 +53,7 @@ impl NodeContent for AgentCard {
         };
         let status_label = match self.status {
             "working" => "LIVE · working",
+            "reviewing" => "REVIEW · Team Lead",
             "approval" => "GATE · approval",
             "ready" | "queued" => "ASSIGNED",
             value => value,
@@ -129,6 +131,7 @@ pub(super) struct TeamSnapshot<'a> {
     pub agents: &'a [AgentProfile],
     pub tasks: &'a [Task],
     pub approvals: &'a [Approval],
+    pub reviews: &'a HashMap<TaskId, String>,
     pub responses: &'a HashMap<AgentId, String>,
     pub provider_kinds: &'a HashMap<AgentId, String>,
     pub team_lead: Option<AgentId>,
@@ -182,12 +185,30 @@ impl TeamFlow {
         {
             self.mouse_highlight = None;
         }
+        for (task_id, caption) in snapshot.reviews {
+            let Some(task) = snapshot.tasks.iter().find(|task| task.id == *task_id) else {
+                continue;
+            };
+            for owner in [Some(task.owner), snapshot.team_lead].into_iter().flatten() {
+                if let Some(card) = self.flow.node_content_mut(&node_id(owner)) {
+                    card.status = "reviewing";
+                    card.status_color = Color::LightCyan;
+                    card.detail = caption.clone();
+                    card.response = Some(if Some(owner) == snapshot.team_lead {
+                        format!("Reviewing {}", super::short_task_id(*task_id))
+                    } else {
+                        "→ Team Lead for decision".into()
+                    });
+                }
+            }
+        }
         let edges = build_edges(
             snapshot.agents,
             snapshot.tasks,
             snapshot.approvals,
             snapshot.team_lead,
             self.mouse_highlight,
+            snapshot.reviews,
         );
         if self.flow.set_edges(edges).is_err() {
             self.flow.retain_edges(|_| false);
@@ -226,8 +247,16 @@ impl TeamFlow {
                 .with_selected(index == selected)
                 .with_deletable(false)
                 .with_connectable(false)
-                .with_source_position(HandlePosition::Bottom)
-                .with_target_position(HandlePosition::Top)
+                .with_source_position(if snapshot.team_lead.is_some_and(|lead| lead != agent.id) {
+                    HandlePosition::Top
+                } else {
+                    HandlePosition::Bottom
+                })
+                .with_target_position(if snapshot.team_lead == Some(agent.id) {
+                    HandlePosition::Bottom
+                } else {
+                    HandlePosition::Top
+                })
             })
             .collect();
         if self.flow.set_nodes(nodes).is_ok() {
@@ -312,6 +341,12 @@ impl TeamFlow {
         self.flow
             .node(&node_id(*agent_id))
             .map(|node| node.position)
+    }
+
+    #[cfg(test)]
+    pub fn connection_positions(&self, index: usize) -> Option<(HandlePosition, HandlePosition)> {
+        let node = self.flow.node(&node_id(*self.agent_ids.get(index)?))?;
+        Some((node.source_position, node.target_position))
     }
 
     #[cfg(test)]
@@ -401,6 +436,7 @@ fn build_edges(
     approvals: &[Approval],
     team_lead: Option<AgentId>,
     highlighted_agent: Option<AgentId>,
+    reviews: &HashMap<TaskId, String>,
 ) -> Vec<Edge<StepEdge>> {
     let mut edges = Vec::new();
     if let Some(lead_id) = team_lead {
@@ -422,14 +458,25 @@ fn build_edges(
                 !specialist.enabled,
                 highlighted_agent.is_some_and(|id| id == lead.id || id == specialist.id),
             );
+            let returning = tasks
+                .iter()
+                .any(|task| task.owner == specialist.id && reviews.contains_key(&task.id));
             edges.push(routing_edge(
                 format!("assignment:{}:{}", lead.id, specialist.id),
-                lead.id,
-                specialist.id,
-                assignment_style,
-                assignment_animated,
+                if returning { specialist.id } else { lead.id },
+                if returning { lead.id } else { specialist.id },
+                if returning {
+                    active_edge_style(Color::LightCyan, true)
+                } else {
+                    assignment_style
+                },
+                returning || assignment_animated,
             ));
         }
+        // All routes share the Lead's bottom port. Paint returning review
+        // arrows last so an outgoing route's diamond cannot cover them.
+        let lead_node = node_id(lead_id);
+        edges.sort_by_key(|edge| edge.target == lead_node);
         return edges;
     }
 

@@ -5,6 +5,7 @@ root = "."
 state_file = ".voff/voff.db"
 
 [runtime]
+automatic_review = true # Team Lead reviews work; false restores manual approvals
 default_timeout_seconds = 1800
 event_channel_capacity = 128
 
@@ -29,7 +30,7 @@ name = "Solo fallback"
 role = "software_developer"
 system_prompt = "Return verifiable results."
 tools = ["file.read", "search.text"]
-max_output_tokens = 4096
+max_output_tokens = 16384
 
 [formation]
 name = "Cloud lead and local implementation"
@@ -44,7 +45,7 @@ provider = "cloud"
 model = "gpt-5-mini"
 system_prompt = "Split work into bounded tasks and review evidence."
 tools = ["file.read", "search.text", "task.delegate", "review.request"]
-max_output_tokens = 8192
+max_output_tokens = 16384
 
 [agents.delegation]
 allowed_targets = ["implementer", "reviewer"]
@@ -59,7 +60,7 @@ provider = "local"
 model = "qwen3:4b"
 system_prompt = "Implement scoped changes and provide verifiable evidence."
 tools = ["file.read", "search.text", "file.patch", "process.test"]
-max_output_tokens = 4096
+max_output_tokens = 16384
 
 [[agents]]
 id = "reviewer"
@@ -69,4 +70,4 @@ provider = "cloud"
 model = "gpt-5-mini"
 system_prompt = "Review artifacts against acceptance criteria."
 tools = ["file.read", "search.text", "review.request"]
-max_output_tokens = 4096
+max_output_tokens = 16384
