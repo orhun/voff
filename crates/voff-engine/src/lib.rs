@@ -1,5 +1,6 @@
 //! Bounded, cancellation-aware orchestration engine.
 mod coordination;
+mod integrated;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -89,6 +90,7 @@ pub struct Engine<R: Repository> {
     coordinator_lock: Mutex<()>,
     workflow_lock: Mutex<()>,
     automatic_review: bool,
+    verified_workflow: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +112,8 @@ pub struct OutputContinuation {
 struct PatchArguments {
     path: PathBuf,
     replacement: String,
+    #[serde(default)]
+    artifact_id: Option<ArtifactId>,
 }
 #[derive(Deserialize)]
 struct TestArguments {
@@ -181,6 +185,7 @@ impl<R: Repository + 'static> Engine<R> {
             coordinator_lock: Mutex::new(()),
             workflow_lock: Mutex::new(()),
             automatic_review: false,
+            verified_workflow: false,
         }
     }
     pub fn with_safe_workflow(mut self, root: &Path) -> Result<Self, EngineError> {
@@ -193,6 +198,12 @@ impl<R: Repository + 'static> Engine<R> {
     #[must_use]
     pub fn with_automatic_review(mut self, enabled: bool) -> Self {
         self.automatic_review = enabled;
+        self
+    }
+    /// Enable contract-first, multi-step verified execution for newly created tasks.
+    #[must_use]
+    pub fn with_verified_workflow(mut self) -> Self {
+        self.verified_workflow = true;
         self
     }
     #[must_use]
@@ -301,7 +312,14 @@ impl<R: Repository + 'static> Engine<R> {
             .await?
             .and_then(|a| a.delegation_limits)
             .unwrap_or_default();
-        let t = Task::root(owner, objective, criteria, limits);
+        let mut t = Task::root(owner, objective, criteria, limits);
+        if self.verified_workflow {
+            t.work = Some(WorkProgress {
+                contract: String::new(),
+                integration: false,
+                turns: 0,
+            });
+        }
         self.repo.save_task(t.clone()).await?;
         self.record(Some(t.id), CanonicalEventKind::TaskCreated)
             .await?;
@@ -356,6 +374,7 @@ impl<R: Repository + 'static> Engine<R> {
             id: TaskId::new(),
             attempt,
             retry_of: Some(previous.id),
+            work: previous.work.clone(),
             parent: previous.parent,
             owner,
             objective: guidance.map_or_else(|| previous.objective.clone(), |guidance| format!("{}\n\nTeam Lead repair instructions for attempt {attempt} (preserve original scope and acceptance):\n{guidance}", previous.objective)),
@@ -552,6 +571,16 @@ impl<R: Repository + 'static> Engine<R> {
             .ready()
             .into_iter()
             .filter(|id| !tasks.iter().any(|task| task.retry_of == Some(*id)))
+            .filter(|id| {
+                tasks.iter().find(|task| task.id == *id).is_none_or(|task| {
+                    task.work.is_none()
+                        || task.parent.is_none_or(|parent| {
+                            tasks
+                                .iter()
+                                .any(|p| p.id == parent && p.status == TaskStatus::Running)
+                        })
+                })
+            })
             .take(max_ready)
         {
             let task = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
@@ -665,7 +694,16 @@ impl<R: Repository + 'static> Engine<R> {
                 agent.max_output_tokens,
             ));
         }
-        let task = self.transition(id, TaskStatus::Running).await?;
+        let mut task = self.transition(id, TaskStatus::Running).await?;
+        if let Some(work) = &mut task.work {
+            if work.turns >= 32 {
+                return Err(EngineError::InvalidDelegationPlan(
+                    "32-turn work budget exhausted; inspect progress before retrying".into(),
+                ));
+            }
+            work.turns += 1;
+            self.repo.save_task(task.clone()).await?;
+        }
         let cancel = CancellationToken::new();
         self.cancellations.lock().await.insert(id, cancel.clone());
         drop(start_guard);
@@ -686,6 +724,7 @@ impl<R: Repository + 'static> Engine<R> {
             && task.limits.max_children > 0
             && agent.tools.iter().any(|tool| tool == "task.delegate");
         let must_patch = mode == RunMode::Work
+            && task.work.is_none()
             && self.team_lead != Some(agent.id)
             && delegation_targets.is_empty()
             && agent.tools.iter().any(|tool| tool == "file.patch");
@@ -724,7 +763,7 @@ impl<R: Repository + 'static> Engine<R> {
         } else {
             owner_prompt
         };
-        let tools = if mode == RunMode::Conversation {
+        let mut tools = if mode == RunMode::Conversation {
             Vec::new()
         } else {
             tool_definitions(
@@ -732,6 +771,20 @@ impl<R: Repository + 'static> Engine<R> {
                 &delegation_target_names,
                 task.limits.max_children,
             )
+        };
+        let owner_prompt = if task.work.is_some() && mode == RunMode::Work {
+            integrated::configure_tools(
+                &mut tools,
+                &delegation_target_names,
+                task.limits.max_children,
+            );
+            format!(
+                "{owner_prompt}\n\n{}\n{}",
+                integrated::WORK_INSTRUCTIONS,
+                self.work_context(&task).await?
+            )
+        } else {
+            owner_prompt
         };
         let tool_choice = if must_patch {
             ToolChoice::Specific(vec!["file.patch".into()])
@@ -945,12 +998,31 @@ impl<R: Repository + 'static> Engine<R> {
         let mut side_effects = 0;
         for event in &response {
             if let ProviderEvent::ToolRequest(call) = event {
-                if !agent.tools.contains(&call.name) {
+                if !(agent.tools.contains(&call.name)
+                    || task.work.is_some() && call.name == "task.complete")
+                {
                     return Err(EngineError::InvalidDelegationPlan(
                         "provider requested an unauthorized tool".into(),
                     ));
                 }
+                if task.work.is_some() && call.name == "task.delegate" {
+                    self.validate_integrated_plan(&task, &agent, &call.arguments_json)
+                        .await?;
+                    side_effects += 1;
+                    continue;
+                }
                 match call.name.as_str() {
+                    "review.request" if task.work.is_some() => {
+                        return Err(EngineError::InvalidDelegationPlan(
+                            "use one contract-first task.delegate plan including integration"
+                                .into(),
+                        ));
+                    }
+                    "task.complete" if task.work.is_some() => {
+                        self.validate_completion(&task, &call.arguments_json)
+                            .await?;
+                        side_effects += 1;
+                    }
                     "task.delegate" => proposals.extend(
                         serde_json::from_str::<DelegationArguments>(&call.arguments_json)?
                             .into_proposals(),
@@ -998,7 +1070,19 @@ impl<R: Repository + 'static> Engine<R> {
                     output_tokens: u.output_tokens,
                 },
                 ProviderEvent::Warning(s) => CanonicalEventKind::ProviderWarning(s),
-                ProviderEvent::ToolRequest(request) => {
+                ProviderEvent::ToolRequest(mut request) => {
+                    if task.work.is_some() && request.name == "task.delegate" {
+                        self.request_approval(
+                            id,
+                            request.id,
+                            "task.plan".into(),
+                            ".".into(),
+                            request.arguments_json,
+                        )
+                        .await?;
+                        waiting_approval = true;
+                        continue;
+                    }
                     let is_delegation =
                         matches!(request.name.as_str(), "task.delegate" | "review.request");
                     if waiting_approval && !is_delegation {
@@ -1082,6 +1166,10 @@ impl<R: Repository + 'static> Engine<R> {
                     )
                     .await?;
                     match request.name.as_str() {
+                        "task.complete" if task.work.is_some() => {
+                            self.validate_completion(&task, &request.arguments_json)
+                                .await?;
+                        }
                         "file.patch" => {
                             let args: PatchArguments =
                                 serde_json::from_str(&request.arguments_json)?;
@@ -1104,6 +1192,12 @@ impl<R: Repository + 'static> Engine<R> {
                                 .as_ref()
                                 .ok_or(EngineError::WorkflowNotConfigured)?
                                 .propose_replacement(id, &args.path, args.replacement)?;
+                            request.arguments_json = serde_json::json!({
+                                "path": proposal.path,
+                                "replacement": proposal.replacement,
+                                "artifact_id": proposal.artifact_id
+                            })
+                            .to_string();
                             self.publish_artifact(proposal.artifact()).await?;
                         }
                         "process.test" => {
@@ -1141,6 +1235,9 @@ impl<R: Repository + 'static> Engine<R> {
             self.record(Some(id), kind).await?;
         }
         if !waiting_approval {
+            if task.work.is_some() && (task.parent.is_some() || self.has_work_actions(id).await?) {
+                return Err(EngineError::InvalidDelegationPlan("work requires task.complete with verification evidence; prose is not completion".into()));
+            }
             if response_text.trim().is_empty() {
                 return Err(EngineError::InvalidDelegationPlan(
                     "provider returned no usable result".into(),
@@ -1277,10 +1374,28 @@ impl<R: Repository + 'static> Engine<R> {
                                     && candidate.decision == ApprovalDecision::Pending
                             });
                     if !has_pending {
-                        self.transition(approval.task_id, TaskStatus::Running)
-                            .await?;
-                        if matches!(approval.action.as_str(), "task.delegate" | "review.request") {
+                        let continuing = parent.work.is_some()
+                            && matches!(approval.action.as_str(), "file.patch" | "process.test");
+                        self.transition(
+                            approval.task_id,
+                            if continuing {
+                                TaskStatus::Ready
+                            } else {
+                                TaskStatus::Running
+                            },
+                        )
+                        .await?;
+                        if continuing {
+                            self.record(Some(parent.id), CanonicalEventKind::ProviderWarning(format!("{} succeeded; continuing work. Acceptance and integration are still pending.", approval.action))).await?;
+                        } else if matches!(
+                            approval.action.as_str(),
+                            "task.delegate" | "review.request" | "task.plan"
+                        ) {
                             self.finalize_parent_tasks().await?;
+                        } else if parent.work.is_some() && approval.action == "task.complete" {
+                            let (summary, evidence) =
+                                self.validate_completion(&parent, &approval.reason).await?;
+                            self.finish_task(parent.id, summary, evidence).await?;
                         } else {
                             let evidence = self
                                 .repo
@@ -1346,6 +1461,16 @@ impl<R: Repository + 'static> Engine<R> {
     }
     async fn dispatch_approved(&self, approval: &Approval) -> Result<(), EngineError> {
         match approval.action.as_str() {
+            "task.plan" => self.dispatch_integrated_plan(approval).await,
+            "task.complete" => {
+                let task = self
+                    .repo
+                    .task(approval.task_id)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?;
+                self.validate_completion(&task, &approval.reason).await?;
+                Ok(())
+            }
             "file.patch" => {
                 let args: PatchArguments = serde_json::from_str(&approval.reason)?;
                 let artifact = self
@@ -1353,7 +1478,14 @@ impl<R: Repository + 'static> Engine<R> {
                     .artifacts()
                     .await?
                     .into_iter()
-                    .find(|a| a.producer == approval.task_id && a.kind == "patch")
+                    .find(|a| {
+                        a.producer == approval.task_id
+                            && a.kind == "patch"
+                            && args.artifact_id.map_or_else(
+                                || a.location == args.path.display().to_string(),
+                                |id| a.id == id,
+                            )
+                    })
                     .ok_or(EngineError::TaskNotFound)?;
                 let proposal = PatchProposal {
                     artifact_id: artifact.id,
@@ -1469,6 +1601,45 @@ impl<R: Repository + 'static> Engine<R> {
         summary: String,
         evidence: Vec<ArtifactId>,
     ) -> Result<Task, EngineError> {
+        let current = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
+        if current.work.is_some() {
+            let tasks = self.repo.tasks().await?;
+            let children = tasks
+                .iter()
+                .filter(|task| task.parent == Some(id))
+                .collect::<Vec<_>>();
+            if !children.is_empty() {
+                if !children
+                    .iter()
+                    .any(|child| child.work.as_ref().is_some_and(|work| work.integration))
+                    || children.iter().any(|child| {
+                        latest_attempt(&tasks, child.id)
+                            .is_none_or(|task| task.status != TaskStatus::Completed)
+                    })
+                {
+                    return Err(EngineError::InvalidDelegationPlan(
+                        "parent requires completed implementations and integration".into(),
+                    ));
+                }
+            } else if current.parent.is_some() || self.has_work_actions(id).await? {
+                let approval = self
+                    .repo
+                    .approvals(self.session)
+                    .await?
+                    .into_iter()
+                    .find(|approval| {
+                        approval.task_id == id
+                            && approval.action == "task.complete"
+                            && approval.decision == ApprovalDecision::ApprovedOnce
+                    })
+                    .ok_or_else(|| {
+                        EngineError::InvalidDelegationPlan(
+                            "work completion requires approved acceptance evidence".into(),
+                        )
+                    })?;
+                self.validate_completion(&current, &approval.reason).await?;
+            }
+        }
         let mut task = self.transition(id, TaskStatus::Completed).await?;
         task.result = Some(TaskResult {
             summary: summary.clone(),
@@ -1792,7 +1963,17 @@ impl<R: Repository + 'static> Engine<R> {
         if max_parallel == 0 {
             return Ok(vec![]);
         }
-        let ready = self.refresh_ready(max_parallel).await?;
+        // Verified workers share a checkout: serialize their model/action turns
+        // until per-file claims or isolated worktrees are enforced.
+        let verified = self
+            .repo
+            .tasks()
+            .await?
+            .iter()
+            .any(|task| task.work.is_some() && !task.status.is_terminal());
+        let ready = self
+            .refresh_ready(if verified { 1 } else { max_parallel })
+            .await?;
         let ids = ready.iter().map(|t| t.id).collect::<Vec<_>>();
         let mut set = tokio::task::JoinSet::new();
         for task in ready {
@@ -2020,15 +2201,22 @@ fn latest_attempt(tasks: &[Task], id: TaskId) -> Option<&Task> {
 }
 
 fn command_spec(command: &str, cwd: &Path) -> Result<CommandSpec, EngineError> {
-    let args = match command {
-        "cargo test" => vec!["test".into()],
-        "cargo check" => vec!["check".into()],
-        "cargo clippy" => vec!["clippy".into()],
-        "cargo fmt --check" => vec!["fmt".into(), "--check".into()],
+    let (program, args) = match command {
+        "cargo test" => ("cargo", vec!["test".into()]),
+        "cargo check" => ("cargo", vec!["check".into()]),
+        "cargo clippy" => ("cargo", vec!["clippy".into()]),
+        "cargo fmt --check" => ("cargo", vec!["fmt".into(), "--check".into()]),
+        "python3 -m unittest discover" => (
+            "python3",
+            vec!["-m".into(), "unittest".into(), "discover".into()],
+        ),
+        "node --test" => ("node", vec!["--test".into()]),
+        "npm test" => ("npm", vec!["test".into()]),
+        "npm run build" => ("npm", vec!["run".into(), "build".into()]),
         _ => return Err(ExecutorError::Denied.into()),
     };
     Ok(CommandSpec {
-        program: "cargo".into(),
+        program: program.into(),
         args,
         cwd: cwd.into(),
         timeout_seconds: 300,
@@ -2073,7 +2261,7 @@ fn tool_definitions(
 ) -> Vec<ToolDefinition> {
     names.iter().filter_map(|name| match name.as_str() {
         "file.patch" => Some(ToolDefinition { name: name.clone(), description: "Propose creating or replacing one workspace text file; user approval and base-digest validation are mandatory.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
-        "process.test" => Some(ToolDefinition { name: name.clone(), description: "Propose a scoped Cargo verification command; user approval is mandatory.".into(), input_schema: r#"{"type":"object","properties":{"command":{"type":"string","enum":["cargo test","cargo check","cargo clippy","cargo fmt --check"]}},"required":["command"]}"#.into() }),
+        "process.test" => Some(ToolDefinition { name: name.clone(), description: "Propose one allowlisted verification command at the workspace root; per-action approval is mandatory. Dependencies must already be installed. No shell or package installation.".into(), input_schema: r#"{"type":"object","properties":{"command":{"type":"string","enum":["cargo test","cargo check","cargo clippy","cargo fmt --check","python3 -m unittest discover","node --test","npm test","npm run build"]}},"required":["command"]}"#.into() }),
         "task.delegate" if !allowed_targets.is_empty() && max_delegations > 0 => Some(delegation_plan_tool(name, allowed_targets, max_delegations)),
         "review.request" if !allowed_targets.is_empty() => Some(delegation_tool(name, "Request review by delegating a bounded evidence review task.", allowed_targets)),
         _ => None,

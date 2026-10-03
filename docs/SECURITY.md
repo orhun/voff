@@ -43,6 +43,13 @@ Permanent rules require direct config editing; a transient dialog must not creat
 
 ## 4. Command classification
 
+ADR 0035 adds exact Python unittest, Node test and npm test/build invocations
+alongside Cargo verification. Every invocation consumes an exact one-time
+reviewed grant, uses no shell, and runs at the workspace root. Package installs
+and arbitrary arguments remain denied. These commands run repository-controlled
+code (including npm scripts); as with Cargo build scripts/tests, they are not
+OS/network-sandboxed. Use manual review for untrusted repositories.
+
 Before shell execution, show and evaluate:
 
 - Executable and arguments

@@ -386,6 +386,27 @@ per-token database overhead without simulating streaming.
 
 ## 8. Formation examples
 
+New TUI tasks use contract-first verified work (ADR 0035). Implementation plans
+include a shared interface contract and a separate integration task, which waits
+for all implementation results. Every assigned role needs `process.test` for
+verification; choose an integration owner capable of correcting the combined
+application. Allow room for integration in `max_children`.
+
+An approved patch now means progress, not completion. The owner continues with
+additional files/checks and submits criterion-by-criterion evidence for final
+acceptance. The Summary displays the shared contract, integration stage and
+turn budget. Verified work is currently serialized in the shared checkout and
+bounded to 32 turns across retries. Existing stored tasks retain their original
+semantics; submit a new objective to use this workflow. There is no config-file
+migration or automatic rewrite of old completed work.
+
+`process.test` accepts exact Cargo verification commands plus `python3 -m unittest
+discover`, `node --test`, `npm test`, and `npm run build`, all at the workspace
+root. A successful test suite after the last workspace patch is required for
+completion; build/check alone do not qualify. Dependencies must already be
+installed. Package installation and arbitrary shell commands remain unavailable.
+These runners execute project code and are not an OS/network sandbox.
+
 - `solo`: one agent, delegation disabled.
 - `lead-specialists`: lead proposes tasks for specialist agents.
 - `review-gated`: implementer results require a separate reviewer.

@@ -40,6 +40,27 @@ The engine generates trusted IDs and timestamps when accepting provider output. 
 
 ## 4. Delegation plan
 
+New TUI work uses ADR 0035's contract-first extension:
+
+```json
+{
+  "shared_contract": "Exact API routes, payloads, auth, ports, file ownership and end-to-end checks",
+  "proposals": [
+    {"target_agent":"Backend Developer","objective":"Implement the server against the shared contract","acceptance_criteria":["Server contract checks pass"]},
+    {"target_agent":"Frontend Developer","objective":"Implement the client against the shared contract","acceptance_criteria":["Client checks pass"]}
+  ],
+  "integration": {"target_agent":"Frontend Developer","objective":"Connect and verify both components","acceptance_criteria":["End-to-end flows pass against the real backend"]}
+}
+```
+
+Integration is a separate persisted child dependent on both implementations.
+Approved patches/tests continue work instead of completing it. `task.complete`
+requires a summary and `evidence` entries with zero-based `criterion`, persisted
+`art_`-prefixed `artifact_ids`, and an `explanation`. A successful test after the
+last workspace patch and final acceptance approval are required. Contract and
+turn state survive restart. The legacy protocol below remains for stored tasks
+and engine callers which have not enabled verified work.
+
 The coordinating agent submits the complete bounded plan in one structured
 `task.delegate` call. Each item remains a separate persisted task and a
 separate approval action:

@@ -714,7 +714,7 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
                         CanonicalEventKind::TaskCancelled | CanonicalEventKind::RevisionStopped(_)
                     )
             });
-        let retry_queued = task.retry_of.is_some()
+        let retry_queued = (task.retry_of.is_some() || task.work.is_some())
             && matches!(task.status, TaskStatus::Queued | TaskStatus::Ready);
         if revision_waiting || retry_queued {
             let mut current = Some(task);

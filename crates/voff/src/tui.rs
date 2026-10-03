@@ -1694,6 +1694,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
             .with_formation_agents(&agent_profiles)
             .with_team_lead(config.team_lead)
             .with_automatic_review(config.automatic_review)
+            .with_verified_workflow()
             .with_runtime(config.model_name, config.system_prompt)
             .with_workspace_context(config.workspace_context)
             .with_safe_workflow(&config.workspace_root)
@@ -2648,6 +2649,26 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             format!(" re-run of {previous}"),
             Style::default().fg(Color::LightCyan),
         )));
+    }
+    if let Some(work) = &task.work {
+        push_section(
+            &mut lines,
+            if work.integration {
+                "INTEGRATION · waits for implementations"
+            } else {
+                "VERIFIED WORK · patch → test → acceptance"
+            },
+            Color::LightCyan,
+        );
+        lines.push(Line::from(format!(" Turn {}/32", work.turns)));
+        if !work.contract.is_empty() {
+            push_section(&mut lines, "SHARED CONTRACT", Color::LightCyan);
+            push_text_lines(
+                &mut lines,
+                &compact_text(&sanitize(&work.contract), app.expanded_output, false),
+                "  ",
+            );
+        }
     }
     lines.push(Line::from(""));
     if let Some(output) = app

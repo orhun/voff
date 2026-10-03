@@ -155,6 +155,17 @@ impl TaskStatus {
         self.is_terminal() || matches!(self, Self::Blocked)
     }
 }
+/// Durable contract and turn budget for evidence-gated implementation work.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkProgress {
+    /// Shared interface contract supplied to every implementation and integrator.
+    pub contract: String,
+    /// Integration work must wait for its implementation prerequisites.
+    pub integration: bool,
+    /// Persisted model-turn count, bounded across restarts.
+    pub turns: u16,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -164,6 +175,9 @@ pub struct Task {
     /// The immediately preceding attempt when this task was explicitly re-run.
     #[serde(default)]
     pub retry_of: Option<TaskId>,
+    /// Verified multi-step workflow. Absent on historical single-turn tasks.
+    #[serde(default)]
+    pub work: Option<WorkProgress>,
     pub parent: Option<TaskId>,
     pub owner: AgentId,
     pub objective: String,
@@ -188,6 +202,7 @@ impl Task {
             id: TaskId::new(),
             attempt: first_task_attempt(),
             retry_of: None,
+            work: None,
             parent: None,
             owner,
             objective: objective.into(),
@@ -412,6 +427,11 @@ impl TaskGraph {
             id: TaskId::new(),
             attempt: first_task_attempt(),
             retry_of: None,
+            work: p.work.as_ref().map(|work| WorkProgress {
+                contract: work.contract.clone(),
+                integration: false,
+                turns: 0,
+            }),
             parent: Some(parent),
             owner,
             objective: objective.into(),
