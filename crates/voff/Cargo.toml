@@ -30,6 +30,8 @@ thiserror.workspace = true
 ansi-to-tui = "=8.0.1"
 ratatui-notifications = "0.1.0"
 llm-kernel = { version = "0.31.6", default-features = false, features = ["provider"] }
+textwrap = { version = "0.16.4", default-features = false, features = ["unicode-width"] }
+unicode-width = "0.2.2"
 [lints]
 workspace = true
 [dev-dependencies]

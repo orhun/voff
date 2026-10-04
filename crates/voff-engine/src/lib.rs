@@ -119,6 +119,11 @@ struct PatchArguments {
 struct TestArguments {
     command: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockedReport {
+    reason: String,
+}
 /// One explicit, approval-gated child task in an application-supplied plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DelegationProposal {
@@ -979,7 +984,8 @@ impl<R: Repository + 'static> Engine<R> {
         for event in &response {
             if let ProviderEvent::ToolRequest(call) = event {
                 if !(agent.tools.contains(&call.name)
-                    || task.work.is_some() && call.name == "task.complete")
+                    || task.work.is_some()
+                        && matches!(call.name.as_str(), "task.complete" | "task.blocked"))
                 {
                     return Err(EngineError::InvalidDelegationPlan(
                         "provider requested an unauthorized tool".into(),
@@ -1001,6 +1007,15 @@ impl<R: Repository + 'static> Engine<R> {
                     "task.complete" if task.work.is_some() => {
                         self.validate_completion(&task, &call.arguments_json)
                             .await?;
+                        side_effects += 1;
+                    }
+                    "task.blocked" if task.work.is_some() => {
+                        let report: BlockedReport = serde_json::from_str(&call.arguments_json)?;
+                        if report.reason.trim().is_empty() {
+                            return Err(EngineError::InvalidDelegationPlan(
+                                "task.blocked requires a concrete reason".into(),
+                            ));
+                        }
                         side_effects += 1;
                     }
                     "task.delegate" => proposals.extend(
@@ -1050,6 +1065,39 @@ impl<R: Repository + 'static> Engine<R> {
                 },
                 ProviderEvent::Warning(s) => CanonicalEventKind::ProviderWarning(s),
                 ProviderEvent::ToolRequest(mut request) => {
+                    if task.work.is_some() && request.name == "task.blocked" {
+                        let report: BlockedReport = serde_json::from_str(&request.arguments_json)?;
+                        let reason = report.reason.trim();
+                        if reason.is_empty() {
+                            return Err(EngineError::InvalidDelegationPlan(
+                                "task.blocked requires a concrete reason".into(),
+                            ));
+                        }
+                        self.record(
+                            Some(id),
+                            CanonicalEventKind::ProviderFailed(format!(
+                                "worker blocked: {}",
+                                reason.chars().take(2_000).collect::<String>()
+                            )),
+                        )
+                        .await?;
+                        if self.automatic_review {
+                            self.record(
+                                Some(id),
+                                CanonicalEventKind::WorkRecoveryRequested {
+                                    reason: format!(
+                                        "worker reported an in-scope blocker: {}",
+                                        reason.chars().take(2_000).collect::<String>()
+                                    ),
+                                    retry_allowed: false,
+                                },
+                            )
+                            .await?;
+                        }
+                        self.transition(id, TaskStatus::Blocked).await?;
+                        waiting_approval = true;
+                        continue;
+                    }
                     if task.work.is_some() && request.name == "task.delegate" {
                         self.request_approval(
                             id,
@@ -3279,6 +3327,49 @@ mod tests {
             repo.task(parent.id).await.unwrap().unwrap().status,
             TaskStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn verified_worker_reports_a_blocker_without_fake_completion_or_approval() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let session = SessionId::new();
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "task.blocked".into(),
+                arguments_json: r#"{"reason":"No in-scope discoverable tests exist"}"#.into(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_verified_workflow()
+            .with_automatic_review(true);
+        let mut task = engine
+            .create_task(AgentId::new(), "implement backend", vec!["verified".into()])
+            .await
+            .unwrap();
+        task.work = Some(WorkProgress {
+            contract: "API contract".into(),
+            integration: false,
+            turns: 0,
+        });
+        repo.save_task(task.clone()).await.unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+        engine.run_task(task.id).await.unwrap();
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
+        assert!(repo.approvals(session).await.unwrap().is_empty());
+        assert!(repo.events(session).await.unwrap().iter().any(|event| {
+            matches!(&event.kind, CanonicalEventKind::ProviderFailed(message)
+                if message.contains("No in-scope discoverable tests exist"))
+        }));
+        assert!(repo.events(session).await.unwrap().iter().any(|event| {
+            matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason, retry_allowed: false }
+                if reason.contains("No in-scope discoverable tests exist"))
+        }));
     }
 
     #[tokio::test]

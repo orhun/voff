@@ -1640,7 +1640,6 @@ fn render_setup(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, shell: Rect) {
                 Step::Basics => " [c] Continue · Esc cancel ",
                 Step::Prompt(_) => " Ctrl+S save prompt · Esc discard ",
                 Step::WorkspacePicker => "",
-                _ if wizard.mode != WizardMode::Startup => " Enter save · Esc cancel ",
                 _ => "",
             }))
             .borders(Borders::ALL)
@@ -1998,7 +1997,7 @@ fn footer_text(wizard: &Wizard) -> String {
             }
         }
         Step::Developer(_) if wizard.mode != WizardMode::Startup => {
-            "Tab/↑↓ fields · ←→ choices · type to edit · [e] prompt · Enter save".into()
+            "Tab/↑↓ move · ←→ choose · e prompt · Enter save · Esc cancel".into()
         }
         Step::Developer(_) => "Press Enter to voff".into(),
         Step::Prompt(_) => "Edit freely · Enter new line · Ctrl+S save · Esc discard".into(),

@@ -165,7 +165,6 @@ pub struct AppModel {
     composer: TextArea<'static>,
     composer_drafts: HashMap<TabId, TextArea<'static>>,
     composer_active: bool,
-    composer_notice: Option<String>,
     composer_hitbox: Rect,
     retry_starting: bool,
     pending_submissions: usize,
@@ -243,7 +242,6 @@ impl AppModel {
             composer,
             composer_drafts: HashMap::new(),
             composer_active: false,
-            composer_notice: None,
             composer_hitbox: Rect::default(),
             retry_starting: false,
             pending_submissions: 0,
@@ -281,6 +279,9 @@ impl AppModel {
         }
         let current = self.active_tab();
         if current != tab {
+            self.notifications.clear();
+            self.transient_notification_ids.clear();
+            self.team_hint_id = None;
             let next = self
                 .composer_drafts
                 .remove(&tab)
@@ -452,7 +453,6 @@ impl AppModel {
             Action::ToggleHelp => self.help = !self.help,
             Action::FocusComposer => {
                 self.composer_active = true;
-                self.composer_notice = None;
             }
             Action::AddCredential => {
                 if self
@@ -529,7 +529,6 @@ impl AppModel {
                 .contains((mouse.column, mouse.row).into())
         {
             self.composer_active = true;
-            self.composer_notice = None;
             return;
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -864,12 +863,10 @@ impl AppModel {
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
                     self.composer.insert_newline();
-                    self.composer_notice = None;
                     ComposerEvent::Consumed
                 }
                 KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.composer.insert_newline();
-                    self.composer_notice = None;
                     ComposerEvent::Consumed
                 }
                 KeyCode::Enter => {
@@ -896,7 +893,6 @@ impl AppModel {
                 }
                 _ => {
                     self.composer.input(*key);
-                    self.composer_notice = None;
                     ComposerEvent::Consumed
                 }
             },
@@ -1070,13 +1066,20 @@ impl AppModel {
                                 .iter()
                                 .find(|agent| agent.id == *lead)
                                 .map_or("Reporting agent", |agent| agent.name.as_str());
+                            let reviewer = truncate_text(&one_line(&sanitize(reviewer)), 24);
                             let review = format!(
                                 "{reviewer} {}: {}",
                                 if *approved { "approved" } else { "rejected" },
                                 sanitize(reason)
                             );
                             if *approved {
-                                self.composer_notice = Some(review);
+                                let _ = self.notify(
+                                    &format!("{reviewer} approved"),
+                                    &truncate_text(&one_line(&sanitize(reason)), 100),
+                                    Level::Info,
+                                    theme::GREEN,
+                                    false,
+                                );
                             } else {
                                 self.warn(&review);
                             }
@@ -1092,9 +1095,14 @@ impl AppModel {
                                     self.agents.iter().find(|agent| agent.id == parent.owner)
                                 })
                                 .map_or("Team Lead", |agent| agent.name.as_str());
-                            self.composer_notice = Some(format!(
-                                "{reviewer} returned feedback → agent revising → fresh review."
-                            ));
+                            let reviewer = truncate_text(&one_line(&sanitize(reviewer)), 24);
+                            let _ = self.notify(
+                                "Revision requested",
+                                &format!("{reviewer} returned feedback; agent revising"),
+                                Level::Info,
+                                theme::AQUA,
+                                false,
+                            );
                         }
                         CanonicalEventKind::RevisionStopped(reason) => {
                             self.warn(&format!("Revision stopped: {}", sanitize(reason)));
@@ -1193,7 +1201,6 @@ impl AppModel {
     }
 
     fn warn(&mut self, message: &str) {
-        self.composer_notice = None;
         let _ = self.notify(
             "Action unavailable",
             message,
@@ -2071,15 +2078,25 @@ async fn terminal_loop<R: Repository + 'static>(
                                 if model.role_requests.len() > 100 {
                                     model.role_requests.remove(0);
                                 }
-                                model.composer_notice = Some(format!(
-                                    "Team Lead asked to delegate to {name}."
-                                ));
+                                let _ = model.notify(
+                                    "Task sent to Team Lead",
+                                    &format!("Requested {}", truncate_text(&one_line(&sanitize(name)), 28)),
+                                    Level::Info,
+                                    theme::AQUA,
+                                    false,
+                                );
                                 model.push_ui_event(format!(
                                     "you → Team Lead (requested {name}): {}",
                                     sanitize(&objective)
                                 ));
                             } else {
-                                model.composer_notice = Some("Task sent to Team Lead.".into());
+                                let _ = model.notify(
+                                    "Task sent to Team Lead",
+                                    "Waiting for the task to start",
+                                    Level::Info,
+                                    theme::AQUA,
+                                    false,
+                                );
                                 model.push_ui_event(format!(
                                     "you → Team Lead task: {}",
                                     sanitize(&objective)
@@ -2127,10 +2144,16 @@ async fn terminal_loop<R: Repository + 'static>(
                                     } else if let Some(task) = model.selected_task().cloned() {
                                         if task.status.can_retry() {
                                             model.retry_starting = true;
-                                            model.composer_notice = Some(format!(
-                                                "Preparing attempt {} for the selected task.",
-                                                task.attempt.saturating_add(1)
-                                            ));
+                                            let _ = model.notify(
+                                                "Preparing retry",
+                                                &format!(
+                                                    "Attempt {} for the selected task",
+                                                    task.attempt.saturating_add(1)
+                                                ),
+                                                Level::Info,
+                                                theme::AQUA,
+                                                false,
+                                            );
                                             let engine = Arc::clone(&engine);
                                             let retry_tx = retry_tx.clone();
                                             tokio::spawn(async move {
@@ -2231,7 +2254,15 @@ async fn terminal_loop<R: Repository + 'static>(
             Some(result)=lead_submission_rx.recv()=>{
                 model.pending_submissions = model.pending_submissions.saturating_sub(1);
                 match result {
-                    Ok(notice) => model.composer_notice = Some(notice.into()),
+                    Ok(notice) => {
+                        let _ = model.notify(
+                            "Task accepted",
+                            notice,
+                            Level::Info,
+                            theme::GREEN,
+                            false,
+                        );
+                    }
                     Err(error) => {
                         let error = sanitize(&error);
                         model.warn(&format!("Team Lead request failed: {error}"));
@@ -2243,10 +2274,13 @@ async fn terminal_loop<R: Repository + 'static>(
                 model.retry_starting = false;
                 match result {
                     Ok((task_id, attempt)) => {
-                        model.composer_notice = Some(format!(
-                            "Re-running attempt {attempt} as {}.",
-                            short_task_id(task_id)
-                        ));
+                        let _ = model.notify(
+                            "Task re-running",
+                            &format!("Attempt {attempt} · {}", short_task_id(task_id)),
+                            Level::Info,
+                            theme::AQUA,
+                            false,
+                        );
                     }
                     Err(error) => {
                         let error = sanitize(&error);
@@ -2361,13 +2395,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
             Alignment::Left,
         ))
     } else {
-        app.composer_notice.as_deref().map(|notice| {
-            (
-                Line::from(format!(" {} ", sanitize(notice)))
-                    .style(Style::default().fg(theme::TEXT)),
-                Alignment::Left,
-            )
-        })
+        None
     };
     let composer_color = if app.composer_active {
         theme::AQUA
@@ -2395,7 +2423,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
             Rect::new(composer_inner.x, composer_inner.y, 2, 1),
         );
     }
-    let input_offset = 2;
+    // TextArea adds a cell before its placeholder, but not before typed text.
+    // Keep the first typed character aligned with the placeholder after the dog.
+    let input_offset = if !app.composer_active && app.composer.lines().iter().all(String::is_empty)
+    {
+        2
+    } else {
+        3
+    };
     let input_area = Rect::new(
         composer_inner.x.saturating_add(input_offset),
         composer_inner.y,
@@ -2485,13 +2520,8 @@ fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect
         spans.push(Span::raw(" "));
         x = x.saturating_add(1);
     }
-    let mut roles = app.role_tabs.clone();
-    if let Some(selected) = app.active_role_tab {
-        roles.retain(|id| *id != selected);
-        roles.insert(0, selected);
-    }
     let mut hidden = 0;
-    for id in roles {
+    for &id in &app.role_tabs {
         let Some(agent) = app.agents.iter().find(|agent| agent.id == id) else {
             continue;
         };
@@ -3944,7 +3974,12 @@ mod tests {
         let edge = &app.team_flow.edges()[0];
         assert_eq!(edge.source, worker.id.to_string());
         assert_eq!(edge.target, lead.id.to_string());
-        assert!(!edge.animated);
+        assert!(edge.animated);
+        assert!(
+            edge.label
+                .as_deref()
+                .is_some_and(|label| label.contains("Review"))
+        );
         assert_eq!(
             app.team_flow.connection_positions(0),
             Some((
@@ -4287,6 +4322,43 @@ mod tests {
 
         app.apply_event(EngineEvent::TaskUpdated(task));
         assert!(!app.notifications.has_notification());
+    }
+
+    #[test]
+    fn lead_approval_uses_a_notification_not_the_composer_border() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Team Lead", "team_lead", vec!["Backend Agent".into()]);
+        let worker = agent("Backend Agent", "backend_agent", vec![]);
+        let task = Task::root(worker.id, "Run tests", vec![], Default::default());
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead.clone(), worker];
+        app.tasks.push(task.clone());
+        app.apply_event(EngineEvent::Canonical(CanonicalEvent {
+            id: voff_core::EventId::new(),
+            session_id: app.session,
+            task_id: Some(task.id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::LeadReviewFinished {
+                lead: lead.id,
+                approval_id: None,
+                approved: true,
+                reason: "Scoped unittest discovery is approved".into(),
+            },
+        }));
+        assert!(app.notifications.has_notification());
+        app.notifications.tick(Duration::from_millis(500));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Team Lead approved"), "{rendered}");
+        assert!(rendered.contains("Scoped unittest discovery"), "{rendered}");
+        let border = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
+            .collect::<String>();
+        assert!(!border.contains("approved"), "{border}");
     }
 
     #[test]
@@ -4755,7 +4827,6 @@ mod tests {
         app.reduce(Action::DeleteAgent);
         assert!(app.pending_delete.is_none(), "the lead cannot be deleted");
         assert!(app.notifications.has_notification());
-        assert!(app.composer_notice.is_none());
         app.notifications.tick(Duration::from_millis(500));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -4833,7 +4904,6 @@ mod tests {
         app.reduce(Action::DeleteAgent);
         assert!(app.pending_delete.is_none());
         assert!(app.notifications.has_notification());
-        assert!(app.composer_notice.is_none());
 
         app.team_setup.as_mut().unwrap().developers.pop();
         app.tasks.push(Task::root(
@@ -4845,7 +4915,6 @@ mod tests {
         app.reduce(Action::DeleteAgent);
         assert!(app.pending_delete.is_none());
         assert!(app.notifications.has_notification());
-        assert!(app.composer_notice.is_none());
     }
 
     #[test]
@@ -5024,6 +5093,46 @@ mod tests {
     }
 
     #[test]
+    fn cycling_tabs_preserves_rendered_order_and_click_targets() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("pashaaaaa", "technical_lead", vec![]);
+        let frontend = agent("Frontend Agent", "frontend_developer", vec![]);
+        let order = [
+            TabId::Team,
+            TabId::Tasks,
+            TabId::Role(lead.id),
+            TabId::Role(frontend.id),
+        ];
+        app.agents = vec![lead, frontend];
+        app.open_role_tab(app.agents[0].id);
+        app.open_role_tab(app.agents[1].id);
+        app.select_tab(order[2]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let positions = app
+            .tab_hitboxes
+            .iter()
+            .map(|tab| (tab.id, tab.area))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            order
+        );
+        for expected in [order[3], order[0], order[1], order[2]] {
+            app.reduce(Action::NextPanel);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.active_tab(), expected);
+            assert_eq!(
+                app.tab_hitboxes
+                    .iter()
+                    .map(|tab| (tab.id, tab.area))
+                    .collect::<Vec<_>>(),
+                positions
+            );
+        }
+    }
+
+    #[test]
     fn switching_tabs_preserves_each_unsent_prompt_draft() {
         let mut app = AppModel::new(SessionId::new());
         let specialist = agent("Linus", "backend_developer", vec![]);
@@ -5085,7 +5194,6 @@ mod tests {
         app.reduce(Action::AdjustTeam);
         assert!(app.setup_editor.is_none());
         assert!(app.notifications.has_notification());
-        assert!(app.composer_notice.is_none());
     }
 
     #[test]
@@ -5095,7 +5203,6 @@ mod tests {
         assert!(!has_unsettled_tasks(&app.tasks));
         app.reduce(Action::AdjustTeam);
         assert!(app.setup_editor.is_some());
-        assert!(app.composer_notice.is_none());
     }
 
     #[test]
@@ -5350,7 +5457,6 @@ mod tests {
         );
 
         assert_eq!(app.panel, Panel::Agents);
-        assert!(app.composer_notice.is_none());
     }
 
     #[test]
@@ -5669,6 +5775,13 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let input_row = app.composer_hitbox.y.saturating_add(1);
+        let hint_start = (0..buffer.area.width)
+            .find(|&column| buffer[(column, input_row)].symbol() == "A")
+            .expect("placeholder begins with Ask");
+
         app.reduce(Action::FocusComposer);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -5691,10 +5804,7 @@ mod tests {
         assert!(!composer.contains("Ctrl+Z/Y undo/redo"), "{composer}");
         assert!(!composer.contains("/task"), "{composer}");
         assert!(!composer.contains("/tasks"), "{composer}");
-        let cursor = (
-            app.composer_hitbox.x.saturating_add(3),
-            app.composer_hitbox.y.saturating_add(1),
-        );
+        let cursor = (hint_start, input_row);
         assert_eq!(buffer[cursor].bg, theme::AQUA);
         assert_eq!(buffer[cursor].fg, theme::BACKGROUND);
 
@@ -5704,7 +5814,8 @@ mod tests {
         let composer = (buffer.area.height.saturating_sub(3)..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(composer.contains("🐶 Build a test app"), "{composer}");
+        assert_eq!(buffer[cursor].symbol(), "B");
+        assert!(composer.contains("🐶  Build a test app"), "{composer}");
     }
 
     #[test]
@@ -5787,12 +5898,9 @@ mod tests {
             !((edge.source == backend_id && edge.target == frontend_id)
                 || (edge.source == frontend_id && edge.target == backend_id))
         }));
-        assert!(
-            app.team_flow
-                .edges()
-                .iter()
-                .all(|edge| edge.label.is_none())
-        );
+        assert!(app.team_flow.edges().iter().all(|edge| {
+            edge.animated && edge.label.as_deref().is_some_and(|label| label.len() > 2)
+        }));
     }
 
     #[test]
@@ -5957,13 +6065,13 @@ mod tests {
                 .iter()
                 .any(|frame| rendered.contains(*frame))
         );
-        assert!(app.team_flow.edges().iter().all(|edge| !edge.animated));
-        assert!(
-            app.team_flow
-                .edges()
-                .iter()
-                .all(|edge| edge.label.is_none())
-        );
+        assert!(app.team_flow.edges().iter().any(|edge| {
+            edge.animated
+                && edge
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.contains("Implement calculator"))
+        }));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Contract-first plans and evidence-gated multi-step work.
 use super::*;
 
-pub(super) const WORK_INSTRUCTIONS: &str = "For implementation, if you have direct reports, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified direct report. Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. Integration waits for all implementations. Do not delegate simple questions. Workers: produce actual project files, not a script that generates an unexecuted application. You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. Completion requires a successful test suite after the last workspace patch, plus reporting-agent acceptance review. Tests run at the workspace root: provide a root test harness that exercises the relevant components together. Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. Report a blocker if dependencies or required checks are unavailable. Never claim generated tests were executed. The task has at most 32 turns across retries.";
+pub(super) const WORK_INSTRUCTIONS: &str = "For implementation, if you have direct reports, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified direct report. Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. Integration waits for all implementations. Do not delegate simple questions. Plan a runnable, in-scope verification file for each implementation worker before dispatch; do not rely on a future integration task for a worker's checks. For Python unittest discovery, a worker must own a root test_*.py file: tests inside server.py are not discovered. Keep file ownership disjoint. Workers: produce actual project files, not a script that generates an unexecuted application. You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. Completion requires a successful test suite after the last workspace patch, plus reporting-agent acceptance review. Tests run at the workspace root: provide a root test harness that exercises the relevant components together. Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. If a missing test file, denied repair, or unavailable check makes the task impossible within its existing scope, call task.blocked with a concrete reason; do not return only prose or claim completion. Never claim generated tests were executed. The task has at most 32 turns across retries.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +15,16 @@ struct Plan {
 mod tests {
     use super::*;
     use voff_storage::InMemoryRepository;
+
+    #[test]
+    fn plan_requires_worker_owned_discoverable_checks_and_an_explicit_blocker_path() {
+        assert!(WORK_INSTRUCTIONS.contains("root test_*.py"));
+        assert!(WORK_INSTRUCTIONS.contains("before dispatch"));
+        assert!(WORK_INSTRUCTIONS.contains("task.blocked"));
+        let mut tools = Vec::new();
+        configure_tools(&mut tools, &[], 0);
+        assert!(tools.iter().any(|tool| tool.name == "task.blocked"));
+    }
 
     async fn fixture() -> (
         Engine<InMemoryRepository>,
@@ -322,6 +332,13 @@ pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String
                 "artifact_ids":{"type":"array","items":{"type":"string"},"minItems":1},
                 "explanation":{"type":"string"}},"required":["criterion","artifact_ids","explanation"],"additionalProperties":false
             }}},"required":["summary","evidence"],"additionalProperties":false}).to_string(),
+    });
+    tools.push(ToolDefinition {
+        name: "task.blocked".into(),
+        description: "Report a concrete blocker when required work or verification cannot be completed within the current scope. This does not complete the task or widen permissions.".into(),
+        input_schema: serde_json::json!({"type":"object","properties":{
+            "reason":{"type":"string","minLength":1}
+        },"required":["reason"],"additionalProperties":false}).to_string(),
     });
 }
 

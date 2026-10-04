@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
 use std::collections::HashMap;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use voff_core::{AgentId, AgentProfile, Approval, ApprovalDecision, Task, TaskId, TaskStatus};
 use voff_engine::DelegationProposal;
 
@@ -35,7 +36,7 @@ struct AgentCard {
 impl AgentCard {
     fn desired_width(&self, zoom: f64) -> u16 {
         let content_width = self
-            .lines(0)
+            .lines(0, u16::MAX)
             .iter()
             .map(Line::width)
             .max()
@@ -48,7 +49,7 @@ impl AgentCard {
             .max(3)
     }
 
-    fn lines(&self, phase: usize) -> Vec<Line<'_>> {
+    fn lines(&self, phase: usize, inner_width: u16) -> Vec<Line<'_>> {
         let status_symbol = if self.status == "working" {
             WORKING_FRAMES[phase % WORKING_FRAMES.len()]
         } else {
@@ -90,10 +91,19 @@ impl AgentCard {
         if self.display_level >= 2
             && let Some(response) = &self.response
         {
-            lines.push(Line::from(vec![
-                Span::styled("↳ ", Style::default().fg(theme::ORANGE)),
-                Span::styled(response.as_str(), Style::default().fg(theme::TEXT)),
-            ]));
+            let width = usize::from(inner_width.saturating_sub(2).max(1));
+            let wrapped = textwrap::wrap(response, width);
+            let keep = if self.status == "working" { 3 } else { 1 };
+            let first = wrapped.len().saturating_sub(keep);
+            for (index, line) in wrapped.into_iter().skip(first).enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { "↳ " } else { "  " },
+                        Style::default().fg(theme::ORANGE),
+                    ),
+                    Span::styled(line.into_owned(), Style::default().fg(theme::TEXT)),
+                ]));
+            }
         }
         if self.display_level >= 2 {
             lines.push(Line::from(Span::styled(
@@ -114,7 +124,7 @@ impl AgentCard {
 
     fn desired_height(&self, width: u16) -> u16 {
         let inner = width.saturating_sub(2).max(1);
-        let lines = self.lines(0);
+        let lines = self.lines(0, inner);
         if lines.iter().all(|line| line.width() <= usize::from(inner)) {
             return u16::try_from(lines.len().saturating_add(2)).unwrap_or(u16::MAX);
         }
@@ -153,7 +163,7 @@ impl NodeContent for AgentCard {
         } else {
             Style::default().fg(theme::BORDER)
         };
-        let lines = self.lines(ctx.animation_phase);
+        let lines = self.lines(ctx.animation_phase, ctx.area.width.saturating_sub(2));
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: true })
             .block(
@@ -568,10 +578,10 @@ fn agent_card(
         format!(
             "{} {}",
             task_status_marker(task.status),
-            truncate_label(&sanitize(&task.objective), 24)
+            truncate_label(&sanitize(&task.objective), 32)
         )
     } else if let Some(proposal) = pending {
-        format!("? {}", truncate_label(&sanitize(&proposal.objective), 24))
+        format!("? {}", truncate_label(&sanitize(&proposal.objective), 32))
     } else if !agent.enabled {
         "Unavailable · no new assignments".into()
     } else {
@@ -593,12 +603,16 @@ fn agent_card(
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            truncate_label(&excerpt, 30)
+            if status == "working" {
+                excerpt
+            } else {
+                truncate_label(&excerpt, 34)
+            }
         });
     let name = sanitize(&agent.name);
     let identity = format!("{} {name}", role_icon(&agent.role));
     AgentCard {
-        max_width: 28.0,
+        max_width: 36.0,
         identity,
         provider: match provider_kind {
             "codex_cli" => "Codex · CLI",
@@ -651,6 +665,14 @@ fn build_edges(
                         .and_then(|parent| tasks.iter().find(|candidate| candidate.id == parent))
                         .is_some_and(|parent| parent.owner == source.id)
             });
+            let active = returning
+                || pending.is_some()
+                || task.is_some_and(|task| {
+                    matches!(
+                        task.status,
+                        TaskStatus::Ready | TaskStatus::Running | TaskStatus::WaitingApproval
+                    )
+                });
             let style = edge_presentation(
                 task,
                 pending.as_ref(),
@@ -658,12 +680,33 @@ fn build_edges(
                 highlighted_agent.is_some_and(|id| id == source.id || id == target.id),
                 returning,
             );
-            let edge = routing_edge(
+            let mut edge = routing_edge(
                 format!("handoff:{}:{}", source.id, target.id),
                 if returning { target.id } else { source.id },
                 if returning { source.id } else { target.id },
                 style,
-            );
+            )
+            .with_animated(active);
+            let caption = if returning {
+                task.map(|task| {
+                    format!(
+                        "↶ Review · {}",
+                        truncate_label(&sanitize(&task.objective), 22)
+                    )
+                })
+            } else if let Some(task) = task.filter(|_| active) {
+                Some(format!(
+                    "▶ {}",
+                    truncate_label(&sanitize(&task.objective), 25)
+                ))
+            } else {
+                pending.as_ref().map(|proposal| {
+                    format!("◇ {}", truncate_label(&sanitize(&proposal.objective), 25))
+                })
+            };
+            if let Some(caption) = caption {
+                edge = edge.with_label(caption);
+            }
             if returning {
                 returning_edges.push(edge);
             } else {
@@ -690,6 +733,24 @@ fn edge_presentation(
     highlighted: bool,
     returning: bool,
 ) -> EdgeStyle {
+    let active = returning
+        || pending.is_some()
+        || task.is_some_and(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Ready | TaskStatus::Running | TaskStatus::WaitingApproval
+            )
+        });
+    if active {
+        return solid_edge_style(
+            if returning {
+                theme::AQUA
+            } else {
+                theme::YELLOW
+            },
+            true,
+        );
+    }
     if highlighted {
         return solid_edge_style(
             if returning {
@@ -751,7 +812,7 @@ fn node_layout(area: Rect, agents: &[AgentProfile]) -> Vec<(Position, f64, f64)>
             depth.min(count.saturating_sub(1))
         })
         .collect::<Vec<_>>();
-    let card_width = area.width.clamp(1, 28);
+    let card_width = area.width.clamp(1, 36);
     let peer_gap = area
         .width
         .saturating_sub(card_width.saturating_mul(2))
@@ -967,13 +1028,22 @@ const fn task_status_marker(status: TaskStatus) -> &'static str {
 
 fn truncate_label(value: &str, width: u16) -> String {
     let width = usize::from(width);
-    if value.chars().count() <= width {
+    if UnicodeWidthStr::width(value) <= width {
         return value.to_owned();
     }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
+    if width == 0 {
+        return String::new();
     }
-    let mut shortened = value.chars().take(width - 1).collect::<String>();
+    let mut shortened = String::new();
+    let mut used = 0;
+    for ch in value.chars() {
+        let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cells > width - 1 {
+            break;
+        }
+        shortened.push(ch);
+        used += cells;
+    }
     shortened.push('…');
     shortened
 }
@@ -988,8 +1058,8 @@ fn agent_status(tasks: &[Task], agent: &AgentProfile, pending: bool) -> (&'stati
         .map(|task| task.status)
         .collect::<Vec<_>>();
     for (status, label, color) in [
-        (TaskStatus::WaitingApproval, "approval", theme::YELLOW),
         (TaskStatus::Running, "working", theme::GREEN),
+        (TaskStatus::WaitingApproval, "approval", theme::YELLOW),
         (TaskStatus::Ready, "ready", theme::AQUA),
         (TaskStatus::Queued, "queued", theme::BLUE),
         (TaskStatus::Blocked, "blocked", theme::RED),
@@ -1070,8 +1140,8 @@ mod geometry_tests {
             agent("Frontend Agent", vec![]),
         ];
         let layout = node_layout(Rect::new(0, 0, 160, 40), &agents);
-        assert_eq!(layout[0].0, Position::new(66.0, 0.0));
-        assert_eq!(layout[1].0, Position::new(42.0, 26.0));
+        assert_eq!(layout[0].0, Position::new(62.0, 0.0));
+        assert_eq!(layout[1].0, Position::new(34.0, 26.0));
         assert_eq!(layout[2].0, Position::new(90.0, 26.0));
         assert_eq!(layout[1].2, layout[2].2);
         let lead = rataflow::Rect::new(
@@ -1087,9 +1157,9 @@ mod geometry_tests {
         }
 
         let narrow = node_layout(Rect::new(0, 0, 80, 40), &agents);
-        assert_eq!(narrow[0].0, Position::new(26.0, 0.0));
-        assert_eq!(narrow[1].0, Position::new(2.0, 26.0));
-        assert_eq!(narrow[2].0, Position::new(50.0, 26.0));
+        assert_eq!(narrow[0].0, Position::new(22.0, 0.0));
+        assert_eq!(narrow[1].0, Position::new(0.0, 26.0));
+        assert_eq!(narrow[2].0, Position::new(44.0, 26.0));
     }
 
     #[test]
@@ -1150,5 +1220,42 @@ mod geometry_tests {
         assert!(card.desired_height(12) > card.desired_height(28));
         card.display_level = 0;
         assert!(card.desired_height(12) < 6);
+    }
+
+    #[test]
+    fn working_card_keeps_three_unicode_width_bounded_lines_of_recent_output() {
+        let card = AgentCard {
+            max_width: 36.0,
+            identity: "⬢ Backend Agent".into(),
+            provider: "Codex · CLI".into(),
+            model: "Model · CLI automatic".into(),
+            detail: "▶ Implement task API".into(),
+            response: Some(format!(
+                "{}latest 🐶 response with a clear ending",
+                "earlier output ".repeat(12)
+            )),
+            status: "working",
+            status_color: theme::GREEN,
+            role_color: theme::YELLOW,
+            display_level: 2,
+        };
+        let lines = card.lines(0, 26);
+        assert_eq!(
+            lines.len(),
+            7,
+            "identity, status, three output lines, model, job"
+        );
+        assert!(lines[2..5].iter().all(|line| line.width() <= 26));
+        assert!(
+            lines[2..5]
+                .iter()
+                .any(|line| line.to_string().contains("latest"))
+        );
+        assert!(
+            lines[2..5]
+                .iter()
+                .any(|line| line.to_string().contains("ending"))
+        );
+        assert_eq!(truncate_label("🐶 alpha", 4), "🐶 …");
     }
 }
