@@ -1363,7 +1363,11 @@ pub fn run(
     let mut wizard = Wizard::startup(catalog, initial_workspace);
     terminal.draw(render_intro)?;
     loop {
-        match event::read()? {
+        let event = event::read()?;
+        if crate::tui::redraw_on_resize(&mut terminal, &event, render_intro)? {
+            continue;
+        }
+        match event {
             Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc => {
                 return Ok(None);
             }
@@ -1374,7 +1378,11 @@ pub fn run(
     while !wizard.cancelled && !wizard.complete {
         terminal.draw(|frame| render(frame, &wizard))?;
         if event::poll(Duration::from_millis(100))? {
-            wizard.handle_event(&event::read()?, terminal.size()?.into());
+            let event = event::read()?;
+            if !crate::tui::redraw_on_resize(&mut terminal, &event, |frame| render(frame, &wizard))?
+            {
+                wizard.handle_event(&event, terminal.size()?.into());
+            }
         }
     }
     if wizard.complete {

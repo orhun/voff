@@ -2102,6 +2102,22 @@ struct LoopConfig {
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+pub(crate) fn redraw_on_resize<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    event: &Event,
+    draw: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> Result<bool, B::Error> {
+    let Event::Resize(width, height) = *event else {
+        return Ok(false);
+    };
+    // Minimized terminals may report an empty viewport; wait for a usable size.
+    if width > 0 && height > 0 {
+        terminal.resize(Rect::new(0, 0, width, height))?;
+        terminal.draw(draw)?;
+    }
+    Ok(true)
+}
+
 fn forward_terminal_events<P, R>(input_tx: mpsc::Sender<Event>, mut poll: P, mut read: R)
 where
     P: FnMut(Duration) -> io::Result<bool>,
@@ -2163,6 +2179,14 @@ async fn terminal_loop<R: Repository + 'static>(
     'terminal: while !model.quit {
         tokio::select! {
             Some(event)=input_rx.recv()=>{
+                match redraw_on_resize(&mut terminal, &event, |frame| render(frame, model)) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        loop_result = Err(TuiError::Io(error));
+                        break 'terminal;
+                    }
+                }
                 if let Some(wizard) = model.workspace_editor.as_mut() {
                     wizard.handle_event(&event, terminal.size()?.into());
                     if wizard.cancelled() {
@@ -4355,6 +4379,42 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn resize_redraws_immediately_and_preserves_input_with_help_open() {
+        let mut app = AppModel::new(SessionId::new());
+        app.help = true;
+        app.composer_active = true;
+        app.composer.insert_str("Keep my draft");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for (width, height) in [(68, 24), (140, 48)] {
+            terminal.backend_mut().resize(width, height);
+            let mut drawn = false;
+            assert!(
+                redraw_on_resize(&mut terminal, &Event::Resize(width, height), |frame| {
+                    drawn = true;
+                    assert_eq!(frame.area(), Rect::new(0, 0, width, height));
+                    render(frame, &mut app);
+                })
+                .unwrap()
+            );
+            assert!(drawn);
+            assert!(app.help && app.composer_active);
+            assert_eq!(app.composer.lines(), &["Keep my draft"]);
+        }
+        assert!(
+            redraw_on_resize(&mut terminal, &Event::Resize(0, 0), |_| {
+                panic!("Do not draw an empty viewport");
+            })
+            .unwrap()
+        );
+        assert!(
+            !redraw_on_resize(&mut terminal, &Event::FocusGained, |_| {
+                panic!("Other events must reach their normal handlers");
+            })
+            .unwrap()
+        );
+    }
 
     #[test]
     fn automatic_approvals_do_not_prompt_but_application_limits_do() {
