@@ -196,13 +196,30 @@ fn cycle<T: Copy + Eq, const N: usize>(values: [T; N], current: T, delta: isize)
     values[next]
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct DeveloperDraft {
     pub name: String,
     pub role: DeveloperRole,
     pub provider: ProviderChoice,
     pub model: String,
     pub max_output_tokens: u64,
+    /// Optional replacement token; never serialized into project configuration.
+    pub api_token: String,
+    /// Existing credential lookup to retain when no replacement is entered.
+    pub credential_reference: Option<String>,
+}
+
+impl std::fmt::Debug for DeveloperDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeveloperDraft")
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("api_token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl DeveloperDraft {
@@ -221,6 +238,8 @@ impl DeveloperDraft {
             provider,
             model: model.into(),
             max_output_tokens,
+            api_token: String::new(),
+            credential_reference: None,
         }
     }
 
@@ -238,6 +257,8 @@ impl DeveloperDraft {
             provider,
             model,
             max_output_tokens,
+            api_token: String::new(),
+            credential_reference: None,
         }
     }
 }
@@ -246,7 +267,6 @@ impl DeveloperDraft {
 pub struct SetupDraft {
     pub developers: Vec<DeveloperDraft>,
     pub working_directory: PathBuf,
-    pub openai_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,7 +274,6 @@ enum Step {
     Basics,
     WorkspacePicker,
     Developer(usize),
-    Credential,
     Review,
 }
 
@@ -263,6 +282,7 @@ enum Field {
     Role,
     Provider,
     Model,
+    Token,
 }
 
 impl Field {
@@ -270,15 +290,17 @@ impl Field {
         match self {
             Self::Role => Self::Provider,
             Self::Provider => Self::Model,
-            Self::Model => Self::Role,
+            Self::Model => Self::Token,
+            Self::Token => Self::Role,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Role => Self::Model,
+            Self::Role => Self::Token,
             Self::Provider => Self::Role,
             Self::Model => Self::Provider,
+            Self::Token => Self::Model,
         }
     }
 }
@@ -309,7 +331,7 @@ impl BasicsField {
 }
 
 #[derive(Debug)]
-struct Wizard {
+pub(crate) struct Wizard {
     step: Step,
     basics_field: BasicsField,
     count_input: String,
@@ -326,8 +348,7 @@ struct Wizard {
     cancelled: bool,
     complete: bool,
     catalog: ModelCatalog,
-    credential_available: bool,
-    openai_token: String,
+    editing: bool,
 }
 
 impl Default for Wizard {
@@ -337,7 +358,7 @@ impl Default for Wizard {
 }
 
 impl Wizard {
-    fn new(catalog: ModelCatalog, credential_available: bool) -> Self {
+    fn new(catalog: ModelCatalog, _credential_available: bool) -> Self {
         Self {
             step: Step::Basics,
             basics_field: BasicsField::Count,
@@ -355,8 +376,52 @@ impl Wizard {
             cancelled: false,
             complete: false,
             catalog,
-            credential_available,
-            openai_token: String::new(),
+            editing: false,
+        }
+    }
+
+    /// Reuse startup setup with current team values; the running workspace is fixed.
+    pub(crate) fn edit(catalog: ModelCatalog, draft: SetupDraft) -> Self {
+        Self {
+            count_input: draft.developers.len().to_string(),
+            default_max_output_tokens: draft
+                .developers
+                .first()
+                .map_or(DEFAULT_OUTPUT_TOKENS, |developer| {
+                    developer.max_output_tokens
+                }),
+            developers: draft.developers,
+            working_directory: draft.working_directory,
+            editing: true,
+            ..Self::new(catalog, false)
+        }
+    }
+
+    pub(crate) fn handle_event(&mut self, event: &Event) {
+        match event {
+            Event::Key(key) => self.handle_key(*key),
+            Event::Paste(value) => self.handle_paste(value),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+    pub(crate) fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn select_role(&mut self, index: usize) {
+        if index < self.developers.len() {
+            self.step = Step::Developer(index);
+        }
+    }
+
+    pub(crate) fn into_draft(self) -> SetupDraft {
+        SetupDraft {
+            developers: self.developers,
+            working_directory: self.working_directory,
         }
     }
 
@@ -365,11 +430,14 @@ impl Wizard {
             return;
         }
         self.error = None;
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.cancelled = true;
+            return;
+        }
         match self.step {
             Step::Basics => self.handle_basics(key),
             Step::WorkspacePicker => self.handle_workspace_picker(key),
             Step::Developer(index) => self.handle_developer(index, key),
-            Step::Credential => self.handle_credential(key),
             Step::Review => self.handle_review(key),
         }
     }
@@ -419,16 +487,25 @@ impl Wizard {
             },
             KeyCode::Right | KeyCode::Char('+') => self.adjust_basic_choice(1),
             KeyCode::Left | KeyCode::Char('-') => self.adjust_basic_choice(-1),
-            KeyCode::Enter => {
-                if self.basics_field == BasicsField::WorkingDirectory {
+            KeyCode::Enter | KeyCode::Char('c') => {
+                if key.code == KeyCode::Enter && self.basics_field == BasicsField::WorkingDirectory
+                {
                     self.open_workspace_picker();
                 } else if let Some(count) = self.count()
                     && self.default_max_output_tokens > 0
                     && self.valid_working_directory().is_some()
                 {
                     let model = self.catalog.first_model(ProviderChoice::Ollama.id());
+                    let previous = std::mem::take(&mut self.developers);
                     self.developers = (0..count)
                         .map(|index| {
+                            if let Some(existing) = previous.get(index) {
+                                let mut developer = existing.clone();
+                                if self.tokens_touched {
+                                    developer.max_output_tokens = self.default_max_output_tokens;
+                                }
+                                return developer;
+                            }
                             DeveloperDraft::suggested(
                                 index,
                                 count,
@@ -453,6 +530,10 @@ impl Wizard {
     }
 
     fn open_workspace_picker(&mut self) {
+        if self.editing {
+            self.error = Some("The active workspace stays fixed while editing its team.".into());
+            return;
+        }
         let start = match self.working_directory.canonicalize() {
             Ok(path) => path,
             Err(error) => {
@@ -609,33 +690,37 @@ impl Wizard {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancelled = true;
             }
-            KeyCode::Tab => self.field = self.field.next(),
-            KeyCode::BackTab => self.field = self.field.previous(),
-            KeyCode::Up => self.field = self.field.previous(),
-            KeyCode::Down => self.field = self.field.next(),
+            KeyCode::Tab | KeyCode::Down => self.move_field(index, true),
+            KeyCode::BackTab | KeyCode::Up => self.move_field(index, false),
             KeyCode::Left => self.cycle_choice(index, -1),
             KeyCode::Right => self.cycle_choice(index, 1),
             KeyCode::Backspace => match self.field {
-                Field::Model
-                    if self
-                        .catalog
-                        .model_is_editable(self.developers[index].provider.id()) =>
-                {
+                Field::Model => {
                     self.developers[index].model.pop();
                 }
-                Field::Model => {}
+                Field::Token => {
+                    self.developers[index].api_token.pop();
+                }
                 Field::Role | Field::Provider => {}
             },
             KeyCode::Char(value) => match self.field {
                 Field::Model
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && self
-                            .catalog
-                            .model_is_editable(self.developers[index].provider.id()) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !value.is_control() =>
                 {
                     self.developers[index].model.push(value);
                 }
-                Field::Role | Field::Provider | Field::Model => {}
+                Field::Token
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !value.is_control() =>
+                {
+                    self.developers[index].api_token.push(value);
+                }
+                Field::Role | Field::Provider | Field::Model | Field::Token => {}
             },
             KeyCode::Enter => {
                 let developer = &self.developers[index];
@@ -644,8 +729,6 @@ impl Wizard {
                 } else if index + 1 < self.developers.len() {
                     self.step = Step::Developer(index + 1);
                     self.field = Field::Role;
-                } else if self.needs_openai_credential() {
-                    self.step = Step::Credential;
                 } else {
                     self.step = Step::Review;
                 }
@@ -654,31 +737,36 @@ impl Wizard {
         }
     }
 
-    fn handle_credential(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.openai_token.clear();
-                self.step = Step::Developer(self.developers.len().saturating_sub(1));
-                self.field = Field::Role;
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cancelled = true;
-            }
-            KeyCode::Backspace => {
-                self.openai_token.pop();
-            }
-            KeyCode::Char(value) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.openai_token.push(value);
-            }
-            KeyCode::Enter => self.step = Step::Review,
-            _ => {}
+    fn move_field(&mut self, index: usize, forward: bool) {
+        self.field = if forward {
+            self.field.next()
+        } else {
+            self.field.previous()
+        };
+        if self.field == Field::Token && self.developers[index].provider != ProviderChoice::OpenAi {
+            self.field = if forward {
+                self.field.next()
+            } else {
+                self.field.previous()
+            };
         }
     }
 
     fn handle_paste(&mut self, value: &str) {
-        match self.step {
-            Step::Credential => self.openai_token.push_str(value.trim()),
-            Step::Basics | Step::WorkspacePicker | Step::Developer(_) | Step::Review => {}
+        if let Step::Developer(index) = self.step
+            && self.field == Field::Model
+        {
+            self.developers[index].model =
+                value.trim().chars().filter(|c| !c.is_control()).collect();
+            return;
+        }
+        if let Step::Developer(index) = self.step
+            && self.field == Field::Token
+            && self.developers[index].provider == ProviderChoice::OpenAi
+        {
+            self.developers[index]
+                .api_token
+                .extend(value.trim().chars().filter(|c| !c.is_control()));
         }
     }
 
@@ -729,21 +817,13 @@ impl Wizard {
         }
     }
 
-    fn needs_openai_credential(&self) -> bool {
-        !self.credential_available
-            && self
-                .developers
-                .iter()
-                .any(|developer| developer.provider == ProviderChoice::OpenAi)
-    }
-
     fn cycle_choice(&mut self, index: usize, delta: isize) {
         let developer = &mut self.developers[index];
         match self.field {
+            Field::Token => {}
             Field::Role => {
                 if index == 0 {
                     developer.role = DeveloperRole::Lead;
-                    developer.name = suggested_name(developer.role, index);
                     return;
                 }
                 developer.role = developer.role.cycle_specialist(delta);
@@ -752,6 +832,8 @@ impl Wizard {
             Field::Provider => {
                 developer.provider = developer.provider.cycle(delta);
                 developer.model = self.catalog.first_model(developer.provider.id());
+                developer.api_token.clear();
+                developer.credential_reference = None;
             }
             Field::Model => {
                 if !self.catalog.model_is_editable(developer.provider.id()) {
@@ -818,14 +900,13 @@ pub fn run(
         Ok(Some(SetupDraft {
             developers: wizard.developers,
             working_directory: wizard.working_directory,
-            openai_token: (!wizard.openai_token.is_empty()).then_some(wizard.openai_token),
         }))
     } else {
         Ok(None)
     }
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
+pub(crate) fn render(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
     let area = frame.area();
     frame.render_widget(Clear, area);
     let shell = centered(area, area.width.min(92), area.height.min(34));
@@ -838,9 +919,11 @@ fn render(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]))
-            .title_bottom(Line::from(
-                " Your team stays editable in .voff/config.toml ",
-            ))
+            .title_bottom(Line::from(if wizard.step == Step::Basics {
+                " [c] Continue · Esc cancel "
+            } else {
+                " Enter continue · Esc back "
+            }))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::DarkGray)),
@@ -863,7 +946,6 @@ fn render(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
         Step::Basics => render_basics(frame, wizard, rows[1]),
         Step::WorkspacePicker => render_workspace_picker(frame, wizard, rows[1]),
         Step::Developer(index) => render_developer(frame, wizard, index, rows[1]),
-        Step::Credential => render_credential(frame, wizard, rows[1]),
         Step::Review => render_review(frame, wizard, rows[1]),
     }
     let footer = wizard
@@ -885,7 +967,7 @@ fn render(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
 
 fn render_progress(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect) {
     let (label, ratio) = match wizard.step {
-        Step::Basics => ("1 · quick defaults", 0.15),
+        Step::Basics => ("1 · Team settings", 0.15),
         Step::WorkspacePicker => ("1 · choose workspace", 0.15),
         Step::Developer(index) => {
             let total = wizard.developers.len().max(1);
@@ -894,8 +976,14 @@ fn render_progress(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect) 
                 0.2 + 0.6 * (index + 1) as f64 / total as f64,
             )
         }
-        Step::Credential => ("3 · secure access", 0.9),
-        Step::Review => ("ready to launch", 1.0),
+        Step::Review => (
+            if wizard.editing {
+                "ready to save"
+            } else {
+                "ready to launch"
+            },
+            1.0,
+        ),
     };
     frame.render_widget(
         Gauge::default()
@@ -912,7 +1000,11 @@ fn render_basics(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect) {
     let working_directory = wizard.working_directory.display().to_string();
     let lines = vec![
         Line::from(Span::styled(
-            "Start with sensible defaults. You can launch without changing anything.",
+            if wizard.editing {
+                "Edit your current team. Existing choices are preserved."
+            } else {
+                "Choose your team size, workspace, and output limit."
+            },
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -937,9 +1029,7 @@ fn render_basics(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect) {
             false,
         ),
         Line::from(""),
-        Line::from(
-            "These apply to the whole team. Choose provider and model on each developer next.",
-        ),
+        Line::from("Next: review each role, provider, model, and cloud token."),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -960,41 +1050,6 @@ fn render_workspace_picker(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area
             area,
         );
     }
-}
-
-fn render_credential(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, area: Rect) {
-    let bullets = "•".repeat(wizard.openai_token.chars().count().min(36));
-    let lines = vec![
-        Line::from(Span::styled(
-            "Add your OpenAI API token now? (optional)",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            if bullets.is_empty() {
-                "  token goes here  ".into()
-            } else {
-                format!("  {bullets}  ")
-            },
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("Paste it now, or press Enter to launch and add it later with A."),
-        Line::from("Tokens are stored in the local .voff SQLite database—not config or logs."),
-        Line::from(Span::styled(
-            "OPENAI_API_KEY remains the non-interactive override.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
-        centered(area, area.width.min(72), 11),
-    );
 }
 
 fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usize, area: Rect) {
@@ -1026,7 +1081,7 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(area);
-    let form = vec![
+    let mut form = vec![
         form_line(
             "Type",
             if index == 0 {
@@ -1063,6 +1118,27 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
             Style::default().fg(Color::DarkGray),
         )),
     ];
+    if developer.provider == ProviderChoice::OpenAi {
+        let token = if developer.api_token.is_empty() {
+            if developer.credential_reference.is_some() {
+                "Unchanged (type to replace)".into()
+            } else {
+                "Optional · use existing access if blank".into()
+            }
+        } else {
+            "•".repeat(developer.api_token.chars().count().min(36))
+        };
+        form.push(Line::from(""));
+        form.push(form_line(
+            "API token",
+            &token,
+            wizard.field == Field::Token,
+            false,
+        ));
+        form.push(Line::from(
+            "  This role only · masked · stored locally, not in config",
+        ));
+    }
     frame.render_widget(
         Paragraph::new(form)
             .block(
@@ -1081,8 +1157,7 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
     render_preview_card(frame, developer, cols[1], index == 0);
 }
 
-fn form_line<'a>(label: &'a str, value: &'a str, selected: bool, choice: bool) -> Line<'a> {
-    let marker = if selected { "›" } else { " " };
+fn form_line(label: &str, value: &str, selected: bool, choice: bool) -> Line<'static> {
     let value = if choice {
         format!("‹ {value} ›")
     } else {
@@ -1090,7 +1165,7 @@ fn form_line<'a>(label: &'a str, value: &'a str, selected: bool, choice: bool) -
     };
     Line::from(vec![
         Span::styled(
-            format!("{marker} {label:<13}"),
+            format!("  {label:<13}"),
             if selected {
                 Style::default()
                     .fg(Color::Black)
@@ -1211,8 +1286,13 @@ fn footer_text(wizard: &Wizard) -> String {
         Step::Developer(_) => {
             "Enter accepts this specialist · Tab fields · ←/→ choices · Esc back".into()
         }
-        Step::Credential => "paste token (optional) · Enter continue · Esc back".into(),
-        Step::Review => "Enter save & launch · Esc edit · q cancel".into(),
+        Step::Review => {
+            if wizard.editing {
+                "Enter save team · Esc edit · q cancel".into()
+            } else {
+                "Enter save & launch · Esc edit · q cancel".into()
+            }
+        }
     }
 }
 
@@ -1421,56 +1501,63 @@ mod tests {
     }
 
     #[test]
-    fn openai_team_collects_and_masks_the_actual_token_once() {
+    fn cloud_tokens_are_per_role_masked_and_debug_redacted() {
         let mut wizard = Wizard::default();
-        wizard.handle_key(key(KeyCode::Enter));
-        for _ in 0..wizard.developers.len() {
+        wizard.handle_key(key(KeyCode::Char('c')));
+        for index in 0..2 {
             wizard.field = Field::Provider;
             wizard.handle_key(key(KeyCode::Right));
+            wizard.field = Field::Token;
+            wizard.handle_paste(&format!("sk-role-{index}"));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 32)).unwrap();
+            terminal.draw(|frame| render(frame, &wizard)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(rendered.contains("API token"));
+            assert!(rendered.contains('•'));
+            assert!(!rendered.contains("sk-role"));
+            assert!(!format!("{wizard:?}").contains("sk-role"));
             wizard.handle_key(key(KeyCode::Enter));
         }
-        assert_eq!(wizard.step, Step::Credential);
-
-        wizard.handle_paste("sk-test-secret");
-        let backend = ratatui::backend::TestBackend::new(100, 32);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &wizard)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = (0..buffer.area.height)
-            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
-            .collect::<String>();
-        assert!(!rendered.contains("sk-test-secret"));
-        assert!(rendered.contains('•'));
-
-        wizard.handle_key(key(KeyCode::Enter));
-        assert_eq!(wizard.step, Step::Review);
+        assert_eq!(wizard.developers[0].api_token, "sk-role-0");
+        assert_eq!(wizard.developers[1].api_token, "sk-role-1");
     }
 
     #[test]
-    fn existing_openai_credential_skips_the_token_step() {
-        let mut wizard = Wizard::new(ModelCatalog::default(), true);
-        wizard.handle_key(key(KeyCode::Enter));
-        for _ in 0..wizard.developers.len() {
-            wizard.field = Field::Provider;
-            wizard.handle_key(key(KeyCode::Right));
-            wizard.handle_key(key(KeyCode::Enter));
-        }
-        assert_eq!(wizard.step, Step::Review);
-        assert!(wizard.openai_token.is_empty());
+    fn local_providers_skip_token_field_and_discard_cloud_draft() {
+        let mut wizard = Wizard::default();
+        wizard.handle_key(key(KeyCode::Char('c')));
+        wizard.field = Field::Model;
+        wizard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard.field, Field::Role);
+        wizard.field = Field::Provider;
+        wizard.handle_key(key(KeyCode::Right));
+        wizard.field = Field::Token;
+        wizard.handle_paste("secret");
+        wizard.field = Field::Provider;
+        wizard.handle_key(key(KeyCode::Right));
+        assert_eq!(wizard.developers[0].provider, ProviderChoice::CodexCli);
+        assert!(wizard.developers[0].api_token.is_empty());
+        wizard.field = Field::Model;
+        wizard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard.field, Field::Role);
     }
 
     #[test]
-    fn openai_token_can_be_skipped_without_blocking_launch() {
-        let mut wizard = Wizard {
-            step: Step::Credential,
-            ..Wizard::default()
-        };
-
-        wizard.handle_key(key(KeyCode::Enter));
-
-        assert_eq!(wizard.step, Step::Review);
-        assert!(wizard.openai_token.is_empty());
-        assert!(wizard.error.is_none());
+    fn common_editor_preserves_current_roles_and_continue_works_from_workspace() {
+        let mut initial = Wizard::default();
+        initial.handle_key(key(KeyCode::Char('c')));
+        initial.developers[0].provider = ProviderChoice::ClaudeCli;
+        initial.developers[0].model = "custom-model".into();
+        let draft = initial.into_draft();
+        let mut wizard = Wizard::edit(ModelCatalog::default(), draft.clone());
+        assert_eq!(wizard.step, Step::Basics);
+        wizard.basics_field = BasicsField::WorkingDirectory;
+        wizard.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(wizard.step, Step::Developer(0));
+        assert_eq!(wizard.developers, draft.developers);
     }
 
     #[test]
@@ -1623,17 +1710,5 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.starts_with("Cannot open that workspace:"))
         );
-    }
-
-    #[test]
-    fn leaving_the_credential_step_discards_the_token() {
-        let mut wizard = Wizard {
-            step: Step::Credential,
-            openai_token: "sk-discard-me".into(),
-            ..Wizard::default()
-        };
-        wizard.handle_key(key(KeyCode::Esc));
-        assert!(wizard.openai_token.is_empty());
-        assert_eq!(wizard.step, Step::Developer(0));
     }
 }

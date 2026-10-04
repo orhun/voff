@@ -52,10 +52,10 @@ highlighted directory; Left/`h` returns to its parent, and Space chooses the
 currently displayed directory. Press Esc to finish or clear a filter, then
 again to return without changing the workspace.
 
-If the selected team uses OpenAI and no credential is configured, the builder
-offers an optional masked token field. Press Enter to skip it: a missing API
-token never blocks launch. In the workspace, press `A` to add it later without
-restarting. Values entered either way are stored in the workspace-local
+Each OpenAI role shows its own optional masked token field on the provider/model
+page. Different roles can use different tokens. Local providers do not ask for
+one. Leave it blank to keep existing access; use `t` or `c` to change it later.
+Tokens are stored in the workspace-local
 `.voff/voff.db`, never in `.voff/config.toml`, logs, prompts, or exports.
 
 The workspace includes a `ratatui-textarea` composer at the bottom, with the
@@ -102,14 +102,12 @@ with the role icon; a distinct custom agent name appears alongside it without
 repeating the role as a title. Cards can be selected or repositioned with the mouse;
 clicking a role highlights its Team Lead-mediated connector in yellow. Drag
 empty graph space to pan, use `+`/`-` to zoom, `0` to reset zoom, and `f`
-to fit the team. Press `t` after setup to open the team popup. `n` adds another
-Backend, Frontend, Full-stack, Reviewer, Tester, or DevOps specialist using the
-Team Lead's provider/model defaults; Enter enables or disables the selected idle
-specialist. The Team Lead cannot be disabled, and a specialist with queued,
-running, or pending-approved work must finish or cancel it before availability
-changes. Press `c` on a selected card to open the setup-style role
-configuration popup. Choose any provider route already configured for the
-workspace, then browse or type the model used for that role's next task.
+to fit the team. Press `t` to reopen the same team builder used at startup,
+prefilled with the current team. The first page shows **Team settings** and
+`[c] Continue`. Change the team size, then review each role's provider, model,
+and cloud token. Press `c` on a selected card to jump directly to that role in
+the same builder. Finish or cancel pending work before editing. Saving keeps
+the current session and persists the team for subsequent launches.
 Cards show a short excerpt of the latest provider response and label a
 CLI-managed model as `CLI automatic`. New specialists have no peer-delegation
 authority. The same status information remains available through text
@@ -158,8 +156,9 @@ before sharing it because repository/model content is untrusted input.
 
 ## Cloud and local providers
 
-Interactive setup and the workspace's `A` shortcut store the OpenAI API token
-in the local `.voff/voff.db`. For CI, scripts, or an explicit override, create an
+Interactive setup stores per-role OpenAI tokens in the local `.voff/voff.db`,
+with only credential lookup names in configuration. For shared credentials
+in CI or scripts, create an
 optional `.env` in the directory
 where you invoke voff (no parent directories are searched):
 
@@ -168,8 +167,10 @@ OPENAI_API_KEY=YOUR_API_KEY
 ```
 
 Existing process variables override `.env`, which overrides the local database.
-OpenAI defaults to `OPENAI_API_KEY`; a custom `api_key_env` name works
-identically. Ollama, Codex CLI, and Claude CLI need no token. The CLI routes use the
+OpenAI defaults to `OPENAI_API_KEY` when no role token is entered. A separately
+entered token uses its own lookup name and is not overridden by the shared
+`OPENAI_API_KEY`; an environment value for its exact `api_key_env` name still
+takes precedence. Ollama, Codex CLI, and Claude CLI need no token. The CLI routes use the
 installed binary's existing login and deliberately do not inherit API-key
 variables. Never commit `.env`; it is ignored by Git.
 Malformed or unreadable files stop startup with a redacted error. Existing TOML

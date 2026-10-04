@@ -1,0 +1,143 @@
+config_version = 1
+
+[workspace]
+root = "/home/orhun/gh/calc"
+state_file = ".voff/voff.db"
+
+[runtime]
+default_timeout_seconds = 1800
+event_channel_capacity = 128
+
+[provider]
+kind = "openai"
+model = "gpt-5.6-luna"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers]]
+id = "openai"
+kind = "openai"
+model = "gpt-5.6-luna"
+api_key_env = "OPENAI_API_KEY"
+
+[cost]
+currency = "USD"
+
+[agent]
+name = "Team Lead"
+role = "technical_lead"
+system_prompt = "Own every team decision. Plan bounded work, delegate every required specialty as an explicit child task, prevent overlapping ownership, and integrate only verified results."
+tools = [
+    "file.read",
+    "search.text",
+    "task.delegate",
+    "review.request",
+]
+max_output_tokens = 4096
+
+[formation]
+name = "5-developer custom team"
+entry_agent = "developer-1"
+max_parallel_tasks = 4
+
+[[agents]]
+id = "developer-1"
+name = "Team Lead"
+role = "technical_lead"
+system_prompt = "Own every team decision. Plan bounded work, delegate every required specialty as an explicit child task, prevent overlapping ownership, and integrate only verified results."
+tools = [
+    "file.read",
+    "search.text",
+    "task.delegate",
+    "review.request",
+]
+provider = "openai"
+model = "gpt-5.6-luna"
+max_output_tokens = 4096
+
+[agents.delegation]
+allowed_targets = [
+    "developer-2",
+    "developer-3",
+    "developer-4",
+    "developer-5",
+]
+max_depth = 2
+max_children = 4
+
+[[agents]]
+id = "developer-2"
+name = "Backend Developer"
+role = "backend_developer"
+system_prompt = "Implement reliable backend changes within Team Lead-assigned boundaries and return verifiable tests."
+tools = [
+    "file.read",
+    "search.text",
+    "file.patch",
+    "process.test",
+]
+provider = "openai"
+model = "gpt-5.6"
+max_output_tokens = 4096
+
+[agents.delegation]
+allowed_targets = []
+max_depth = 2
+max_children = 5
+
+[[agents]]
+id = "developer-3"
+name = "Frontend Developer"
+role = "frontend_developer"
+system_prompt = "Build accessible user-facing changes, preserve established patterns, verify behavior, and return the result to the Team Lead."
+tools = [
+    "file.read",
+    "search.text",
+    "file.patch",
+    "process.test",
+]
+provider = "openai"
+model = "gpt-5-mini"
+max_output_tokens = 4096
+
+[agents.delegation]
+allowed_targets = []
+max_depth = 2
+max_children = 5
+
+[[agents]]
+id = "developer-4"
+name = "Reviewer"
+role = "code_reviewer"
+system_prompt = "Review Team Lead-routed artifacts against acceptance criteria and return concrete blocking findings."
+tools = [
+    "file.read",
+    "search.text",
+    "process.test",
+]
+provider = "openai"
+model = "gpt-5-mini"
+max_output_tokens = 4096
+
+[agents.delegation]
+allowed_targets = []
+max_depth = 2
+max_children = 5
+
+[[agents]]
+id = "developer-5"
+name = "Test Engineer"
+role = "test_engineer"
+system_prompt = "Design focused checks, exercise failure paths, and return reproducible evidence to the Team Lead."
+tools = [
+    "file.read",
+    "search.text",
+    "process.test",
+]
+provider = "openai"
+model = "gpt-5-mini"
+max_output_tokens = 4096
+
+[agents.delegation]
+allowed_targets = []
+max_depth = 2
+max_children = 5

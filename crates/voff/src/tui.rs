@@ -1,7 +1,7 @@
 //! Responsive Ratatui shell and pure action reducer.
 mod team_flow;
 
-use crate::{model_catalog::ModelCatalog, onboarding::DeveloperRole};
+use crate::model_catalog::ModelCatalog;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -31,7 +31,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
-    CanonicalEventKind, EventId, SessionId, Task, TaskStatus,
+    CanonicalEventKind, SessionId, Task, TaskStatus,
 };
 use voff_engine::{DelegationProposal, Engine, EngineEvent, OutputContinuation};
 use voff_provider::ProviderHealth;
@@ -98,47 +98,6 @@ enum ComposerEvent {
     Submit(String),
 }
 
-#[derive(Debug)]
-enum TeamAdjustmentEvent {
-    Ignored,
-    Consumed,
-    Save(Box<AgentProfile>),
-    Add(Box<AgentProfile>),
-}
-
-#[derive(Debug)]
-enum ModelConfigEvent {
-    Ignored,
-    Consumed,
-    Save(Box<AgentProfile>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RoleConfigField {
-    Provider,
-    Model,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProviderRouteOption {
-    pub route: String,
-    pub kind: String,
-}
-
-enum SavedTeamAdjustment {
-    Availability(AgentProfile, CanonicalEvent),
-    Added(AgentProfile, AgentProfile),
-}
-
-const ADDABLE_ROLES: [DeveloperRole; 6] = [
-    DeveloperRole::Backend,
-    DeveloperRole::Frontend,
-    DeveloperRole::FullStack,
-    DeveloperRole::Reviewer,
-    DeveloperRole::Tester,
-    DeveloperRole::DevOps,
-];
-
 pub struct AppModel {
     automatic_review: bool,
     lead_reviews: HashMap<voff_core::TaskId, String>,
@@ -165,7 +124,6 @@ pub struct AppModel {
     pub estimated_cost: Option<f64>,
     pub model_catalog: ModelCatalog,
     pub agent_provider_kinds: HashMap<AgentId, String>,
-    pub provider_routes: Vec<ProviderRouteOption>,
     pub cost_partial: bool,
     pub workspace_root: PathBuf,
     pub event_viewer: bool,
@@ -187,25 +145,15 @@ pub struct AppModel {
     composer_hitbox: Rect,
     quick_run_starting: bool,
     retry_starting: bool,
+    pending_submissions: usize,
     selected_agent: usize,
     approval_selected: usize,
     approval_details: bool,
     approval_scroll: u16,
     team_lead: Option<AgentId>,
-    team_adjustment_open: bool,
-    team_adjustment_selected: usize,
-    team_role_picker: bool,
-    team_role_selected: usize,
-    team_adjustment_saving: bool,
-    team_adjustment_notice: Option<String>,
-    model_config_open: bool,
-    model_config_field: RoleConfigField,
-    model_config_provider: usize,
-    model_config_selected: Option<usize>,
-    model_config_input: String,
-    model_config_typing: bool,
-    model_config_saving: bool,
-    model_config_notice: Option<String>,
+    team_setup: Option<crate::onboarding::SetupDraft>,
+    setup_editor: Option<crate::onboarding::Wizard>,
+    setup_result: Option<crate::onboarding::SetupDraft>,
     team_flow: TeamFlow,
     streaming_text: bool,
     agent_responses: HashMap<AgentId, String>,
@@ -252,10 +200,6 @@ impl AppModel {
             estimated_cost: None,
             model_catalog: ModelCatalog::default(),
             agent_provider_kinds: HashMap::new(),
-            provider_routes: vec![ProviderRouteOption {
-                route: "mock".into(),
-                kind: "mock".into(),
-            }],
             cost_partial: false,
             workspace_root: ".".into(),
             event_viewer: false,
@@ -277,25 +221,15 @@ impl AppModel {
             composer_hitbox: Rect::default(),
             quick_run_starting: false,
             retry_starting: false,
+            pending_submissions: 0,
             selected_agent: 0,
             approval_selected: 0,
             approval_details: false,
             approval_scroll: 0,
             team_lead: None,
-            team_adjustment_open: false,
-            team_adjustment_selected: 0,
-            team_role_picker: false,
-            team_role_selected: 0,
-            team_adjustment_saving: false,
-            team_adjustment_notice: None,
-            model_config_open: false,
-            model_config_field: RoleConfigField::Provider,
-            model_config_provider: 0,
-            model_config_selected: None,
-            model_config_input: String::new(),
-            model_config_typing: false,
-            model_config_saving: false,
-            model_config_notice: None,
+            team_setup: None,
+            setup_editor: None,
+            setup_result: None,
             team_flow: TeamFlow::default(),
             streaming_text: false,
             agent_responses: HashMap::new(),
@@ -359,17 +293,8 @@ impl AppModel {
             Action::ZoomTeamIn if self.panel == Panel::Agents => self.team_flow.zoom_in(),
             Action::ZoomTeamOut if self.panel == Panel::Agents => self.team_flow.zoom_out(),
             Action::ResetTeamZoom if self.panel == Panel::Agents => self.team_flow.reset_zoom(),
-            Action::AdjustTeam => {
-                self.team_adjustment_open = true;
-                self.model_config_open = false;
-                self.team_adjustment_selected =
-                    self.selected_agent.min(self.agents.len().saturating_sub(1));
-                self.team_role_picker = false;
-                self.team_adjustment_notice = None;
-            }
-            Action::ConfigureModel if self.panel == Panel::Agents => {
-                self.open_model_config();
-            }
+            Action::AdjustTeam => self.open_team_setup(false),
+            Action::ConfigureModel if self.panel == Panel::Agents => self.open_team_setup(true),
             Action::ShowTeam => self.panel = Panel::Agents,
             Action::ShowTasks => self.panel = Panel::Tasks,
             Action::ShowTaskDetails => {
@@ -493,332 +418,43 @@ impl AppModel {
         }
     }
 
-    fn handle_team_adjustment_event(&mut self, event: &Event) -> TeamAdjustmentEvent {
-        if !self.team_adjustment_open {
-            return TeamAdjustmentEvent::Ignored;
-        }
-        if self.team_adjustment_saving {
-            return TeamAdjustmentEvent::Consumed;
-        }
-        let Event::Key(key) = event else {
-            return TeamAdjustmentEvent::Consumed;
-        };
-        if key.kind != KeyEventKind::Press {
-            return TeamAdjustmentEvent::Consumed;
-        }
-        if self.team_role_picker {
-            match key.code {
-                KeyCode::Esc => {
-                    self.team_role_picker = false;
-                    self.team_adjustment_notice = None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.team_role_selected = self.team_role_selected.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.team_role_selected =
-                        (self.team_role_selected + 1).min(ADDABLE_ROLES.len() - 1);
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    let Some(member) = self.new_team_member(ADDABLE_ROLES[self.team_role_selected])
-                    else {
-                        self.team_adjustment_notice =
-                            Some("The required Team Lead profile is unavailable.".into());
-                        return TeamAdjustmentEvent::Consumed;
-                    };
-                    self.team_adjustment_saving = true;
-                    self.team_adjustment_notice = Some("Adding specialist…".into());
-                    return TeamAdjustmentEvent::Add(Box::new(member));
-                }
-                _ => {}
-            }
-            return TeamAdjustmentEvent::Consumed;
-        }
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('t') => {
-                self.team_adjustment_open = false;
-                self.team_adjustment_notice = None;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.team_adjustment_selected = self.team_adjustment_selected.saturating_sub(1);
-                self.team_adjustment_notice = None;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.team_adjustment_selected + 1 < self.agents.len() {
-                    self.team_adjustment_selected += 1;
-                }
-                self.team_adjustment_notice = None;
-            }
-            KeyCode::Char('n') => {
-                self.team_role_picker = true;
-                self.team_role_selected = 0;
-                self.team_adjustment_notice = None;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                let Some(agent) = self.agents.get(self.team_adjustment_selected) else {
-                    self.team_adjustment_notice = Some("No specialist is selected.".into());
-                    return TeamAdjustmentEvent::Consumed;
-                };
-                if Some(agent.id) == self.team_lead {
-                    self.team_adjustment_notice =
-                        Some("The Team Lead is required and cannot be disabled.".into());
-                    return TeamAdjustmentEvent::Consumed;
-                }
-                if self.agent_has_committed_work(agent) {
-                    self.team_adjustment_notice = Some(
-                        "Finish, cancel, or decide this specialist's active work before changing availability."
-                            .into(),
-                    );
-                    return TeamAdjustmentEvent::Consumed;
-                }
-                let mut updated = agent.clone();
-                updated.enabled = !updated.enabled;
-                self.team_adjustment_saving = true;
-                self.team_adjustment_notice = Some("Saving team adjustment…".into());
-                return TeamAdjustmentEvent::Save(Box::new(updated));
-            }
-            _ => {}
-        }
-        TeamAdjustmentEvent::Consumed
-    }
-
-    fn open_model_config(&mut self) {
-        let Some(agent) = self.agents.get(self.selected_agent) else {
-            self.composer_notice = Some("Select a role to configure.".into());
-            return;
-        };
-        let route = agent.provider.clone();
-        let kind = self
-            .agent_provider_kinds
-            .get(&agent.id)
-            .cloned()
-            .unwrap_or_else(|| route.clone());
-        let model = agent.model.clone();
-        if !self
-            .provider_routes
-            .iter()
-            .any(|provider| provider.route == route)
-        {
-            self.provider_routes.push(ProviderRouteOption {
-                route: route.clone(),
-                kind: kind.clone(),
-            });
-        }
-        self.model_config_provider = self
-            .provider_routes
-            .iter()
-            .position(|provider| provider.route == route)
-            .unwrap_or(0);
-        self.model_config_field = RoleConfigField::Provider;
-        self.model_config_selected = self
-            .model_catalog
-            .models(&kind)
-            .iter()
-            .position(|option| option.id == model);
-        self.model_config_input = model;
-        self.model_config_typing = false;
-        self.model_config_saving = false;
-        self.model_config_notice = None;
-        self.team_adjustment_open = false;
-        self.model_config_open = true;
-    }
-
-    fn handle_model_config_event(&mut self, event: &Event) -> ModelConfigEvent {
-        if !self.model_config_open {
-            return ModelConfigEvent::Ignored;
-        }
-        if self.model_config_saving {
-            return ModelConfigEvent::Consumed;
-        }
-        let Event::Key(key) = event else {
-            if self.model_config_field == RoleConfigField::Model
-                && let Event::Paste(value) = event
-            {
-                if !self.model_config_typing {
-                    self.model_config_input.clear();
-                    self.model_config_typing = true;
-                }
-                self.model_config_input
-                    .extend(value.chars().filter(|value| !value.is_whitespace()));
-                self.model_config_selected = None;
-                self.model_config_notice = None;
-            }
-            return ModelConfigEvent::Consumed;
-        };
-        if key.kind != KeyEventKind::Press {
-            return ModelConfigEvent::Consumed;
-        }
-        match key.code {
-            KeyCode::Esc => {
-                self.model_config_open = false;
-                self.model_config_notice = None;
-            }
-            KeyCode::Up | KeyCode::BackTab => {
-                self.model_config_field = RoleConfigField::Provider;
-                self.model_config_notice = None;
-            }
-            KeyCode::Down | KeyCode::Tab => {
-                self.model_config_field = RoleConfigField::Model;
-                self.model_config_notice = None;
-            }
-            KeyCode::Left => self.cycle_role_config_choice(-1),
-            KeyCode::Right => self.cycle_role_config_choice(1),
-            KeyCode::Backspace if self.model_config_field == RoleConfigField::Model => {
-                self.model_config_typing = true;
-                self.model_config_selected = None;
-                self.model_config_input.pop();
-                self.model_config_notice = None;
-            }
-            KeyCode::Char('u')
-                if self.model_config_field == RoleConfigField::Model
-                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.model_config_input.clear();
-                self.model_config_typing = true;
-                self.model_config_selected = None;
-                self.model_config_notice = None;
-            }
-            KeyCode::Enter => {
-                let model = self.model_config_input.trim();
-                if model.is_empty() {
-                    self.model_config_notice = Some("Model name cannot be empty.".into());
-                } else if model.len() > 128 {
-                    self.model_config_notice = Some("Keep model names under 128 bytes.".into());
-                } else if model.chars().any(char::is_whitespace) {
-                    self.model_config_notice =
-                        Some("Model names cannot contain whitespace.".into());
-                } else if let (Some(agent), Some(provider)) = (
-                    self.agents.get(self.selected_agent),
-                    self.provider_routes.get(self.model_config_provider),
-                ) {
-                    let mut updated = agent.clone();
-                    updated.provider = provider.route.clone();
-                    updated.model = model.to_owned();
-                    self.model_config_saving = true;
-                    self.model_config_notice = Some("Saving role configuration…".into());
-                    return ModelConfigEvent::Save(Box::new(updated));
-                } else {
-                    self.model_config_notice = Some("The selected role is unavailable.".into());
-                }
-            }
-            KeyCode::Char(value)
-                if self.model_config_field == RoleConfigField::Model
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !value.is_whitespace() =>
-            {
-                if !self.model_config_typing {
-                    self.model_config_input.clear();
-                    self.model_config_typing = true;
-                }
-                self.model_config_input.push(value);
-                self.model_config_selected = None;
-                self.model_config_notice = None;
-            }
-            _ => {}
-        }
-        ModelConfigEvent::Consumed
-    }
-
-    fn cycle_role_config_choice(&mut self, delta: isize) {
-        if self.provider_routes.is_empty() {
-            self.model_config_notice = Some("No configured provider routes are available.".into());
-            return;
-        }
-        if self.model_config_field == RoleConfigField::Provider {
-            self.model_config_provider = (self.model_config_provider as isize + delta)
-                .rem_euclid(self.provider_routes.len() as isize)
-                as usize;
-            let kind = &self.provider_routes[self.model_config_provider].kind;
-            self.model_config_input = self.model_catalog.first_model(kind);
-            self.model_config_selected = self
-                .model_catalog
-                .models(kind)
+    fn open_team_setup(&mut self, selected_role: bool) {
+        if self.tasks.iter().any(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Queued
+                    | TaskStatus::Ready
+                    | TaskStatus::Running
+                    | TaskStatus::WaitingApproval
+            )
+        }) || self.quick_run_starting
+            || self.retry_starting
+            || self.pending_submissions > 0
+            || self
+                .approvals
                 .iter()
-                .position(|model| model.id == self.model_config_input);
-            self.model_config_typing = false;
-            self.model_config_notice = None;
+                .any(|approval| approval.decision == ApprovalDecision::Pending)
+            || !self.lead_reviews.is_empty()
+        {
+            self.composer_notice =
+                Some("Finish or cancel pending work before editing the team.".into());
             return;
         }
-        let kind = &self.provider_routes[self.model_config_provider].kind;
-        let models = self.model_catalog.models(kind);
-        if models.is_empty() {
-            self.model_config_notice = Some("No discovered models; type a model name.".into());
+        let Some(mut draft) = self.team_setup.clone() else {
+            self.composer_notice =
+                Some("This custom team cannot be represented safely in guided setup.".into());
             return;
+        };
+        for (developer, agent) in draft.developers.iter_mut().zip(&self.agents) {
+            developer.model.clone_from(&agent.model);
+            developer.max_output_tokens = agent.max_output_tokens;
         }
-        let next = match self.model_config_selected {
-            Some(current) => (current as isize + delta).rem_euclid(models.len() as isize) as usize,
-            None if delta.is_negative() => models.len() - 1,
-            None => 0,
-        };
-        self.model_config_selected = Some(next);
-        self.model_config_input.clone_from(&models[next].id);
-        self.model_config_typing = false;
-        self.model_config_notice = None;
-    }
-
-    fn new_team_member(&self, role: DeveloperRole) -> Option<AgentProfile> {
-        let lead = self
-            .team_lead
-            .and_then(|id| self.agents.iter().find(|agent| agent.id == id))?;
-        let base_name = match role {
-            DeveloperRole::Backend => "Backend Developer",
-            DeveloperRole::Frontend => "Frontend Developer",
-            DeveloperRole::FullStack => "Full-stack Developer",
-            DeveloperRole::Reviewer => "Reviewer",
-            DeveloperRole::Tester => "Test Engineer",
-            DeveloperRole::DevOps => "DevOps Engineer",
-            DeveloperRole::Lead => return None,
-        };
-        let name = (1..)
-            .map(|index| {
-                if index == 1 {
-                    base_name.to_owned()
-                } else {
-                    format!("{base_name} {index}")
-                }
-            })
-            .find(|candidate| self.agents.iter().all(|agent| agent.name != *candidate))?;
-        let mut tools = role.tools();
-        tools.retain(|tool| !matches!(tool.as_str(), "task.delegate" | "review.request"));
-        let delegation_limits =
-            lead.delegation_limits
-                .as_ref()
-                .map(|limits| voff_core::TaskLimits {
-                    max_delegation_depth: 0,
-                    max_children: 0,
-                    max_duration_seconds: limits.max_duration_seconds,
-                });
-        Some(AgentProfile {
-            id: AgentId::new(),
-            name,
-            role: role.config_role().into(),
-            provider: lead.provider.clone(),
-            model: lead.model.clone(),
-            system_prompt: role.prompt().into(),
-            tools,
-            max_output_tokens: lead.max_output_tokens,
-            enabled: true,
-            allowed_targets: vec![],
-            delegation_limits,
-        })
-    }
-
-    fn agent_has_committed_work(&self, agent: &AgentProfile) -> bool {
-        self.tasks.iter().any(|task| {
-            task.owner == agent.id
-                && matches!(
-                    task.status,
-                    TaskStatus::Queued
-                        | TaskStatus::Ready
-                        | TaskStatus::Running
-                        | TaskStatus::WaitingApproval
-                )
-        }) || self.approvals.iter().any(|approval| {
-            approval.decision == ApprovalDecision::Pending
-                && matches!(approval.action.as_str(), "task.delegate" | "review.request")
-                && serde_json::from_str::<DelegationProposal>(&approval.reason)
-                    .is_ok_and(|proposal| proposal.target_agent == agent.name)
-        })
+        draft.working_directory = self.workspace_root.clone();
+        let mut wizard = crate::onboarding::Wizard::edit(self.model_catalog.clone(), draft);
+        if selected_role {
+            wizard.select_role(self.selected_agent);
+        }
+        self.setup_editor = Some(wizard);
     }
 
     fn handle_credential_event(
@@ -1173,6 +809,7 @@ impl AppModel {
             _ => false,
         }
     }
+    #[cfg(test)]
     fn push_event(&mut self, kind: &CanonicalEventKind) {
         self.push_scoped_event(None, kind);
     }
@@ -1679,11 +1316,13 @@ pub(crate) struct ConfiguredRun {
     pub cost_currency: String,
     pub model_catalog: ModelCatalog,
     pub agent_provider_kinds: HashMap<AgentId, String>,
-    pub provider_routes: Vec<ProviderRouteOption>,
     pub credential_target: Option<(String, crate::credential::CredentialSlot)>,
     pub team_lead: AgentId,
+    pub team_setup: Option<crate::onboarding::SetupDraft>,
 }
-pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError> {
+pub(crate) async fn run_configured(
+    config: ConfiguredRun,
+) -> Result<Option<crate::onboarding::SetupDraft>, TuiError> {
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
     let model_label = config.model_name.clone();
     let credential_repository = Arc::clone(&config.repo);
@@ -1719,9 +1358,9 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
         };
     app.model_catalog = config.model_catalog;
     app.agent_provider_kinds = config.agent_provider_kinds;
-    app.provider_routes = config.provider_routes;
     app.credential_target = config.credential_target;
     app.team_lead = Some(config.team_lead);
+    app.team_setup = config.team_setup;
     if app.input_cost_per_million.is_some() && app.output_cost_per_million.is_some()
         || app.agents.iter().any(|agent| {
             app.agent_provider_kinds
@@ -1751,7 +1390,8 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<(), TuiError
         input_rx,
         event_rx,
     )
-    .await
+    .await?;
+    Ok(app.setup_result.take())
 }
 
 fn restore_initial_history(
@@ -1833,14 +1473,12 @@ async fn terminal_loop<R: Repository + 'static>(
         forward_terminal_events(input_tx, event::poll, event::read);
     });
     let (credential_tx, mut credential_rx) = mpsc::channel(1);
-    let (team_adjustment_tx, mut team_adjustment_rx) =
-        mpsc::channel::<Result<SavedTeamAdjustment, String>>(1);
-    let (model_config_tx, mut model_config_rx) = mpsc::channel::<Result<AgentProfile, String>>(1);
     let (lead_submission_tx, mut lead_submission_rx) =
         mpsc::channel::<Result<&'static str, String>>(8);
     let (quick_run_tx, mut quick_run_rx) = mpsc::channel::<Result<(), String>>(1);
     let (retry_tx, mut retry_rx) = mpsc::channel::<Result<(voff_core::TaskId, u16), String>>(1);
     if model.automatic_review {
+        model.pending_submissions += 1;
         let engine = Arc::clone(&engine);
         let notices = lead_submission_tx.clone();
         tokio::spawn(async move {
@@ -1854,65 +1492,16 @@ async fn terminal_loop<R: Repository + 'static>(
     'terminal: while !model.quit {
         tokio::select! {
             Some(event)=input_rx.recv()=>{
-                let model_config = model.handle_model_config_event(&event);
-                if let ModelConfigEvent::Save(profile) = model_config {
-                    let profile = *profile;
-                    let model_config_tx = model_config_tx.clone();
-                    let repository = Arc::clone(&credential_repository);
-                    tokio::spawn(async move {
-                        let result = repository
-                            .save_agent(profile.clone())
-                            .await
-                            .map(|()| profile)
-                            .map_err(|error| error.to_string());
-                        let _ = model_config_tx.send(result).await;
-                    });
-                } else if matches!(model_config, ModelConfigEvent::Ignored) {
-                let team_adjustment = model.handle_team_adjustment_event(&event);
-                if let TeamAdjustmentEvent::Save(profile) = team_adjustment {
-                    let profile = *profile;
-                    let team_adjustment_tx = team_adjustment_tx.clone();
-                    let repository = Arc::clone(&credential_repository);
-                    let session_id = model.session;
-                    tokio::spawn(async move {
-                        let audit = CanonicalEvent {
-                            id: EventId::new(),
-                            session_id,
-                            task_id: None,
-                            created_at: chrono::Utc::now(),
-                            kind: CanonicalEventKind::AgentAvailabilityChanged {
-                                agent_id: profile.id,
-                                name: profile.name.clone(),
-                                enabled: profile.enabled,
-                            },
-                        };
-                        let result = async {
-                            repository
-                                .save_agent(profile.clone())
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            repository
-                                .append_event(audit.clone())
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            Ok(SavedTeamAdjustment::Availability(profile, audit))
-                        }
-                        .await;
-                        let _ = team_adjustment_tx.send(result).await;
-                    });
-                } else if let TeamAdjustmentEvent::Add(profile) = team_adjustment {
-                    let profile = *profile;
-                    let engine = Arc::clone(&engine);
-                    let team_adjustment_tx = team_adjustment_tx.clone();
-                    tokio::spawn(async move {
-                        let result = engine
-                            .add_team_member(profile.clone())
-                            .await
-                            .map(|lead| SavedTeamAdjustment::Added(profile, lead))
-                            .map_err(|error| error.to_string());
-                        let _ = team_adjustment_tx.send(result).await;
-                    });
-                } else if matches!(team_adjustment, TeamAdjustmentEvent::Ignored) {
+                if let Some(wizard) = model.setup_editor.as_mut() {
+                    wizard.handle_event(&event);
+                    if wizard.cancelled() {
+                        model.setup_editor = None;
+                    } else if wizard.complete() {
+                        model.setup_result = model.setup_editor.take().map(crate::onboarding::Wizard::into_draft);
+                        model.quit = true;
+                    }
+                    continue;
+                }
                 let (handled, submission) = model.handle_credential_event(&event);
                 if let Some((reference, slot, token)) = submission {
                     model.credential_saving = true;
@@ -1928,6 +1517,7 @@ async fn terminal_loop<R: Repository + 'static>(
                 } else if !handled {
                     match model.handle_composer_event(&event) {
                         ComposerEvent::Submit(objective) => {
+                            model.pending_submissions += 1;
                             model.composer_notice = Some("Task sent to Team Lead.".into());
                             model.push_ui_event(format!(
                                 "you → Team Lead task: {}",
@@ -2097,8 +1687,6 @@ async fn terminal_loop<R: Repository + 'static>(
                         }
                     }
                 }
-                }
-                }
             }
             Some(result)=credential_rx.recv()=>{
                 model.credential_saving = false;
@@ -2113,92 +1701,8 @@ async fn terminal_loop<R: Repository + 'static>(
                     Err(error) => model.credential_error = Some(error),
                 }
             }
-            Some(result)=team_adjustment_rx.recv()=>{
-                model.team_adjustment_saving = false;
-                match result {
-                    Ok(SavedTeamAdjustment::Availability(profile, audit)) => {
-                        if let Some(agent) = model.agents.iter_mut().find(|agent| agent.id == profile.id) {
-                            *agent = profile.clone();
-                        }
-                        model.team_adjustment_notice = Some(format!(
-                            "{} is now {} for future Team Lead assignments.",
-                            profile.name,
-                            if profile.enabled { "enabled" } else { "disabled" }
-                        ));
-                        model.push_event(&audit.kind);
-                    }
-                    Ok(SavedTeamAdjustment::Added(profile, lead)) => {
-                        let provider_kind = model
-                            .team_lead
-                            .and_then(|id| model.agent_provider_kinds.get(&id))
-                            .cloned();
-                        if let Some(configured_lead) = model
-                            .agents
-                            .iter_mut()
-                            .find(|agent| agent.id == lead.id)
-                        {
-                            *configured_lead = lead;
-                        }
-                        if let Some(provider_kind) = provider_kind {
-                            model.agent_provider_kinds.insert(profile.id, provider_kind);
-                        }
-                        model.agents.push(profile.clone());
-                        model.team_adjustment_selected = model.agents.len() - 1;
-                        model.selected_agent = model.team_adjustment_selected;
-                        model.team_role_picker = false;
-                        model.team_adjustment_notice = Some(format!(
-                            "{} added and ready for Team Lead assignments.",
-                            profile.name
-                        ));
-                    }
-                    Err(error) => model.team_adjustment_notice = Some(format!(
-                        "Could not save the team adjustment: {}",
-                        sanitize(&error)
-                    )),
-                }
-            }
-            Some(result)=model_config_rx.recv()=>{
-                model.model_config_saving = false;
-                match result {
-                    Ok(profile) => {
-                        let name = profile.name.clone();
-                        let selected_provider = profile.provider.clone();
-                        let selected_model = profile.model.clone();
-                        let provider = model
-                            .provider_routes
-                            .iter()
-                            .find(|provider| provider.route == selected_provider)
-                            .cloned()
-                            .unwrap_or(ProviderRouteOption {
-                                route: selected_provider.clone(),
-                                kind: selected_provider.clone(),
-                            });
-                        let provider_label = provider_option_label(&provider);
-                        if let Some(agent) = model.agents.iter_mut().find(|agent| agent.id == profile.id) {
-                            *agent = profile.clone();
-                        }
-                        model.known_agents.insert(profile.id, profile.clone());
-                        model.agent_provider_kinds.insert(profile.id, provider.kind);
-                        if Some(profile.id) == model.team_lead {
-                            model.provider_label.clone_from(&provider_label);
-                            model.model_label.clone_from(&selected_model);
-                        }
-                        model.model_config_open = false;
-                        model.model_config_notice = None;
-                        model.composer_notice = Some(format!(
-                            "{name} will use {provider_label} · {selected_model} for the next task."
-                        ));
-                        model.push_ui_event(format!(
-                            "team: {name} provider/model changed to {selected_provider}/{selected_model}"
-                        ));
-                    }
-                    Err(error) => model.model_config_notice = Some(format!(
-                        "Could not save the role configuration: {}",
-                        sanitize(&error)
-                    )),
-                }
-            }
             Some(result)=lead_submission_rx.recv()=>{
+                model.pending_submissions = model.pending_submissions.saturating_sub(1);
                 match result {
                     Ok(notice) => model.composer_notice = Some(notice.into()),
                     Err(error) => {
@@ -2287,6 +1791,10 @@ fn composer_height(app: &AppModel, area: Rect) -> u16 {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
+    if let Some(wizard) = &app.setup_editor {
+        crate::onboarding::render(frame, wizard);
+        return;
+    }
     let composer_height = composer_height(app, frame.area());
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -2394,7 +1902,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         Some(app.composer_notice.as_deref().map_or_else(
             || {
                 (
-                    Line::from(" [R] Quick Run ").style(Style::default().fg(Color::White)),
+                    Line::from(" [R] ").style(Style::default().fg(Color::White)),
                     Alignment::Center,
                 )
             },
@@ -3278,319 +2786,6 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             popup,
         );
     }
-    if app.team_adjustment_open {
-        render_team_adjustment_popup(frame, app);
-    }
-    if app.model_config_open {
-        render_model_config_popup(frame, app);
-    }
-}
-
-fn render_model_config_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
-    let Some(agent) = app.agents.get(app.selected_agent) else {
-        return;
-    };
-    let Some(provider) = app.provider_routes.get(app.model_config_provider) else {
-        return;
-    };
-    let option = app
-        .model_catalog
-        .option(&provider.kind, &app.model_config_input);
-    let pricing = option.map_or_else(
-        || "price unavailable".into(),
-        crate::model_catalog::ModelOption::price_label,
-    );
-    let context = option.and_then(|model| model.context_limit).map_or_else(
-        || "context unknown".into(),
-        |limit| format!("{limit} context"),
-    );
-    let model_label = if app.model_catalog.models(&provider.kind).is_empty() {
-        app.model_config_input.clone()
-    } else {
-        format!(
-            "{}  ({})",
-            app.model_config_input,
-            app.model_catalog
-                .selection_label(&provider.kind, &app.model_config_input)
-        )
-    };
-    let provider_label = provider_option_label(provider);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Role  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                sanitize(&agent.name),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        role_config_line(
-            "Provider",
-            &provider_label,
-            app.model_config_field == RoleConfigField::Provider,
-            true,
-        ),
-        Line::from(""),
-        role_config_line(
-            "Model",
-            &model_label,
-            app.model_config_field == RoleConfigField::Model,
-            !app.model_catalog.model_is_editable(&provider.kind),
-        ),
-        Line::from(Span::styled(
-            format!("  {pricing} · {context}"),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "  {} configured provider route{}",
-                app.provider_routes.len(),
-                if app.provider_routes.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    if let Some(notice) = &app.model_config_notice {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            sanitize(notice),
-            Style::default().fg(if app.model_config_saving {
-                Color::Yellow
-            } else {
-                Color::LightRed
-            }),
-        )));
-    }
-    let area = frame.area();
-    let popup = centered_popup(
-        area,
-        area.width.saturating_sub(6).clamp(1, 86),
-        area.height.saturating_sub(4).clamp(1, 14),
-    );
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" Configure role ")
-        .title_bottom(
-            Line::from(" ↑/↓ or Tab field · ←/→ choice · type model · Enter save · Esc cancel ")
-                .style(Style::default().fg(Color::LightCyan))
-                .alignment(ratatui::layout::Alignment::Center),
-        )
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::LightCyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().bg(Color::Black)),
-        columns[0],
-    );
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                format!("{} {}", role_icon(&agent.role), sanitize(&agent.name)),
-                Style::default()
-                    .fg(role_color(&agent.role))
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                provider_option_label(provider),
-                Style::default().fg(Color::LightMagenta),
-            )),
-            Line::from(Span::styled(
-                sanitize(&app.model_config_input),
-                Style::default().fg(Color::LightCyan),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Applies to the next task",
-                Style::default().fg(Color::Gray),
-            )),
-        ])
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .title(" Preview ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(role_color(&agent.role))),
-        ),
-        columns[1],
-    );
-}
-
-fn role_config_line<'a>(label: &'a str, value: &'a str, selected: bool, choice: bool) -> Line<'a> {
-    let value = if choice {
-        format!("‹ {value} ›")
-    } else {
-        format!("{value}{}", if selected { "▏" } else { "" })
-    };
-    Line::from(vec![
-        Span::styled(
-            format!("  {label:<13}"),
-            if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            },
-        ),
-        Span::styled(
-            value,
-            if selected {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ),
-    ])
-}
-
-fn provider_option_label(provider: &ProviderRouteOption) -> String {
-    let base = match provider.kind.as_str() {
-        "ollama" => "Ollama · local",
-        "openai" => "OpenAI · cloud",
-        "codex_cli" => "Codex · CLI",
-        "claude_cli" => "Claude · CLI",
-        "mock" => "Mock · local",
-        value => value,
-    };
-    if provider.route == provider.kind {
-        base.into()
-    } else {
-        format!("{base} · {}", provider.route)
-    }
-}
-
-fn render_team_adjustment_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Every assignment and delegation decision routes through the Team Lead.",
-            Style::default().fg(Color::LightMagenta),
-        )),
-        Line::from("Specialists never dispatch work to one another."),
-        Line::from(""),
-    ];
-    if app.team_role_picker {
-        lines.push(Line::from(Span::styled(
-            "Choose a specialist role. Provider, model, and token limit inherit from the Team Lead.",
-            Style::default().fg(Color::Gray),
-        )));
-        lines.push(Line::from(""));
-        for (index, role) in ADDABLE_ROLES.iter().enumerate() {
-            let selected = index == app.team_role_selected;
-            lines.push(Line::from(Span::styled(
-                format!("{} {}", role.icon(), role.label()),
-                if selected {
-                    Style::default()
-                        .fg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            )));
-        }
-    } else {
-        for (index, agent) in app.agents.iter().enumerate() {
-            let selected = index == app.team_adjustment_selected;
-            let is_lead = Some(agent.id) == app.team_lead;
-            let state = if is_lead {
-                "required"
-            } else if agent.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            let style = if selected {
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if agent.enabled {
-                Style::default()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "[{}] {} · {}",
-                    if agent.enabled { "on " } else { "off" },
-                    sanitize(&agent.name),
-                    state
-                ),
-                style,
-            )));
-        }
-        lines.push(Line::from(""));
-        if let Some(notice) = &app.team_adjustment_notice {
-            lines.push(Line::from(Span::styled(
-                sanitize(notice),
-                Style::default().fg(if app.team_adjustment_saving {
-                    Color::Yellow
-                } else {
-                    Color::LightCyan
-                }),
-            )));
-            lines.push(Line::from(""));
-        }
-    }
-    let area = frame.area();
-    let item_count = if app.team_role_picker {
-        ADDABLE_ROLES.len()
-    } else {
-        app.agents.len()
-    };
-    let popup = centered_popup(
-        area,
-        area.width.saturating_sub(6).clamp(1, 76),
-        area.height
-            .saturating_sub(6)
-            .min(u16::try_from(item_count.saturating_add(9)).unwrap_or(u16::MAX))
-            .max(1),
-    );
-    let (title, footer) = if app.team_role_picker {
-        (
-            " Add specialist · Team Lead remains coordinator ",
-            " ↑/↓ choose · Enter/Space add · Esc back ",
-        )
-    } else {
-        (
-            " Adjust team · Team Lead remains required ",
-            " n add · ↑/↓ select · Enter/Space toggle · t/Esc close ",
-        )
-    };
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().bg(Color::Black))
-            .block(
-                Block::default()
-                    .title(title)
-                    .title_bottom(
-                        Line::from(footer)
-                            .style(Style::default().fg(Color::LightCyan))
-                            .alignment(ratatui::layout::Alignment::Center),
-                    )
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::LightMagenta)),
-            ),
-        popup,
-    );
 }
 
 fn compact_approval_area(area: Rect) -> Rect {
@@ -4542,7 +3737,7 @@ mod tests {
             (frontend_task.id, "frontend-event-hidden"),
         ] {
             app.apply_event(EngineEvent::Canonical(CanonicalEvent {
-                id: EventId::new(),
+                id: voff_core::EventId::new(),
                 session_id: app.session,
                 task_id: Some(task_id),
                 created_at: chrono::Utc::now(),
@@ -4629,209 +3824,77 @@ mod tests {
         assert!(rendered.contains("delegated"), "{rendered}");
     }
 
-    #[test]
-    fn team_adjustment_keeps_the_lead_and_toggles_an_idle_specialist() {
+    fn editable_team() -> AppModel {
         let mut app = AppModel::new(SessionId::new());
-        let lead = agent("Team Lead", "technical_lead", vec!["Backend".into()]);
-        let specialist = agent("Backend", "backend_developer", vec![]);
-        app.team_lead = Some(lead.id);
-        app.agents = vec![lead, specialist.clone()];
-        app.reduce(Action::AdjustTeam);
-
-        let enter = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ));
-        assert!(matches!(
-            app.handle_team_adjustment_event(&enter),
-            TeamAdjustmentEvent::Consumed
-        ));
-        assert!(
-            app.team_adjustment_notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("required"))
-        );
-
-        let down = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Down,
-            KeyModifiers::NONE,
-        ));
-        app.handle_team_adjustment_event(&down);
-        let TeamAdjustmentEvent::Save(updated) = app.handle_team_adjustment_event(&enter) else {
-            panic!("idle specialist should produce a persisted adjustment");
-        };
-        assert_eq!(updated.id, specialist.id);
-        assert!(!updated.enabled);
-        assert!(app.team_adjustment_saving);
+        app.agents = vec![agent("Team Lead", "technical_lead", vec![])];
+        app.team_setup = Some(crate::onboarding::SetupDraft {
+            developers: vec![crate::onboarding::DeveloperDraft::new(
+                "Team Lead",
+                crate::onboarding::DeveloperRole::Lead,
+                crate::onboarding::ProviderChoice::CodexCli,
+                "default",
+                16384,
+            )],
+            working_directory: ".".into(),
+        });
+        app
     }
 
     #[test]
-    fn team_lists_highlight_text_without_selector_glyphs() {
-        let mut app = AppModel::new(SessionId::new());
-        let lead = agent("Team Lead", "technical_lead", vec!["Backend".into()]);
-        app.team_lead = Some(lead.id);
-        app.agents = vec![lead, agent("Backend", "backend_developer", vec![])];
+    fn team_button_opens_the_common_intro_with_continue_control() {
+        let mut app = editable_team();
         app.reduce(Action::AdjustTeam);
-        let backend = TestBackend::new(90, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render_overlays(frame, &app)).unwrap();
-
+        assert!(app.setup_editor.is_some());
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(!rendered.contains('›'), "{rendered}");
-        assert!(
-            rendered.contains("[on ] Team Lead · required"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("voff team builder"));
+        assert!(rendered.contains("[c] Continue"));
+        assert!(rendered.contains("Developers"));
+        assert!(rendered.contains("Team settings"));
+        assert!(rendered.contains("Edit your current team"));
+        assert!(!rendered.contains("quick defaults"));
+        assert!(!rendered.contains("Adjust team"));
     }
 
     #[test]
-    fn selected_roles_can_change_configured_provider_and_model() {
-        let mut app = AppModel::new(SessionId::new());
-        let mut lead = agent("Team Lead", "technical_lead", vec![]);
-        lead.provider = "local-codex".into();
-        lead.model = "default".into();
-        app.agent_provider_kinds.insert(lead.id, "codex_cli".into());
-        app.provider_routes = vec![
-            ProviderRouteOption {
-                route: "local-codex".into(),
-                kind: "codex_cli".into(),
-            },
-            ProviderRouteOption {
-                route: "cloud".into(),
-                kind: "openai".into(),
-            },
-        ];
-        app.agents.push(lead.clone());
-
+    fn role_button_opens_the_same_editor_at_the_selected_role() {
+        let mut app = editable_team();
         app.reduce(Action::ConfigureModel);
-        assert!(app.model_config_open);
-        assert_eq!(app.model_config_field, RoleConfigField::Provider);
-        assert_eq!(app.model_config_input, "default");
-        assert_eq!(app.model_config_selected, Some(0));
-
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render_overlays(frame, &app)).unwrap();
+        assert!(app.setup_editor.is_some());
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("Configure role"), "{rendered}");
-        assert!(rendered.contains("Provider"), "{rendered}");
-        assert!(rendered.contains("Codex · CLI"), "{rendered}");
-        assert!(rendered.contains("Model"), "{rendered}");
-        assert!(rendered.contains("Preview"), "{rendered}");
-
-        let right = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        ));
-        assert!(matches!(
-            app.handle_model_config_event(&right),
-            ModelConfigEvent::Consumed
-        ));
-        assert_eq!(app.model_config_provider, 1);
-        assert_eq!(app.model_config_input, "gpt-5-mini");
-        let down = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Down,
-            KeyModifiers::NONE,
-        ));
-        app.handle_model_config_event(&down);
-        assert_eq!(app.model_config_field, RoleConfigField::Model);
-        assert!(matches!(
-            app.handle_model_config_event(&Event::Paste("gpt-5.4".into())),
-            ModelConfigEvent::Consumed
-        ));
-        let enter = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ));
-        let ModelConfigEvent::Save(updated) = app.handle_model_config_event(&enter) else {
-            panic!("a valid custom model should be persisted");
-        };
-        assert_eq!(updated.id, lead.id);
-        assert_eq!(updated.provider, "cloud");
-        assert_eq!(updated.model, "gpt-5.4");
-        assert!(app.model_config_saving);
+        assert!(rendered.contains("voff team builder"));
+        assert!(rendered.contains("Codex · CLI"));
+        assert!(!rendered.contains("API token"));
     }
 
     #[test]
-    fn team_adjustment_adds_a_unique_non_delegating_backend_draft() {
-        let mut app = AppModel::new(SessionId::new());
-        let lead = agent(
-            "Team Lead",
-            "technical_lead",
-            vec!["Backend Developer".into()],
-        );
-        app.team_lead = Some(lead.id);
-        app.agents = vec![
-            lead.clone(),
-            agent("Backend Developer", "backend_developer", vec![]),
-        ];
-        app.reduce(Action::AdjustTeam);
-
-        let add = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Char('n'),
-            KeyModifiers::NONE,
-        ));
-        assert!(matches!(
-            app.handle_team_adjustment_event(&add),
-            TeamAdjustmentEvent::Consumed
-        ));
-        assert!(app.team_role_picker);
-        let enter = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ));
-        let TeamAdjustmentEvent::Add(member) = app.handle_team_adjustment_event(&enter) else {
-            panic!("the selected backend role should create a specialist draft");
-        };
-
-        assert_eq!(member.name, "Backend Developer 2");
-        assert_eq!(member.role, "backend_developer");
-        assert_eq!(member.provider, lead.provider);
-        assert_eq!(member.model, lead.model);
-        assert!(member.allowed_targets.is_empty());
-        assert!(!member.tools.contains(&"task.delegate".into()));
-        assert!(!member.tools.contains(&"review.request".into()));
-    }
-
-    #[test]
-    fn team_adjustment_refuses_to_disable_a_specialist_with_active_work() {
-        let mut app = AppModel::new(SessionId::new());
-        let lead = agent("Team Lead", "technical_lead", vec!["Backend".into()]);
-        let specialist = agent("Backend", "backend_developer", vec![]);
-        app.team_lead = Some(lead.id);
-        app.agents = vec![lead, specialist.clone()];
-        let mut task = Task::root(
-            specialist.id,
-            "bounded backend work",
+    fn team_changes_are_blocked_until_pending_work_is_settled() {
+        let mut app = editable_team();
+        app.tasks.push(Task::root(
+            app.agents[0].id,
+            "pending work",
             vec![],
             voff_core::TaskLimits::default(),
-        );
-        task.transition(TaskStatus::Ready).unwrap();
-        app.tasks.push(task);
-        app.reduce(Action::AdjustTeam);
-        app.team_adjustment_selected = 1;
-
-        let enter = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
         ));
-        assert!(matches!(
-            app.handle_team_adjustment_event(&enter),
-            TeamAdjustmentEvent::Consumed
-        ));
-        assert!(
-            app.team_adjustment_notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("active work"))
-        );
-        assert!(!app.team_adjustment_saving);
+        for action in [Action::AdjustTeam, Action::ConfigureModel] {
+            app.reduce(action);
+            assert!(app.setup_editor.is_none());
+            assert!(
+                app.composer_notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Finish or cancel")
+            );
+        }
     }
 
     #[test]
@@ -5165,7 +4228,8 @@ mod tests {
         );
         assert!(!composer.contains("/task assign"), "{composer}");
         assert!(!composer.contains("/tasks browse"), "{composer}");
-        assert!(composer.contains("[R] Quick Run"), "{composer}");
+        assert!(composer.contains("[R]"), "{composer}");
+        assert!(!composer.contains("Quick Run"), "{composer}");
         assert!(!composer.contains("1/2/3 views"), "{composer}");
         let bottom_border = (0..buffer.area.width)
             .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
@@ -5188,10 +4252,6 @@ mod tests {
         );
         assert_eq!(
             buffer[(hint_x + 2, buffer.area.height - 1)].fg,
-            Color::White
-        );
-        assert_eq!(
-            buffer[(hint_x + 4, buffer.area.height - 1)].fg,
             Color::White
         );
         let cwd = bottom_border

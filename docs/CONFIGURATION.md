@@ -55,25 +55,20 @@ highlighted directory, Left/`h` returns to its parent, and Space accepts the
 currently displayed directory. Esc first finishes or clears an active filter
 and then preserves the previous workspace selection.
 
-After launch, `t` opens a modal team adjustment surface. It changes an idle
-specialist's enabled state for future assignments in the active runtime, and
-`n` adds another specialist from the safe Backend, Frontend, Full-stack,
-Reviewer, Tester, or DevOps presets. Added specialists inherit the Team Lead's
-provider, model, and token limit, receive role-appropriate tools, and have no
-delegation targets. The required Team Lead cannot be disabled, and active or
-approval-pending work blocks availability changes. Accepted changes update
-persisted agent profiles and append audit events. Runtime additions apply to the
-active run; durable membership/provider/model customization still requires a
-validated configuration update and a new run.
+After launch, `t` opens the same team builder used at startup, prefilled with
+the current team. Its first page is **Team settings**, with a visible
+`[c] Continue` control. Reopening says **Edit your current team**, not quick
+defaults. Existing choices are preserved when continuing; changing the count
+adds or removes trailing roles. The active workspace stays fixed.
 
-With a role highlighted in Team, `c` opens a setup-style provider and model
-configuration surface. Up/Down or Tab moves between fields. Left/Right selects
-one of the provider routes already configured for the workspace and then
-browses that provider's discovered models; typing in the Model field replaces
-it with an exact model ID. Enter persists the active role profile and Esc
-cancels. The engine loads that profile for the role's next task. This runtime
-choice applies to the active run; add durable provider routes and role defaults
-to `.voff/config.toml` when they must survive a restart.
+With a role highlighted, `c` opens that role in the same builder. Tab/Up/Down
+moves between fields; Left/Right changes choices. Cloud roles show an optional
+masked API-token field on their own page; Ollama and CLI roles do not.
+The final review saves the team to workspace configuration (backing up the
+previous file), reloads provider routes, and returns to the same session.
+Pending work must finish or be cancelled first. Esc goes back; Esc on the first
+page cancels without saving. Custom roles/providers not representable by guided
+setup are refused rather than silently converted to presets.
 
 Launching or resuming a workspace creates no implicit task. Press Enter and
 describe explicit work, or press capital `R` for Quick Run. The Team Lead may
@@ -282,10 +277,12 @@ directory only, before configuration and authentication resolution. Existing
 process variables take precedence; a missing file is harmless. Malformed or
 unreadable files fail with a safe error. Never commit `.env`.
 
-Interactive setup offers an optional field for the actual OpenAI API token if
-the selected team needs it and no credential already exists. Enter skips it,
-so credentials never block workspace launch. Press `A` in the running
-workspace to enter the token later without restarting. Input is masked and
+Each OpenAI role has an optional masked API-token field beside its provider
+and model, even when another role already has credentials. Blank retains the
+existing reference, or uses `OPENAI_API_KEY` for a new role. Entering a token
+creates a separate opaque credential reference for that role; other roles'
+tokens are never overwritten. Use `t` or `c` to replace it later.
+Local providers never show this field. Values are
 stored in the workspace-local SQLite database at `.voff/voff.db`. The value is
 never serialized to project configuration, prompts, logs, or exports. This is
 a deliberately simple temporary mechanism: the token is plaintext at rest,
@@ -319,7 +316,20 @@ api_key_env = "OPENAI_API_KEY"
 the required structured-output and safety flags. An older CLI fails with an
 actionable update message instead of starting an unsafe or unstructured run.
 
-No TOML migration is required.
+No TOML or SQLite schema migration is required. Saved teams use one named
+provider route per role. Old shared references continue to work until a role
+receives its own token. Only lookup names appear in configuration, for example:
+
+```toml
+[[providers]]
+id = "openai-developer-1"
+kind = "openai"
+model = "gpt-5-mini"
+api_key_env = "VOFF_OPENAI_ROLE_AGT_EXAMPLE"
+```
+
+The environment override applies to that exact lookup name; `OPENAI_API_KEY`
+does not override a separately entered role token.
 
 - Config stores only environment-variable/database lookup names.
 - The UI displays whether a credential is available, never its value, and
@@ -349,7 +359,7 @@ Markdown requirements with the source, prioritize bounded tasks, delegate
 independent workstreams when specialists are available, execute approved work,
 and validate the results. The UI switches to Tasks immediately and marks the
 workflow `R QUICK RUN`; all delegation and side-effect approvals still apply.
-The inactive composer keeps a centered white `[R] Quick Run` label on its
+The inactive composer keeps a centered white `[R]` label on its
 bottom border; the workspace header is reserved for view and runtime status.
 
 In the Tasks view, lowercase `r` creates and runs a new attempt for the selected
