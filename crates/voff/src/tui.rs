@@ -18,7 +18,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use ratatui_notifications::{
     Anchor, Animation, AutoDismiss, Level, Notification, Notifications, SizeConstraint,
@@ -101,7 +104,22 @@ struct ScopedEvent {
     task_id: Option<voff_core::TaskId>,
     text: String,
     is_output: bool,
-    workflow: Option<String>,
+    headline: Option<&'static str>,
+    related_task: Option<voff_core::TaskId>,
+    source_task: Option<voff_core::TaskId>,
+    accent: Color,
+    approval_id: Option<voff_core::ApprovalId>,
+    tool_call_id: Option<voff_core::ToolCallId>,
+    review: Option<ReviewContext>,
+    conversational: bool,
+    speaker: Option<AgentId>,
+    details_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewContext {
+    reviewer: AgentId,
+    decision: Option<(bool, String)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -279,6 +297,7 @@ impl AppModel {
         }
         let current = self.active_tab();
         if current != tab {
+            self.task_inspector_scroll = 0;
             self.notifications.clear();
             self.transient_notification_ids.clear();
             self.team_hint_id = None;
@@ -358,7 +377,7 @@ impl AppModel {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
                     self.event_follow = self.event_scroll == 0;
                 } else if self.active_role_tab.is_some() {
-                    self.role_scroll = self.role_scroll.saturating_sub(1);
+                    self.role_scroll = self.role_scroll.saturating_add(1);
                 } else if self.panel == Panel::Agents {
                     self.selected_agent = self.selected_agent.saturating_sub(1);
                 } else {
@@ -374,7 +393,7 @@ impl AppModel {
                         .min(self.event_scroll_limit());
                     self.event_follow = self.event_scroll == 0;
                 } else if self.active_role_tab.is_some() {
-                    self.role_scroll = self.role_scroll.saturating_add(1);
+                    self.role_scroll = self.role_scroll.saturating_sub(1);
                 } else if self.panel == Panel::Agents {
                     if self.selected_agent + 1 < self.agents.len() {
                         self.selected_agent += 1;
@@ -389,9 +408,9 @@ impl AppModel {
                     self.event_scroll = self.event_scroll.saturating_sub(10);
                     self.event_follow = self.event_scroll == 0;
                 } else if self.active_role_tab.is_some() {
-                    self.role_scroll = self.role_scroll.saturating_sub(10);
+                    self.role_scroll = self.role_scroll.saturating_add(10);
                 } else if self.panel == Panel::Tasks {
-                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(10);
+                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(10);
                 }
             }
             Action::PageDown => {
@@ -402,9 +421,9 @@ impl AppModel {
                         .min(self.event_scroll_limit());
                     self.event_follow = self.event_scroll == 0;
                 } else if self.active_role_tab.is_some() {
-                    self.role_scroll = self.role_scroll.saturating_add(10);
+                    self.role_scroll = self.role_scroll.saturating_sub(10);
                 } else if self.panel == Panel::Tasks {
-                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(10);
+                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(10);
                 }
             }
             Action::FitTeam if self.panel == Panel::Agents => self.team_flow.fit_view(),
@@ -439,6 +458,7 @@ impl AppModel {
             Action::ToggleExpanded => {
                 self.expanded_output = !self.expanded_output;
                 self.task_inspector_scroll = 0;
+                self.role_scroll = 0;
                 self.event_scroll = 0;
             }
             Action::NextPanel => {
@@ -536,8 +556,8 @@ impl AppModel {
         }
         if self.active_role_tab.is_some() {
             match mouse.kind {
-                MouseEventKind::ScrollUp => self.role_scroll = self.role_scroll.saturating_sub(3),
-                MouseEventKind::ScrollDown => self.role_scroll = self.role_scroll.saturating_add(3),
+                MouseEventKind::ScrollUp => self.role_scroll = self.role_scroll.saturating_add(3),
+                MouseEventKind::ScrollDown => self.role_scroll = self.role_scroll.saturating_sub(3),
                 _ => {}
             }
             return;
@@ -566,7 +586,7 @@ impl AppModel {
                 }
                 MouseEventKind::ScrollUp => {
                     if over_inspector {
-                        self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(3);
+                        self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(3);
                     } else {
                         self.selected = self.selected.saturating_sub(1);
                         self.task_inspector_scroll = 0;
@@ -575,7 +595,7 @@ impl AppModel {
                 }
                 MouseEventKind::ScrollDown => {
                     if over_inspector {
-                        self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(3);
+                        self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(3);
                     } else if self.selected + 1 < self.tasks.len() {
                         self.selected += 1;
                         self.task_inspector_scroll = 0;
@@ -1379,10 +1399,11 @@ impl AppModel {
         {
             let clean = sanitize(delta);
             if was_streaming
-                && self
-                    .scoped_events
-                    .last()
-                    .is_some_and(|event| event.task_id == task_id)
+                && self.scoped_events.last().is_some_and(|event| {
+                    event.task_id == task_id
+                        && event.details_only
+                            == matches!(kind, CanonicalEventKind::GenerationDelta(_))
+                })
             {
                 if let Some(last) = self.scoped_events.last_mut() {
                     last.text.push_str(&clean);
@@ -1392,19 +1413,113 @@ impl AppModel {
                     task_id,
                     text: clean,
                     is_output: true,
-                    workflow: None,
+                    headline: Some("Response · preview"),
+                    related_task: None,
+                    source_task: None,
+                    accent: theme::BLUE,
+                    approval_id: None,
+                    tool_call_id: None,
+                    review: None,
+                    conversational: true,
+                    speaker: None,
+                    details_only: matches!(kind, CanonicalEventKind::GenerationDelta(_)),
                 });
             }
         } else {
             self.scoped_events.push(ScopedEvent {
                 task_id,
-                text: description,
+                text: match kind {
+                    CanonicalEventKind::RevisionRequested { feedback, .. } => {
+                        format!("Revise and resubmit: {}", sanitize(feedback))
+                    }
+                    _ => description,
+                },
                 is_output: false,
-                workflow: workflow_step(kind).map(|step| {
-                    reviewer
-                        .as_deref()
-                        .map_or_else(|| step.to_owned(), |name| step.replace("Team Lead", name))
-                }),
+                details_only: matches!(
+                    kind,
+                    CanonicalEventKind::ToolProposed { .. }
+                        | CanonicalEventKind::LeadReviewStarted { .. }
+                        | CanonicalEventKind::LeadReviewFinished { approved: true, .. }
+                        | CanonicalEventKind::WorkRecoveryRequested { .. }
+                ),
+                headline: activity_headline(kind),
+                approval_id: match kind {
+                    CanonicalEventKind::ApprovalRequested { approval_id, .. }
+                    | CanonicalEventKind::ApprovalDecided { approval_id, .. }
+                    | CanonicalEventKind::RevisionRequested { approval_id, .. } => {
+                        Some(*approval_id)
+                    }
+                    CanonicalEventKind::LeadReviewStarted { approval_id, .. }
+                    | CanonicalEventKind::LeadReviewFinished { approval_id, .. } => *approval_id,
+                    _ => None,
+                },
+                tool_call_id: match kind {
+                    CanonicalEventKind::ToolProposed { tool_call_id, .. } => Some(*tool_call_id),
+                    _ => None,
+                },
+                review: match kind {
+                    CanonicalEventKind::LeadReviewStarted { lead, .. } => Some(ReviewContext {
+                        reviewer: *lead,
+                        decision: None,
+                    }),
+                    CanonicalEventKind::LeadReviewFinished {
+                        lead,
+                        approved,
+                        reason,
+                        ..
+                    } => Some(ReviewContext {
+                        reviewer: *lead,
+                        decision: Some((*approved, sanitize(reason))),
+                    }),
+                    _ => None,
+                },
+                conversational: matches!(
+                    kind,
+                    CanonicalEventKind::TaskDelegated { .. }
+                        | CanonicalEventKind::ToolProposed { .. }
+                        | CanonicalEventKind::LeadReviewStarted { .. }
+                        | CanonicalEventKind::LeadReviewFinished { .. }
+                        | CanonicalEventKind::RevisionRequested { .. }
+                        | CanonicalEventKind::WorkRecoveryRequested { .. }
+                        | CanonicalEventKind::RevisionStopped(_)
+                        | CanonicalEventKind::ProviderFailed(_)
+                        | CanonicalEventKind::TaskResultPublished { .. }
+                ),
+                speaker: match kind {
+                    CanonicalEventKind::LeadReviewFinished { lead, .. } => Some(*lead),
+                    CanonicalEventKind::RevisionRequested { .. } => task_id
+                        .and_then(|id| self.tasks.iter().find(|task| task.id == id))
+                        .and_then(|task| task.parent)
+                        .and_then(|id| self.tasks.iter().find(|task| task.id == id))
+                        .map(|task| task.owner),
+                    _ => None,
+                },
+                related_task: match kind {
+                    CanonicalEventKind::TaskDelegated { child, .. } => Some(*child),
+                    CanonicalEventKind::DependencyAdded { depends_on, .. } => Some(*depends_on),
+                    _ => None,
+                },
+                source_task: match kind {
+                    CanonicalEventKind::TaskDelegated { parent, .. } => Some(*parent),
+                    CanonicalEventKind::DependencyAdded { task, .. } => Some(*task),
+                    _ => None,
+                },
+                accent: match kind {
+                    CanonicalEventKind::LeadReviewFinished { approved: true, .. }
+                    | CanonicalEventKind::ProcessFinished {
+                        exit_code: Some(0), ..
+                    }
+                    | CanonicalEventKind::TaskResultPublished { .. } => theme::GREEN,
+                    CanonicalEventKind::LeadReviewFinished {
+                        approved: false, ..
+                    }
+                    | CanonicalEventKind::ProcessFinished { .. }
+                    | CanonicalEventKind::ProviderFailed(_) => theme::RED,
+                    CanonicalEventKind::LeadReviewStarted { .. }
+                    | CanonicalEventKind::RevisionRequested { .. }
+                    | CanonicalEventKind::TaskDelegated { .. } => theme::AQUA,
+                    _ => event_text_color(&format_event(kind)),
+                },
             });
         }
         self.on_events_changed();
@@ -1419,6 +1534,8 @@ impl AppModel {
     }
 
     fn on_events_changed(&mut self) {
+        self.role_scroll = 0;
+        self.task_inspector_scroll = 0;
         if self.event_follow {
             self.event_scroll = 0;
         } else {
@@ -1544,26 +1661,44 @@ fn action_for_event(value: Event) -> Action {
     }
 }
 
-fn workflow_step(kind: &CanonicalEventKind) -> Option<&'static str> {
+fn activity_headline(kind: &CanonicalEventKind) -> Option<&'static str> {
     match kind {
-        CanonicalEventKind::LeadReviewStarted {
-            approval_id: Some(_),
-            ..
-        } => Some("Developer → Team Lead · REVIEW"),
-        CanonicalEventKind::LeadReviewStarted {
-            approval_id: None, ..
-        } => Some("Developer → Team Lead · DIAGNOSIS"),
-        CanonicalEventKind::LeadReviewFinished { approved: true, .. } => {
-            Some("Team Lead · APPROVED")
-        }
+        CanonicalEventKind::TaskDelegated { .. } => Some("↳ Delegated"),
+        CanonicalEventKind::DependencyAdded { .. } => Some("Waiting for another task"),
+        CanonicalEventKind::LeadReviewStarted { .. } => Some("↶ Sent for review"),
+        CanonicalEventKind::LeadReviewFinished { approved: true, .. } => Some("✓ Approved"),
         CanonicalEventKind::LeadReviewFinished {
             approved: false, ..
-        } => Some("Team Lead · REJECTED"),
-        CanonicalEventKind::RevisionRequested { .. } => {
-            Some("Team Lead → Developer · REVISE & RESUBMIT")
+        } => Some("↶ Changes requested"),
+        CanonicalEventKind::RevisionRequested { .. } => Some("↳ Feedback returned"),
+        CanonicalEventKind::TaskRetried { .. } => Some("↻ New attempt"),
+        CanonicalEventKind::WorkRecoveryRequested { .. } => Some("↶ Diagnosis requested"),
+        CanonicalEventKind::RevisionStopped(_) | CanonicalEventKind::ApplicationIssue(_) => {
+            Some("! Needs attention")
         }
-        CanonicalEventKind::RevisionStopped(_) => Some("STOPPED · needs attention"),
-        CanonicalEventKind::TaskRetried { .. } => Some("Developer · NEW ATTEMPT"),
+        CanonicalEventKind::ProviderFailed(_) | CanonicalEventKind::PatchConflict { .. } => {
+            Some("! Problem")
+        }
+        CanonicalEventKind::ProviderWarning(_) | CanonicalEventKind::ProviderRetrying { .. } => {
+            Some("! Provider update")
+        }
+        CanonicalEventKind::ToolProposed { .. } => Some("Action proposed"),
+        CanonicalEventKind::ProcessFinished { .. } => Some("Check finished"),
+        CanonicalEventKind::ArtifactPublished { .. } => Some("Artifact recorded"),
+        CanonicalEventKind::TaskResultPublished { .. } => Some("✓ Result"),
+        CanonicalEventKind::TaskTransition {
+            to: TaskStatus::Running,
+            ..
+        } => Some("▶ Working"),
+        CanonicalEventKind::TaskTransition {
+            to: TaskStatus::Completed,
+            ..
+        } => Some("✓ Completed"),
+        CanonicalEventKind::TaskTransition {
+            to: TaskStatus::Blocked | TaskStatus::Failed,
+            ..
+        } => Some("! Stopped"),
+        CanonicalEventKind::TaskCancelled => Some("× Cancelled"),
         _ => None,
     }
 }
@@ -2596,12 +2731,7 @@ fn render_role_workspace(
     };
     let latest = app.tasks.iter().find(|task| task.owner == id);
     let mut activity = Vec::new();
-    for (_, message) in app
-        .role_requests
-        .iter()
-        .filter(|(target, _)| *target == id)
-        .rev()
-    {
+    for (_, message) in app.role_requests.iter().filter(|(target, _)| *target == id) {
         activity.push(Line::from(Span::styled(
             " You → Team Lead · requested this role",
             Style::default()
@@ -2609,42 +2739,32 @@ fn render_role_workspace(
                 .add_modifier(Modifier::BOLD),
         )));
         for line in compact_text(&sanitize(message), false, false).lines() {
-            activity.push(Line::from(format!("  {line}")));
+            activity.push(Line::from(format!("  {line}")).style(Style::default().fg(theme::TEXT)));
         }
         activity.push(Line::from(""));
     }
     if let Some(task) = latest {
-        activity.extend(role_activity_lines(app, task));
+        activity.extend(role_activity_lines(app, task, area.width.saturating_sub(2)));
     } else if activity.is_empty() {
         activity.push(Line::from("No activity for this role yet."));
     }
-    app.role_scroll = app
-        .role_scroll
-        .min(u16::try_from(activity.len().saturating_sub(1)).unwrap_or(u16::MAX));
-    frame.render_widget(
-        Paragraph::new(activity)
-            .wrap(Wrap { trim: true })
-            .scroll((app.role_scroll, 0))
-            .block(panel(
-                &format!(" {} · Activity · ↑/↓ scroll ", sanitize(&agent.name)),
-                true,
-            )),
+    render_chat(
+        frame,
+        activity,
+        panel(
+            &format!(" {} · Activity · ↑/↓ scroll ", sanitize(&agent.name)),
+            true,
+        ),
         area,
+        &mut app.role_scroll,
     );
 }
 
 fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
-    let panes = if area.width >= 88 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(area)
-    };
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(area);
     let browser = panes[0];
     let inspector = panes[1];
     app.task_list_hitbox = browser;
@@ -2770,6 +2890,21 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
             List::new(items).block(panel(&browser_title, true).border_type(BorderType::Rounded)),
             browser,
         );
+        let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
+            .position(start)
+            .viewport_content_length(visible);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(Style::default().fg(theme::BORDER))
+                .thumb_style(Style::default().fg(theme::AQUA)),
+            browser.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar,
+        );
     }
 
     let Some(task) = app.selected_task().cloned() else {
@@ -2783,28 +2918,75 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
     };
     let mut lines = task_detail_lines(app, &task);
     lines.push(Line::from(""));
-    push_section(&mut lines, "ACTIVITY · newest first", theme::AQUA);
-    lines.extend(role_activity_lines(app, &task));
+    lines.push(conversation_heading(app, &task));
+    let pair = reporting_pair(app, &task);
+    let mut thread = task_thread_ids(&app.tasks, task.id);
+    if pair.is_some() {
+        thread.retain(|id| {
+            app.tasks
+                .iter()
+                .any(|candidate| candidate.id == *id && candidate.owner == task.owner)
+        });
+    }
+    lines.extend(conversation_lines(
+        app,
+        &thread,
+        inspector.width.saturating_sub(2),
+        pair,
+    ));
     let footer = format!(
         " [v] {} · [r] re-run · PgUp/PgDn scroll ",
         if app.expanded_output {
-            "collapse"
+            "compact"
         } else {
-            "expand"
+            "details"
         }
     );
     app.task_expand_hitbox = title_action_hitbox(inspector, &footer, "[v]", 4, false);
     app.task_retry_hitbox = title_action_hitbox(inspector, &footer, "[r]", 4, false);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.task_inspector_scroll, 0))
-            .block(
-                panel(" Inspector ", true)
-                    .title_bottom(footer)
-                    .border_type(BorderType::Rounded),
-            ),
+    render_chat(
+        frame,
+        lines,
+        panel(" Inspector ", true)
+            .title_bottom(footer)
+            .border_type(BorderType::Rounded),
         inspector,
+        &mut app.task_inspector_scroll,
+    );
+}
+
+fn render_chat(
+    frame: &mut ratatui::Frame<'_>,
+    lines: Vec<Line<'static>>,
+    block: Block<'_>,
+    area: Rect,
+    from_bottom: &mut u16,
+) {
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = usize::from(inner.height);
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(height)
+        .min(usize::from(u16::MAX));
+    *from_bottom = (*from_bottom).min(max_scroll as u16);
+    let position = max_scroll.saturating_sub(usize::from(*from_bottom));
+    frame.render_widget(block, area);
+    frame.render_widget(paragraph.scroll((position as u16, 0)), inner);
+    let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
+        .position(position)
+        .viewport_content_length(height);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_style(Style::default().fg(theme::BORDER))
+            .thumb_style(Style::default().fg(theme::AQUA)),
+        area.inner(Margin {
+            horizontal: 0,
+            vertical: 1,
+        }),
+        &mut state,
     );
 }
 
@@ -2820,6 +3002,79 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         ),
         Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
     ]));
+    if !app.expanded_output {
+        push_text_lines(
+            &mut lines,
+            &truncate_text(&one_line(&sanitize(&task.objective)), 180),
+            " ",
+        );
+        if let Some(result) = &task.result {
+            push_section(&mut lines, "OUTCOME", theme::GREEN);
+            push_text_lines(
+                &mut lines,
+                &compact_text(&sanitize(&result.summary), false, false),
+                " ",
+            );
+        } else if app.lead_reviews.contains_key(&task.id) {
+            lines.push(Line::from(Span::styled(
+                " ↶ Awaiting reporting agent review",
+                Style::default().fg(theme::AQUA),
+            )));
+        }
+        let thread = task_thread_ids(&app.tasks, task.id);
+        let mut children = app
+            .tasks
+            .iter()
+            .filter(|child| child.id != task.id && thread.contains(&child.id))
+            .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.created_at);
+        if !children.is_empty() {
+            lines.push(Line::from(""));
+            push_section(&mut lines, "DELEGATION", theme::AQUA);
+            for child in children {
+                let (icon, status, color) = task_status_visual(child.status);
+                let name = app.agent_for_owner(child.owner).map_or_else(
+                    || short_agent_id(child.owner),
+                    |agent| sanitize(&agent.name),
+                );
+                let parent = child
+                    .parent
+                    .and_then(|id| app.tasks.iter().find(|task| task.id == id))
+                    .and_then(|task| app.agent_for_owner(task.owner))
+                    .map_or("Team Lead", |agent| agent.name.as_str());
+                let stage = if child.work.as_ref().is_some_and(|work| work.integration) {
+                    " · integration"
+                } else {
+                    ""
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(" {icon} {} → {name}{stage} · {status}", sanitize(parent)),
+                    Style::default().fg(color),
+                )));
+                lines.push(Line::from(format!(
+                    "   {}",
+                    truncate_text(&one_line(&sanitize(&child.objective)), 90)
+                )));
+            }
+        }
+        for artifact in app
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer == task.id)
+            .rev()
+            .take(3)
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " ▸ {} · {}",
+                    sanitize(&artifact.location),
+                    sanitize(&artifact.kind)
+                ),
+                Style::default().fg(theme::PURPLE),
+            )));
+        }
+        return lines;
+    }
     lines.push(Line::from(Span::styled(
         format!(" {}  ·  attempt {}", task.id, task.attempt),
         Style::default().fg(theme::TEXT),
@@ -2966,141 +3221,311 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
     lines
 }
 
-fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
-    let agent = app.agent_for_owner(selected.owner);
-    let owner = agent.map_or_else(
-        || short_agent_id(selected.owner),
-        |agent| sanitize(&agent.name),
-    );
-    let mut lines = vec![Line::from(Span::styled(
-        format!(" {owner} · all role events"),
-        Style::default().fg(theme::TEXT),
-    ))];
-    push_review_loop(&mut lines, app, selected);
-    let mut count = 0usize;
-    for event in app.scoped_events.iter().rev() {
+fn task_thread_ids(tasks: &[Task], selected: voff_core::TaskId) -> HashSet<voff_core::TaskId> {
+    let mut ids = HashSet::from([selected]);
+    loop {
+        let before = ids.len();
+        for task in tasks {
+            if task.parent.is_some_and(|id| ids.contains(&id))
+                || task.retry_of.is_some_and(|id| ids.contains(&id))
+            {
+                ids.insert(task.id);
+            }
+            if ids.contains(&task.id)
+                && let Some(previous) = task.retry_of
+            {
+                ids.insert(previous);
+            }
+        }
+        if ids.len() == before {
+            return ids;
+        }
+    }
+}
+
+fn reporting_pair(app: &AppModel, selected: &Task) -> Option<(AgentId, AgentId)> {
+    let owner = app.agent_for_owner(selected.owner)?;
+    let parent = app
+        .agents
+        .iter()
+        .find(|agent| agent.allowed_targets.contains(&owner.name))
+        .map(|agent| agent.id)
+        .or_else(|| {
+            selected
+                .parent
+                .and_then(|id| app.tasks.iter().find(|task| task.id == id))
+                .map(|task| task.owner)
+        })?;
+    (parent != selected.owner).then_some((selected.owner, parent))
+}
+
+fn conversation_heading(app: &AppModel, selected: &Task) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " CONVERSATION",
+        Style::default()
+            .fg(theme::TEXT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some((worker, lead)) = reporting_pair(app, selected) {
+        for (separator, id) in [(" · ", worker), (" ↔ ", lead)] {
+            if let Some(agent) = app.agent_for_owner(id) {
+                spans.push(Span::raw(separator));
+                spans.push(Span::styled(
+                    sanitize(&agent.name),
+                    Style::default()
+                        .fg(role_color(&agent.role))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+fn role_activity_lines(app: &AppModel, selected: &Task, width: u16) -> Vec<Line<'static>> {
+    let ids = app
+        .tasks
+        .iter()
+        .filter(|task| task.owner == selected.owner)
+        .map(|task| task.id)
+        .collect();
+    let mut heading = conversation_heading(app, selected);
+    heading.spans.push(Span::raw(" · [v] details"));
+    let mut lines = vec![heading];
+    lines.extend(conversation_lines(
+        app,
+        &ids,
+        width,
+        reporting_pair(app, selected),
+    ));
+    lines
+}
+
+fn conversation_lines(
+    app: &AppModel,
+    ids: &HashSet<voff_core::TaskId>,
+    width: u16,
+    pair: Option<(AgentId, AgentId)>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut previous_thread = None;
+    let mut review_numbers = HashMap::new();
+    for event in &app.scoped_events {
         let Some(task_id) = event.task_id else {
             continue;
         };
+        if !event.conversational || (!app.expanded_output && event.details_only) {
+            continue;
+        }
+        if (!ids.contains(&task_id) && !event.related_task.is_some_and(|id| ids.contains(&id)))
+            || (!app.expanded_output && event.headline.is_none())
+        {
+            continue;
+        }
         let Some(task) = app.tasks.iter().find(|task| task.id == task_id) else {
             continue;
         };
-        if task.owner != selected.owner {
+        let source = event
+            .source_task
+            .and_then(|id| app.tasks.iter().find(|task| task.id == id))
+            .unwrap_or(task);
+        if let Some((worker, lead)) = pair
+            && (task.owner != worker
+                || event
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.reviewer != lead)
+                || task
+                    .parent
+                    .and_then(|id| app.tasks.iter().find(|parent| parent.id == id))
+                    .is_some_and(|parent| parent.owner != lead)
+                || (event.source_task.is_some() && source.owner != lead))
+        {
             continue;
         }
-        count += 1;
-        let objective = truncate_text(&one_line(&sanitize(&task.objective)), 52);
-        lines.push(Line::from(vec![
-            Span::styled(task_event_prefix(task.id), Style::default().fg(theme::BLUE)),
-            Span::styled(objective, Style::default().add_modifier(Modifier::BOLD)),
-        ]));
-        let event_style = Style::default().fg(event_text_color(&event.text));
-        let visible = if event.is_output && !app.expanded_output {
-            "Provider output hidden · [v] expand".to_owned()
-        } else {
-            compact_text(&event.text, app.expanded_output, event.is_output)
-        };
-        for event_line in visible.lines() {
-            lines.push(Line::from(Span::styled(event_line.to_owned(), event_style)));
+        let color = app
+            .agent_for_owner(event.speaker.unwrap_or(source.owner))
+            .map_or(event.accent, |agent| role_color(&agent.role));
+        let owner = app.agent_for_owner(source.owner).map_or_else(
+            || short_agent_id(source.owner),
+            |agent| sanitize(&agent.name),
+        );
+        let related = event
+            .related_task
+            .and_then(|id| app.tasks.iter().find(|task| task.id == id));
+        let approval_id = event.approval_id.or_else(|| {
+            event.tool_call_id.and_then(|id| {
+                app.approvals
+                    .iter()
+                    .find(|approval| approval.tool_call_id == id)
+                    .map(|approval| approval.id)
+            })
+        });
+        let thread = (
+            task_id,
+            if app.expanded_output {
+                approval_id
+            } else {
+                None
+            },
+        );
+        let connected = previous_thread == Some(thread);
+        let action = approval_id
+            .and_then(|id| app.approvals.iter().find(|approval| approval.id == id))
+            .map_or("proposal", |approval| approval.action.as_str());
+        if !connected {
+            let (heading, heading_color) =
+                if let Some(id) = approval_id.filter(|_| app.expanded_output) {
+                    let next = review_numbers.len() + 1;
+                    let number = review_numbers.entry(id).or_insert(next);
+                    (
+                        format!(" Review {number} · {}", sanitize(action)),
+                        theme::TEXT,
+                    )
+                } else {
+                    (
+                        format!(" {owner}"),
+                        app.agent_for_owner(source.owner)
+                            .map_or(theme::TEXT, |agent| role_color(&agent.role)),
+                    )
+                };
+            for row in textwrap::wrap(&heading, usize::from(width.max(1))) {
+                lines.push(Line::from(Span::styled(
+                    row.into_owned(),
+                    Style::default()
+                        .fg(heading_color)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
         }
-        lines.push(Line::from(""));
+        let mut title = event.headline.unwrap_or("Details").to_owned();
+        if event.is_output && !app.expanded_output {
+            title = "Reply".into();
+        }
+        if let Some(target) = related.filter(|target| target.owner != source.owner) {
+            let target_name = app.agent_for_owner(target.owner).map_or_else(
+                || short_agent_id(target.owner),
+                |agent| sanitize(&agent.name),
+            );
+            title.push_str(&format!(" · {owner} → {target_name}"));
+        }
+        if task.attempt > 1 && app.expanded_output {
+            title.push_str(&format!(" · attempt {}", task.attempt));
+        }
+        let detail = if let Some(review) = &event.review {
+            let reviewer = app.agent_for_owner(review.reviewer).map_or_else(
+                || short_agent_id(review.reviewer),
+                |agent| sanitize(&agent.name),
+            );
+            if let Some((approved, reason)) = &review.decision {
+                title = if review.reviewer == task.owner {
+                    if *approved {
+                        "✓ Approved"
+                    } else {
+                        "↶ Changes requested"
+                    }
+                    .into()
+                } else {
+                    format!(
+                        "{} {reviewer} {}",
+                        if *approved { "✓" } else { "↶" },
+                        if *approved {
+                            "approved"
+                        } else {
+                            "requested changes"
+                        }
+                    )
+                };
+                compact_text(reason, app.expanded_output, false)
+            } else {
+                title = if review.reviewer == task.owner {
+                    "↶ Reviewing".into()
+                } else {
+                    format!("↶ {owner} → {reviewer}")
+                };
+                if approval_id.is_some() {
+                    format!("Review requested for {}.", sanitize(action))
+                } else {
+                    "Diagnosing the failed attempt.".into()
+                }
+            }
+        } else if let Some(related) = related {
+            compact_text(&sanitize(&related.objective), app.expanded_output, false)
+        } else if event.is_output {
+            compact_text(&event.text, app.expanded_output, true)
+        } else {
+            compact_text(
+                event.text.strip_prefix("result: ").unwrap_or(&event.text),
+                app.expanded_output,
+                false,
+            )
+        };
+        let start = lines.len();
+        push_activity_card(
+            &mut lines,
+            &title,
+            &detail,
+            color,
+            width,
+            if app.expanded_output {
+                usize::MAX
+            } else if event.is_output {
+                3
+            } else {
+                5
+            },
+        );
+        if connected {
+            // Join the preceding card's closing border to this reply while
+            // preserving chronological order, including interleaved agents.
+            lines[start - 2] = Line::from(Span::styled(" │", Style::default().fg(color)));
+            lines[start - 1] = Line::from(Span::styled(" │", Style::default().fg(color)));
+            if let Some(span) = lines[start].spans.first_mut() {
+                span.content = span.content.replacen(" ╭ ", " ├ ", 1).into();
+            }
+        }
+        previous_thread = Some(thread);
     }
-    if count == 0 {
-        lines.push(Line::from(Span::styled(
-            "  No task-scoped events recorded for this role yet.",
-            Style::default().fg(theme::TEXT),
-        )));
+    if lines.is_empty() {
+        lines.push(Line::from(
+            " No conversation messages yet. [v] work details",
+        ));
     }
     lines
 }
 
-// A chronological, bounded overview separate from the newest-first raw activity.
-// Membership comes from persisted retry links, never from provider prose.
-fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &Task) {
-    let mut attempts = HashSet::from([selected.id]);
-    for _ in 0..app.tasks.len() {
-        let previous_len = attempts.len();
-        for task in &app.tasks {
-            if let Some(previous) = task.retry_of
-                && (attempts.contains(&task.id) || attempts.contains(&previous))
-            {
-                attempts.insert(previous);
-                attempts.insert(task.id);
-            }
-        }
-        if attempts.len() == previous_len {
-            break;
-        }
-    }
-    let steps = app
-        .scoped_events
-        .iter()
-        .filter(|event| {
-            event.workflow.is_some() && event.task_id.is_some_and(|id| attempts.contains(&id))
-        })
-        .collect::<Vec<_>>();
-    if steps.is_empty() {
-        return;
-    }
-    push_section(
-        lines,
-        "REVIEW LOOP · selected task + its attempts",
-        theme::AQUA,
-    );
-    let latest = app
-        .tasks
-        .iter()
-        .filter(|task| attempts.contains(&task.id))
-        .max_by_key(|task| task.attempt)
-        .unwrap_or(selected);
-    let reporting_name = latest
-        .parent
-        .and_then(|parent| app.tasks.iter().find(|task| task.id == parent))
-        .and_then(|parent| app.agents.iter().find(|agent| agent.id == parent.owner))
-        .map_or("Team Lead", |agent| agent.name.as_str());
-    let (_, status, color) = task_status_visual(latest.status);
-    let review_status = format!("{reporting_name} reviewing");
-    let status = if app.lead_reviews.contains_key(&latest.id) {
-        review_status.as_str()
-    } else {
-        status
-    };
-    lines.push(Line::from(Span::styled(
-        format!(
-            " Attempt {} · {} · {status}",
-            latest.attempt,
-            short_task_id(latest.id)
-        ),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(format!(
-        " Develop → {reporting_name} review → feedback → revise → {reporting_name} review"
-    )));
-    lines.push(Line::from(
-        " Recent handoffs · oldest → newest · [v] full feedback",
-    ));
-    for event in steps.iter().skip(steps.len().saturating_sub(6)) {
-        let task = app.tasks.iter().find(|task| Some(task.id) == event.task_id);
-        let attempt = task.map_or_else(|| "?".into(), |task| task.attempt.to_string());
-        let style = Style::default().fg(event_text_color(&event.text));
+fn push_activity_card(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    body: &str,
+    color: Color,
+    width: u16,
+    limit: usize,
+) {
+    let inner = usize::from(width.saturating_sub(4).max(1));
+    for (index, line) in textwrap::wrap(title, inner).iter().enumerate() {
+        let prefix = if index == 0 { " ╭ " } else { " │ " };
         lines.push(Line::from(Span::styled(
-            format!(
-                " Attempt {attempt} · {}",
-                event.workflow.as_deref().unwrap_or_default()
-            ),
-            style.add_modifier(Modifier::BOLD),
+            format!("{prefix}{line}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         )));
-        let detail = if app.expanded_output {
-            event.text.clone()
-        } else {
-            truncate_text(&one_line(&event.text), 180)
-        };
-        for line in detail.lines() {
-            lines.push(Line::from(Span::styled(format!(" {line}"), style)));
-        }
     }
+    let wrapped = textwrap::wrap(body, inner);
+    let folded = wrapped.len() > limit;
+    for line in wrapped.iter().take(limit) {
+        lines.push(Line::from(vec![
+            Span::styled(" │ ", Style::default().fg(color)),
+            Span::styled(line.to_string(), Style::default().fg(theme::TEXT)),
+        ]));
+    }
+    if folded {
+        lines.push(Line::from(Span::styled(
+            " │ … [v] details",
+            Style::default().fg(theme::AQUA),
+        )));
+    }
+    lines.push(Line::from(Span::styled(" ╰─", Style::default().fg(color))));
     lines.push(Line::from(""));
-    push_section(lines, "ROLE ACTIVITY · newest first", theme::PURPLE);
 }
 
 fn push_section(lines: &mut Vec<Line<'static>>, title: &str, color: Color) {
@@ -4089,108 +4514,316 @@ mod tests {
     }
 
     #[test]
-    fn activity_explains_review_loop_across_attempts_without_mixing_other_work() {
+    fn chat_follows_wrapped_content_and_allows_scrolling_back() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        let lines = (0..20)
+            .map(|n| Line::from(format!("message {n}: a long wrapped message")))
+            .collect::<Vec<_>>();
+        let mut scroll = 0;
+        terminal
+            .draw(|frame| {
+                render_chat(
+                    frame,
+                    lines.clone(),
+                    panel("Chat", true),
+                    frame.area(),
+                    &mut scroll,
+                )
+            })
+            .unwrap();
+        let screen = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..8)
+                .flat_map(|y| (0..30).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>()
+        };
+        assert!(screen(&terminal).contains("message 19"));
+        assert!(!screen(&terminal).contains("message 0:"));
+        assert_eq!(terminal.backend().buffer()[(29, 6)].fg, theme::AQUA);
+        scroll = 10;
+        terminal
+            .draw(|frame| {
+                render_chat(
+                    frame,
+                    lines.clone(),
+                    panel("Chat", true),
+                    frame.area(),
+                    &mut scroll,
+                )
+            })
+            .unwrap();
+        assert!(!screen(&terminal).contains("message 19"));
         let mut app = AppModel::new(SessionId::new());
-        let owner = AgentId::new();
-        let lead = AgentId::new();
-        let original = Task::root(owner, "Build frontend", vec![], Default::default());
-        let mut retry = Task::root(owner, "Build frontend", vec![], Default::default());
-        retry.retry_of = Some(original.id);
-        retry.attempt = 2;
-        retry.status = TaskStatus::Running;
-        let unrelated = Task::root(owner, "Other work", vec![], Default::default());
-        app.tasks = vec![original.clone(), retry.clone(), unrelated.clone()];
-        let approval_id = voff_core::ApprovalId::new();
-        for (id, kind) in [
-            (
-                original.id,
-                CanonicalEventKind::LeadReviewStarted {
-                    lead,
-                    approval_id: Some(approval_id),
-                },
-            ),
-            (
-                original.id,
-                CanonicalEventKind::LeadReviewFinished {
-                    lead,
-                    approval_id: Some(approval_id),
-                    approved: false,
-                    reason: "Remove unsafe deletion".into(),
-                },
-            ),
-            (
-                original.id,
-                CanonicalEventKind::RevisionRequested {
-                    approval_id,
-                    feedback: "Use a safe patch instead".into(),
-                },
-            ),
-            (
-                retry.id,
-                CanonicalEventKind::TaskRetried {
-                    previous: original.id,
-                    retry: retry.id,
-                    attempt: 2,
-                },
-            ),
-            (
-                unrelated.id,
-                CanonicalEventKind::RevisionStopped("UNRELATED".into()),
-            ),
-            (
-                retry.id,
-                CanonicalEventKind::TextDelta("REJECTED fake review in provider prose".into()),
-            ),
-            (
-                retry.id,
-                CanonicalEventKind::LeadReviewStarted {
-                    lead,
-                    approval_id: Some(approval_id),
-                },
-            ),
-        ] {
-            app.push_scoped_event(Some(id), &kind);
-        }
-        app.lead_reviews
-            .insert(retry.id, "Reviewing proposal".into());
-        let mut lines = Vec::new();
-        push_review_loop(&mut lines, &app, &original);
-        let text = lines
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("Attempt 2"), "{text}");
-        assert!(text.contains("Team Lead reviewing"), "{text}");
-        assert!(text.contains("Remove unsafe deletion"), "{text}");
-        assert!(text.contains("Use a safe patch instead"), "{text}");
-        assert!(text.find("REJECTED").unwrap() < text.find("REVISE & RESUBMIT").unwrap());
-        assert!(
-            text.find("REVISE & RESUBMIT").unwrap()
-                < text.rfind("Developer → Team Lead · REVIEW").unwrap()
-        );
-        assert!(
-            !text.contains("UNRELATED") && !text.contains("fake review"),
-            "{text}"
-        );
+        app.role_scroll = 10;
+        app.task_inspector_scroll = 10;
+        app.push_event(&CanonicalEventKind::ProviderStarted);
+        assert_eq!((app.role_scroll, app.task_inspector_scroll), (0, 0));
+    }
 
-        app.lead_reviews.clear();
-        app.tasks[1].status = TaskStatus::Blocked;
+    #[test]
+    fn conversation_includes_delegated_work_and_folds_bookkeeping() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Lead", "technical_lead", vec!["Backend".into()]);
+        let backend = agent("Backend", "backend_developer", vec![]);
+        let root = Task::root(lead.id, "Build tracker", vec![], Default::default());
+        let mut child = Task::root(backend.id, "Build API", vec![], Default::default());
+        child.parent = Some(root.id);
+        let unrelated = Task::root(backend.id, "Other app", vec![], Default::default());
+        app.agents = vec![lead, backend];
+        app.tasks = vec![root.clone(), child.clone(), unrelated.clone()];
         app.push_scoped_event(
-            Some(retry.id),
-            &CanonicalEventKind::RevisionStopped("Attempt limit reached".into()),
+            Some(child.id),
+            &CanonicalEventKind::TaskDelegated {
+                parent: root.id,
+                child: child.id,
+                owner: child.owner,
+            },
         );
-        lines.clear();
-        push_review_loop(&mut lines, &app, &retry);
-        let text = lines
+        app.push_scoped_event(
+            Some(child.id),
+            &CanonicalEventKind::Usage {
+                input_tokens: 17,
+                output_tokens: 9,
+            },
+        );
+        app.push_scoped_event(
+            Some(child.id),
+            &CanonicalEventKind::ProviderFailed("Fix the failing check".into()),
+        );
+        app.push_scoped_event(
+            Some(unrelated.id),
+            &CanonicalEventKind::ProviderFailed("UNRELATED".into()),
+        );
+        let ids = task_thread_ids(&app.tasks, root.id);
+        let render = |app: &AppModel| {
+            conversation_lines(app, &ids, 80, None)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = render(&app);
+        assert!(text.find("Delegated").unwrap() < text.find("Fix the failing check").unwrap());
+        assert!(
+            text.contains("Lead → Backend") && text.contains("Fix the failing check"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("usage:") && !text.contains("UNRELATED"),
+            "{text}"
+        );
+        assert!(!task_thread_ids(&app.tasks, child.id).contains(&root.id));
+        app.expanded_output = true;
+        assert!(!render(&app).contains("usage: 17"));
+    }
+
+    #[test]
+    fn review_cards_connect_only_the_same_review_and_use_actual_names() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("pashaaaaa", "technical_lead", vec![]);
+        let worker = agent("Backend Agent", "backend_developer", vec![]);
+        let task = Task::root(worker.id, "Implement API", vec![], Default::default());
+        let lead_id = lead.id;
+        app.agents = vec![lead, worker];
+        app.tasks = vec![task.clone()];
+        let first = Some(voff_core::ApprovalId::new());
+        let second = Some(voff_core::ApprovalId::new());
+        for kind in [
+            CanonicalEventKind::LeadReviewStarted {
+                lead: lead_id,
+                approval_id: first,
+            },
+            CanonicalEventKind::LeadReviewFinished {
+                lead: lead_id,
+                approval_id: first,
+                approved: true,
+                reason: "The API checks passed.".into(),
+            },
+            CanonicalEventKind::LeadReviewStarted {
+                lead: lead_id,
+                approval_id: second,
+            },
+        ] {
+            app.push_scoped_event(Some(task.id), &kind);
+        }
+        let compact = conversation_lines(&app, &HashSet::from([task.id]), 80, None)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("blocked") && text.contains("STOPPED · needs attention"),
+            !compact.contains("Review 1")
+                && !compact.contains("approved")
+                && !compact.contains("Review requested")
+        );
+        app.expanded_output = true;
+        let lines = conversation_lines(&app, &HashSet::from([task.id]), 80, None);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("Review 1").count(), 1);
+        assert_eq!(text.matches("Review 2").count(), 1);
+        assert!(text.contains("Backend Agent → pashaaaaa"), "{text}");
+        assert!(text.contains("├ ✓ pashaaaaa approved"), "{text}");
+        assert!(
+            !text.contains("Developer") && !text.contains("Sent for review"),
             "{text}"
         );
+        assert_eq!(text.matches(" ╭ ").count(), 2);
+        assert!(text.find("The API checks passed.").unwrap() < text.find("Review 2").unwrap());
+        assert!(lines.iter().all(|line| line.width() <= 80));
+    }
+
+    #[test]
+    fn reporting_conversation_filters_other_pairs_and_colors_each_speaker() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Lead", "technical_lead", vec!["Backend".into()]);
+        let worker = agent("Backend", "backend_developer", vec!["Nested".into()]);
+        let nested = agent("Nested", "frontend_developer", vec![]);
+        let lead_id = lead.id;
+        let worker_color = role_color(&worker.role);
+        let lead_color = role_color(&lead.role);
+        let root = Task::root(lead.id, "Build app", vec![], Default::default());
+        let mut task = Task::root(worker.id, "Build API", vec![], Default::default());
+        task.parent = Some(root.id);
+        let mut subtask = Task::root(nested.id, "Nested job", vec![], Default::default());
+        subtask.parent = Some(task.id);
+        let other_reviewer = nested.id;
+        app.agents = vec![lead, worker, nested];
+        app.tasks = vec![root, task.clone(), subtask.clone()];
+        app.push_scoped_event(
+            Some(task.id),
+            &CanonicalEventKind::TaskTransition {
+                from: TaskStatus::WaitingApproval,
+                to: TaskStatus::Running,
+            },
+        );
+        app.push_scoped_event(
+            Some(task.id),
+            &CanonicalEventKind::TextDelta("WORKER_REPLY".into()),
+        );
+        for (id, reviewer, reason) in [
+            (task.id, lead_id, "LEAD_FEEDBACK"),
+            (subtask.id, task.owner, "SUBAGENT_FEEDBACK"),
+            (task.id, other_reviewer, "WRONG_REVIEWER"),
+        ] {
+            app.push_scoped_event(
+                Some(id),
+                &CanonicalEventKind::LeadReviewFinished {
+                    lead: reviewer,
+                    approval_id: Some(voff_core::ApprovalId::new()),
+                    approved: false,
+                    reason: reason.into(),
+                },
+            );
+        }
+        let ids = task_thread_ids(&app.tasks, task.id);
+        let pair = reporting_pair(&app, &task);
+        assert_eq!(pair, Some((task.owner, lead_id)));
+        for expanded in [false, true] {
+            app.expanded_output = expanded;
+            let lines = conversation_lines(&app, &ids, 80, pair);
+            let text = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("WORKER_REPLY") && text.contains("LEAD_FEEDBACK"));
+            assert!(
+                !text.contains("Build API"),
+                "Assignment stays in the task list"
+            );
+            assert!(
+                lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content == " Backend" && span.style.fg == Some(worker_color)
+                })
+            );
+            assert!(
+                !text.contains("SUBAGENT_FEEDBACK")
+                    && !text.contains("WRONG_REVIEWER")
+                    && !text.contains("WaitingApproval"),
+                "{text}"
+            );
+            for (message, color) in [
+                (
+                    if expanded {
+                        "Response · preview"
+                    } else {
+                        "Reply"
+                    },
+                    worker_color,
+                ),
+                ("Lead requested changes", lead_color),
+            ] {
+                assert!(
+                    lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| span.content.contains(message) && span.style.fg == Some(color))
+                );
+            }
+            for message in ["WORKER_REPLY", "LEAD_FEEDBACK"] {
+                assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.contains(message) && span.style.fg == Some(theme::TEXT)
+                }));
+            }
+            assert!(lines.iter().all(|line| line.style.bg.is_none()
+                && line.spans.iter().all(|span| span.style.bg.is_none())));
+        }
+    }
+
+    #[test]
+    fn chat_hides_structured_generation_without_merging_it_into_replies() {
+        let mut app = AppModel::new(SessionId::new());
+        let task = Task::root(AgentId::new(), "Build app", vec![], Default::default());
+        app.tasks = vec![task.clone()];
+        for event in [
+            CanonicalEventKind::TextDelta("I am building the API.".into()),
+            CanonicalEventKind::GenerationDelta("INTERNAL_PATCH_JSON".into()),
+            CanonicalEventKind::TextDelta("The routes are ready.".into()),
+            CanonicalEventKind::ToolProposed {
+                tool_call_id: voff_core::ToolCallId::new(),
+                name: "file.patch".into(),
+            },
+        ] {
+            app.push_scoped_event(Some(task.id), &event);
+        }
+        let ids = HashSet::from([task.id]);
+        let render = |app: &AppModel| {
+            conversation_lines(app, &ids, 80, None)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let chat = render(&app);
+        assert!(chat.contains("I am building the API.") && chat.contains("The routes are ready."));
+        assert!(!chat.contains("INTERNAL_PATCH_JSON") && !chat.contains("file.patch"));
+        app.expanded_output = true;
+        let details = render(&app);
+        assert!(details.contains("INTERNAL_PATCH_JSON") && details.contains("file.patch"));
+    }
+
+    #[test]
+    fn conversation_cards_wrap_unicode_and_bound_previews() {
+        let mut lines = Vec::new();
+        push_activity_card(
+            &mut lines,
+            "Response · 🐶 開発者",
+            &"長い出力を確認する ".repeat(40),
+            theme::BLUE,
+            32,
+            3,
+        );
+        assert!(lines.iter().all(|line| line.width() <= 32));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("[v] details"))
+        );
+        assert!(lines.len() <= 9);
     }
 
     fn agent(name: &str, role: &str, allowed_targets: Vec<String>) -> AgentProfile {
@@ -4633,6 +5266,45 @@ mod tests {
     }
 
     #[test]
+    fn task_workspace_stacks_wide_panes_and_scrolls_the_task_list() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = agent("Backend", "backend_agent", vec![]);
+        app.tasks = (0..20)
+            .map(|index| {
+                Task::root(
+                    owner.id,
+                    format!("Task {index}"),
+                    vec![],
+                    Default::default(),
+                )
+            })
+            .collect();
+        app.agents.push(owner);
+        app.selected = 19;
+        app.panel = Panel::Tasks;
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|frame| render_tasks_workspace(frame, &mut app, frame.area()))
+            .unwrap();
+        let browser = app.task_list_hitbox;
+        let inspector = app.task_inspector_hitbox;
+        assert_eq!(browser.width, inspector.width);
+        assert_eq!(browser.bottom(), inspector.y);
+        assert!(app.task_window_start > 0);
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (browser.y + 1..browser.bottom() - 1)
+                .any(|y| { buffer[(browser.right() - 1, y)].fg == theme::AQUA })
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            browser.x + 1,
+            browser.y + 1,
+        ));
+        assert_eq!(app.selected, 18);
+    }
+
+    #[test]
     fn task_workspace_stacks_browser_and_inspector_on_narrow_terminals() {
         let mut app = AppModel::new(SessionId::new());
         let owner = agent("API Engineer", "backend_developer", vec![]);
@@ -4654,7 +5326,7 @@ mod tests {
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
         assert!(rendered.contains("Narrow terminal task"), "{rendered}");
-        assert!(rendered.contains("OBJECTIVE"), "{rendered}");
+        assert!(rendered.contains("CONVERSATION"), "{rendered}");
         assert!(rendered.contains("API Engineer"), "{rendered}");
         assert!(rendered.contains("voff · ses_"), "{rendered}");
         assert!(!rendered.contains("Tasks view"), "{rendered}");
@@ -5373,7 +6045,7 @@ mod tests {
             app.task_inspector_hitbox.y + 2,
         );
         app.reduce(Action::Mouse(mouse(
-            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
             point.0,
             point.1,
         )));
