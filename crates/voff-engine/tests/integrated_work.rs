@@ -16,8 +16,7 @@ fn plan() -> serde_json::Value {
     serde_json::json!({
         "shared_contract":"Client and server must both use port=8000. Server owns server.txt; client owns client.txt. Integration verifies both together and preserves the app.",
         "proposals":[
-            {"target_agent":"Server","objective":"server","acceptance_criteria":["server component implemented"]},
-            {"target_agent":"Client","objective":"client","acceptance_criteria":["client component implemented"]}
+            {"target_agent":"Server","objective":"components","acceptance_criteria":["client and server components implemented"]}
         ],
         "integration":{"target_agent":"Client","objective":"integrate","acceptance_criteria":["client and server use the same port"]}
     })
@@ -53,11 +52,11 @@ impl ModelProvider for Team {
         } else {
             assert!(request.messages[0].content.contains("both use port=8000"));
             match (task.objective.as_str(), turn) {
-                ("server", 1) => (
+                ("components", 1) => (
                     "file.patch",
                     serde_json::json!({"path":"server.txt","replacement":"port=8000"}),
                 ),
-                ("client", 1) => (
+                ("components", 2) => (
                     "file.patch",
                     serde_json::json!({"path":"client.txt","replacement":"port=3000"}),
                 ),
@@ -68,7 +67,7 @@ impl ModelProvider for Team {
                         .filter(|d| d.task_id == task.id)
                         .map(|d| d.depends_on)
                         .collect::<Vec<_>>();
-                    assert_eq!(ids.len(), 2);
+                    assert_eq!(ids.len(), 1);
                     for id in ids {
                         assert_eq!(
                             self.repo.task(id).await.unwrap().unwrap().status,
@@ -89,9 +88,8 @@ impl ModelProvider for Team {
                     "file.patch",
                     serde_json::json!({"path":"src/lib.rs","replacement":"#[test] fn contract() { assert_eq!(include_str!(\"../client.txt\"), include_str!(\"../server.txt\")); assert_eq!(include_str!(\"../server.txt\"), \"port=8000\"); }"}),
                 ),
-                ("server" | "client", 2) | ("integrate", 4) => {
-                    ("process.test", serde_json::json!({"command":"cargo test"}))
-                }
+                ("components", 3) => ("process.test", serde_json::json!({"command":"cargo test"})),
+                ("integrate", 4) => ("process.test", serde_json::json!({"command":"cargo test"})),
                 _ => {
                     let evidence = self
                         .repo
@@ -183,14 +181,17 @@ async fn related_outputs_are_integrated_and_tested_before_parent_completion() {
         .await
         .unwrap();
     engine.mark_ready(root.id).await.unwrap();
+    // Both component files have one writer; the separate integration task
+    // verifies their shared contract after implementation completes.
     engine.run_task_and_schedule(root.id, 3).await.unwrap();
     let tasks = repo.tasks().await.unwrap();
-    assert_eq!(tasks.len(), 4, "{tasks:?}");
+    let events = repo.events(session).await.unwrap();
+    assert_eq!(tasks.len(), 3, "{tasks:?}");
     assert!(
         tasks
             .iter()
             .all(|task| task.status == TaskStatus::Completed),
-        "{tasks:?}"
+        "tasks: {tasks:?}\nevents: {events:?}"
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("client.txt")).unwrap(),
@@ -201,7 +202,6 @@ async fn related_outputs_are_integrated_and_tested_before_parent_completion() {
         .find(|task| task.work.as_ref().unwrap().integration)
         .unwrap();
     assert_eq!(integration.work.as_ref().unwrap().turns, 5);
-    let events = repo.events(session).await.unwrap();
     assert!(
         events
             .iter()

@@ -8,15 +8,12 @@ license.workspace = true
 name = "voff"
 path = "src/main.rs"
 [dependencies]
-ai-model-directory-router = "0.3"
 voff-core.workspace = true
 voff-provider.workspace = true
 voff-storage.workspace = true
 voff-engine.workspace = true
 voff-tools = { path = "../voff-tools", version = "=0.1.0-beta.1" }
 anyhow = "1"
-dotenvy.workspace = true
-clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
 chrono.workspace = true
 crossterm = "0.29"
@@ -30,7 +27,9 @@ tracing-appender = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror.workspace = true
-toml = "0.8"
+ansi-to-tui = "=8.0.1"
+ratatui-notifications = "0.1.0"
+llm-kernel = { version = "0.31.6", default-features = false, features = ["provider"] }
 [lints]
 workspace = true
 [dev-dependencies]

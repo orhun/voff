@@ -708,7 +708,7 @@ async fn local_file_error_is_reviewed_with_path_and_repaired() {
 async fn lead_cannot_override_runtime_policy_by_approving_a_retry() {
     let forbidden = call(
         "file.patch",
-        serde_json::json!({"path":".voff/config.toml","replacement":"unsafe"}),
+        serde_json::json!({"path":".voff/voff.db","replacement":"unsafe"}),
     );
     let (engine, repo, provider, dir, session, lead) =
         setup(vec![forbidden, verdict(true)], false).await;

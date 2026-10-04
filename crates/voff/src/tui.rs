@@ -2,6 +2,7 @@
 mod team_flow;
 
 use crate::model_catalog::ModelCatalog;
+use crate::theme;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -16,12 +17,15 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
+};
+use ratatui_notifications::{
+    Anchor, Animation, AutoDismiss, Level, Notification, Notifications, SizeConstraint,
 };
 use ratatui_textarea::{DataCursor, TextArea, WrapMode};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io, panic,
     path::PathBuf,
     sync::Arc,
@@ -34,7 +38,6 @@ use voff_core::{
     CanonicalEventKind, SessionId, Task, TaskStatus,
 };
 use voff_engine::{DelegationProposal, Engine, EngineEvent, OutputContinuation};
-use voff_provider::ProviderHealth;
 use voff_storage::{Repository, SqliteRepository};
 
 use self::team_flow::{TeamFlow, TeamSnapshot, handoff_summary, role_color, role_icon};
@@ -44,11 +47,20 @@ pub enum Panel {
     Tasks,
     Agents,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TaskInspector {
-    Details,
-    RoleActivity,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TabId {
+    Team,
+    Tasks,
+    Role(AgentId),
 }
+
+#[derive(Clone, Copy, Debug)]
+struct TabHitbox {
+    id: TabId,
+    area: Rect,
+    close: Option<Rect>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Up,
@@ -56,7 +68,6 @@ pub enum Action {
     NextPanel,
     ToggleHelp,
     FocusComposer,
-    QuickRun,
     RetryTask,
     AddCredential,
     Cancel,
@@ -70,11 +81,13 @@ pub enum Action {
     ZoomTeamOut,
     ResetTeamZoom,
     AdjustTeam,
-    ConfigureModel,
+    ChangeWorkspace,
+    AddAgent,
+    DeleteAgent,
     ShowTeam,
     ShowTasks,
-    ShowTaskDetails,
-    ShowRoleActivity,
+    OpenRoleTab,
+    CloseRoleTab,
     ToggleExpanded,
     ToggleApprovalDetails,
     Escape,
@@ -88,7 +101,7 @@ struct ScopedEvent {
     task_id: Option<voff_core::TaskId>,
     text: String,
     is_output: bool,
-    workflow: Option<&'static str>,
+    workflow: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -99,6 +112,9 @@ enum ComposerEvent {
 }
 
 pub struct AppModel {
+    notifications: Notifications,
+    team_hint_id: Option<u64>,
+    transient_notification_ids: VecDeque<u64>,
     automatic_review: bool,
     lead_reviews: HashMap<voff_core::TaskId, String>,
     application_notice: Option<String>,
@@ -110,40 +126,47 @@ pub struct AppModel {
     pub panel: Panel,
     pub help: bool,
     pub quit: bool,
-    pub provider_label: String,
-    pub agent_name: String,
-    pub model_label: String,
     pub agents: Vec<AgentProfile>,
     known_agents: HashMap<AgentId, AgentProfile>,
     pub approvals: Vec<Approval>,
     pub artifacts: Vec<Artifact>,
-    pub provider_health: ProviderHealth,
-    pub input_cost_per_million: Option<f64>,
-    pub output_cost_per_million: Option<f64>,
-    pub cost_currency: String,
-    pub estimated_cost: Option<f64>,
     pub model_catalog: ModelCatalog,
     pub agent_provider_kinds: HashMap<AgentId, String>,
-    pub cost_partial: bool,
     pub workspace_root: PathBuf,
     pub event_viewer: bool,
     pub event_scroll: u16,
     event_follow: bool,
     scoped_events: Vec<ScopedEvent>,
-    task_inspector: TaskInspector,
     task_inspector_scroll: u16,
     expanded_output: bool,
     task_list_hitbox: Rect,
+    task_inspector_hitbox: Rect,
+    team_tab_hitbox: Rect,
+    tasks_tab_hitbox: Rect,
+    tab_hitboxes: Vec<TabHitbox>,
+    add_role_tab_hitbox: Rect,
+    role_tabs: Vec<AgentId>,
+    active_role_tab: Option<AgentId>,
+    role_click_candidate: Option<(usize, u16, u16)>,
+    last_role_click: Option<(AgentId, std::time::Instant)>,
+    role_scroll: u16,
+    role_requests: Vec<(AgentId, String)>,
+    team_edit_hitbox: Rect,
+    team_add_hitbox: Rect,
+    task_expand_hitbox: Rect,
+    task_retry_hitbox: Rect,
+    help_hitbox: Rect,
+    workspace_hitbox: Rect,
     task_window_start: usize,
     credential_target: Option<(String, crate::credential::CredentialSlot)>,
     credential_input: Option<String>,
     credential_saving: bool,
     credential_error: Option<String>,
     composer: TextArea<'static>,
+    composer_drafts: HashMap<TabId, TextArea<'static>>,
     composer_active: bool,
     composer_notice: Option<String>,
     composer_hitbox: Rect,
-    quick_run_starting: bool,
     retry_starting: bool,
     pending_submissions: usize,
     selected_agent: usize,
@@ -152,8 +175,12 @@ pub struct AppModel {
     approval_scroll: u16,
     team_lead: Option<AgentId>,
     team_setup: Option<crate::onboarding::SetupDraft>,
+    pending_delete: Option<AgentId>,
     setup_editor: Option<crate::onboarding::Wizard>,
     setup_result: Option<crate::onboarding::SetupDraft>,
+    setup_notice: Option<String>,
+    workspace_editor: Option<crate::onboarding::Wizard>,
+    workspace_result: Option<PathBuf>,
     team_flow: TeamFlow,
     streaming_text: bool,
     agent_responses: HashMap<AgentId, String>,
@@ -161,20 +188,11 @@ pub struct AppModel {
 impl AppModel {
     #[must_use]
     pub fn new(session: SessionId) -> Self {
-        let mut composer = TextArea::default();
-        composer.set_cursor_line_style(Style::default());
-        composer.set_cursor_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        );
-        composer.set_selection_style(Style::default().fg(Color::Black).bg(Color::LightBlue));
-        composer.set_wrap_mode(WrapMode::WordOrGlyph);
-        composer.set_tab_length(2);
-        composer.set_max_histories(200);
-        composer.set_placeholder_text("Press Enter to assign a task");
+        let composer = new_composer();
         Self {
+            notifications: Notifications::new(),
+            team_hint_id: None,
+            transient_notification_ids: VecDeque::new(),
             session,
             tasks: vec![],
             events: vec![],
@@ -183,9 +201,6 @@ impl AppModel {
             panel: Panel::Agents,
             help: false,
             quit: false,
-            provider_label: "mock".into(),
-            agent_name: "Mock Agent".into(),
-            model_label: "mock-v1".into(),
             agents: vec![],
             known_agents: HashMap::new(),
             approvals: vec![],
@@ -193,33 +208,43 @@ impl AppModel {
             lead_reviews: HashMap::new(),
             application_notice: None,
             artifacts: vec![],
-            provider_health: ProviderHealth::default(),
-            input_cost_per_million: None,
-            output_cost_per_million: None,
-            cost_currency: "USD".into(),
-            estimated_cost: None,
             model_catalog: ModelCatalog::default(),
             agent_provider_kinds: HashMap::new(),
-            cost_partial: false,
             workspace_root: ".".into(),
             event_viewer: false,
             event_scroll: 0,
             event_follow: true,
             scoped_events: vec![],
-            task_inspector: TaskInspector::Details,
             task_inspector_scroll: 0,
             expanded_output: false,
             task_list_hitbox: Rect::default(),
+            task_inspector_hitbox: Rect::default(),
+            team_tab_hitbox: Rect::default(),
+            tasks_tab_hitbox: Rect::default(),
+            tab_hitboxes: Vec::new(),
+            add_role_tab_hitbox: Rect::default(),
+            role_tabs: Vec::new(),
+            active_role_tab: None,
+            role_click_candidate: None,
+            last_role_click: None,
+            role_scroll: 0,
+            role_requests: Vec::new(),
+            team_edit_hitbox: Rect::default(),
+            team_add_hitbox: Rect::default(),
+            task_expand_hitbox: Rect::default(),
+            task_retry_hitbox: Rect::default(),
+            help_hitbox: Rect::default(),
+            workspace_hitbox: Rect::default(),
             task_window_start: 0,
             credential_target: None,
             credential_input: None,
             credential_saving: false,
             credential_error: None,
             composer,
+            composer_drafts: HashMap::new(),
             composer_active: false,
             composer_notice: None,
             composer_hitbox: Rect::default(),
-            quick_run_starting: false,
             retry_starting: false,
             pending_submissions: 0,
             selected_agent: 0,
@@ -228,13 +253,97 @@ impl AppModel {
             approval_scroll: 0,
             team_lead: None,
             team_setup: None,
+            pending_delete: None,
             setup_editor: None,
             setup_result: None,
+            setup_notice: None,
+            workspace_editor: None,
+            workspace_result: None,
             team_flow: TeamFlow::default(),
             streaming_text: false,
             agent_responses: HashMap::new(),
         }
     }
+
+    fn active_tab(&self) -> TabId {
+        self.active_role_tab.map_or_else(
+            || match self.panel {
+                Panel::Agents => TabId::Team,
+                Panel::Tasks => TabId::Tasks,
+            },
+            TabId::Role,
+        )
+    }
+
+    fn select_tab(&mut self, tab: TabId) {
+        if matches!(tab, TabId::Role(id) if !self.role_tabs.contains(&id)) {
+            return;
+        }
+        let current = self.active_tab();
+        if current != tab {
+            let next = self
+                .composer_drafts
+                .remove(&tab)
+                .unwrap_or_else(new_composer);
+            let previous = std::mem::replace(&mut self.composer, next);
+            self.composer_drafts.insert(current, previous);
+        }
+        self.composer_active = false;
+        match tab {
+            TabId::Team => {
+                self.panel = Panel::Agents;
+                self.active_role_tab = None;
+            }
+            TabId::Tasks => {
+                self.panel = Panel::Tasks;
+                self.active_role_tab = None;
+            }
+            TabId::Role(id) => {
+                self.active_role_tab = Some(id);
+                self.role_scroll = 0;
+            }
+        }
+    }
+
+    fn open_role_tab(&mut self, id: AgentId) {
+        let Some(index) = self.agents.iter().position(|agent| agent.id == id) else {
+            return;
+        };
+        self.selected_agent = index;
+        if !self.role_tabs.contains(&id) {
+            self.role_tabs.push(id);
+        }
+        self.select_tab(TabId::Role(id));
+    }
+
+    fn close_role_tab(&mut self, id: AgentId) {
+        self.role_tabs.retain(|open| *open != id);
+        if self.active_role_tab == Some(id) {
+            self.select_tab(TabId::Team);
+        }
+    }
+
+    fn composer_target(&self) -> Option<&AgentProfile> {
+        self.active_role_tab
+            .and_then(|id| self.agents.iter().find(|agent| agent.id == id))
+    }
+
+    fn routed_objective(&self, message: &str) -> String {
+        self.composer_target().map_or_else(
+            || message.to_owned(),
+            |agent| {
+                if Some(agent.id) == self.team_lead {
+                    message.to_owned()
+                } else {
+                    format!(
+                        "The user addressed this request to {} ({}). As Team Lead, delegate it to this role through the normal persisted task workflow, then review and integrate its response. If that is unsafe or impossible, report the blocker; do not impersonate the role or bypass approvals.\n\nUser request:\n{message}",
+                        agent.name, agent.role
+                    )
+                }
+            },
+        )
+    }
+
     pub fn reduce(&mut self, action: Action) {
         if action == Action::Escape && self.application_notice.take().is_some() {
             return;
@@ -247,6 +356,8 @@ impl AppModel {
                 if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
                     self.event_follow = self.event_scroll == 0;
+                } else if self.active_role_tab.is_some() {
+                    self.role_scroll = self.role_scroll.saturating_sub(1);
                 } else if self.panel == Panel::Agents {
                     self.selected_agent = self.selected_agent.saturating_sub(1);
                 } else {
@@ -261,6 +372,8 @@ impl AppModel {
                         .saturating_add(1)
                         .min(self.event_scroll_limit());
                     self.event_follow = self.event_scroll == 0;
+                } else if self.active_role_tab.is_some() {
+                    self.role_scroll = self.role_scroll.saturating_add(1);
                 } else if self.panel == Panel::Agents {
                     if self.selected_agent + 1 < self.agents.len() {
                         self.selected_agent += 1;
@@ -274,6 +387,8 @@ impl AppModel {
                 if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(10);
                     self.event_follow = self.event_scroll == 0;
+                } else if self.active_role_tab.is_some() {
+                    self.role_scroll = self.role_scroll.saturating_sub(10);
                 } else if self.panel == Panel::Tasks {
                     self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(10);
                 }
@@ -285,6 +400,8 @@ impl AppModel {
                         .saturating_add(10)
                         .min(self.event_scroll_limit());
                     self.event_follow = self.event_scroll == 0;
+                } else if self.active_role_tab.is_some() {
+                    self.role_scroll = self.role_scroll.saturating_add(10);
                 } else if self.panel == Panel::Tasks {
                     self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(10);
                 }
@@ -293,19 +410,30 @@ impl AppModel {
             Action::ZoomTeamIn if self.panel == Panel::Agents => self.team_flow.zoom_in(),
             Action::ZoomTeamOut if self.panel == Panel::Agents => self.team_flow.zoom_out(),
             Action::ResetTeamZoom if self.panel == Panel::Agents => self.team_flow.reset_zoom(),
-            Action::AdjustTeam => self.open_team_setup(false),
-            Action::ConfigureModel if self.panel == Panel::Agents => self.open_team_setup(true),
-            Action::ShowTeam => self.panel = Panel::Agents,
-            Action::ShowTasks => self.panel = Panel::Tasks,
-            Action::ShowTaskDetails => {
-                self.panel = Panel::Tasks;
-                self.task_inspector = TaskInspector::Details;
-                self.task_inspector_scroll = 0;
+            Action::AdjustTeam => self.open_team_setup(),
+            Action::ChangeWorkspace => self.open_workspace_picker(),
+            Action::AddAgent => {
+                if self.panel == Panel::Agents || self.active_role_tab.is_some() {
+                    self.open_agent_setup(true);
+                }
             }
-            Action::ShowRoleActivity => {
-                self.panel = Panel::Tasks;
-                self.task_inspector = TaskInspector::RoleActivity;
-                self.task_inspector_scroll = 0;
+            Action::DeleteAgent => self.open_delete_confirmation(),
+            Action::ShowTeam => self.select_tab(TabId::Team),
+            Action::ShowTasks => self.select_tab(TabId::Tasks),
+            Action::OpenRoleTab => {
+                let id = if self.panel == Panel::Tasks && self.active_role_tab.is_none() {
+                    self.selected_task().map(|task| task.owner)
+                } else {
+                    self.agents.get(self.selected_agent).map(|agent| agent.id)
+                };
+                if let Some(id) = id {
+                    self.open_role_tab(id);
+                }
+            }
+            Action::CloseRoleTab => {
+                if let Some(id) = self.active_role_tab {
+                    self.close_role_tab(id);
+                }
             }
             Action::ToggleExpanded => {
                 self.expanded_output = !self.expanded_output;
@@ -313,10 +441,13 @@ impl AppModel {
                 self.event_scroll = 0;
             }
             Action::NextPanel => {
-                self.panel = match self.panel {
-                    Panel::Agents => Panel::Tasks,
-                    Panel::Tasks => Panel::Agents,
-                };
+                let mut tabs = vec![TabId::Team, TabId::Tasks];
+                tabs.extend(self.role_tabs.iter().copied().map(TabId::Role));
+                let current = tabs
+                    .iter()
+                    .position(|tab| *tab == self.active_tab())
+                    .unwrap_or(0);
+                self.select_tab(tabs[(current + 1) % tabs.len()]);
             }
             Action::ToggleHelp => self.help = !self.help,
             Action::FocusComposer => {
@@ -350,8 +481,7 @@ impl AppModel {
             }
             Action::Quit => self.quit = true,
             Action::Mouse(mouse) => self.handle_mouse(mouse),
-            Action::QuickRun
-            | Action::ToggleApprovalDetails
+            Action::ToggleApprovalDetails
             | Action::RetryTask
             | Action::Cancel
             | Action::Approve
@@ -360,12 +490,39 @@ impl AppModel {
             | Action::ZoomTeamIn
             | Action::ZoomTeamOut
             | Action::ResetTeamZoom
-            | Action::ConfigureModel
             | Action::None => {}
         }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.help || self.event_viewer {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let point = (mouse.column, mouse.row).into();
+            if let Some(hitbox) = self
+                .tab_hitboxes
+                .iter()
+                .copied()
+                .find(|tab| tab.area.contains(point))
+            {
+                if hitbox.close.is_some_and(|close| close.contains(point)) {
+                    if let TabId::Role(id) = hitbox.id {
+                        self.close_role_tab(id);
+                    }
+                } else {
+                    self.select_tab(hitbox.id);
+                }
+                return;
+            }
+            if self.add_role_tab_hitbox.contains(point) {
+                let id = self.agents.get(self.selected_agent).map(|agent| agent.id);
+                if let Some(id) = id {
+                    self.open_role_tab(id);
+                }
+                return;
+            }
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self
                 .composer_hitbox
@@ -375,7 +532,21 @@ impl AppModel {
             self.composer_notice = None;
             return;
         }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.composer_active = false;
+        }
+        if self.active_role_tab.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.role_scroll = self.role_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => self.role_scroll = self.role_scroll.saturating_add(3),
+                _ => {}
+            }
+            return;
+        }
         if self.panel == Panel::Tasks {
+            let over_inspector = self
+                .task_inspector_hitbox
+                .contains((mouse.column, mouse.row).into());
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)
                     if self
@@ -395,19 +566,31 @@ impl AppModel {
                     return;
                 }
                 MouseEventKind::ScrollUp => {
-                    self.selected = self.selected.saturating_sub(1);
-                    self.task_inspector_scroll = 0;
+                    if over_inspector {
+                        self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(3);
+                    } else {
+                        self.selected = self.selected.saturating_sub(1);
+                        self.task_inspector_scroll = 0;
+                    }
                     return;
                 }
                 MouseEventKind::ScrollDown => {
-                    if self.selected + 1 < self.tasks.len() {
+                    if over_inspector {
+                        self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(3);
+                    } else if self.selected + 1 < self.tasks.len() {
                         self.selected += 1;
+                        self.task_inspector_scroll = 0;
                     }
-                    self.task_inspector_scroll = 0;
                     return;
                 }
                 _ => return,
             }
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.role_click_candidate = self
+                .team_flow
+                .node_at(mouse.column, mouse.row)
+                .map(|index| (index, mouse.column, mouse.row));
         }
         let interaction = self.team_flow.handle_mouse(mouse);
         if interaction.handled {
@@ -415,19 +598,151 @@ impl AppModel {
             if let Some(index) = interaction.selected {
                 self.selected_agent = index;
             }
+            if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+                self.role_click_candidate = None;
+                self.last_role_click = None;
+            }
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                && let Some((index, x, y)) = self.role_click_candidate.take()
+                && x == mouse.column
+                && y == mouse.row
+                && let Some(id) = self.agents.get(index).map(|agent| agent.id)
+            {
+                let now = std::time::Instant::now();
+                let double_click = self.last_role_click.is_some_and(|(previous, at)| {
+                    previous == id && now.duration_since(at) <= Duration::from_millis(500)
+                });
+                self.last_role_click = Some((id, now));
+                if double_click {
+                    self.last_role_click = None;
+                    self.open_role_tab(id);
+                }
+            }
         }
     }
 
-    fn open_team_setup(&mut self, selected_role: bool) {
-        if self.tasks.iter().any(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Queued
-                    | TaskStatus::Ready
-                    | TaskStatus::Running
-                    | TaskStatus::WaitingApproval
-            )
-        }) || self.quick_run_starting
+    fn open_team_setup(&mut self) {
+        self.open_agent_setup(false);
+    }
+
+    fn team_edit_blocked(&self) -> bool {
+        has_unsettled_tasks(&self.tasks)
+            || self.retry_starting
+            || self.pending_submissions > 0
+            || self
+                .approvals
+                .iter()
+                .any(|approval| approval.decision == ApprovalDecision::Pending)
+            || !self.lead_reviews.is_empty()
+    }
+
+    fn open_delete_confirmation(&mut self) {
+        if (self.panel != Panel::Agents && self.active_role_tab.is_none())
+            || self.help
+            || self.event_viewer
+        {
+            return;
+        }
+        if self.team_edit_blocked() {
+            self.warn("Finish or cancel pending work before editing the team.");
+            return;
+        }
+        let Some(draft) = &self.team_setup else {
+            self.warn("This team cannot be edited safely.");
+            return;
+        };
+        let index = self
+            .active_role_tab
+            .and_then(|id| self.agents.iter().position(|agent| agent.id == id))
+            .unwrap_or(self.selected_agent);
+        let Some(agent) = self.agents.get(index) else {
+            return;
+        };
+        if Some(agent.id) == self.team_lead || index == 0 {
+            self.warn("The Team Lead cannot be deleted.");
+        } else if draft
+            .developers
+            .iter()
+            .any(|developer| developer.reports_to == Some(index))
+        {
+            self.warn("Reassign this agent's direct reports before deleting it.");
+        } else if draft.developers.get(index).is_some() {
+            self.pending_delete = Some(agent.id);
+            self.composer_active = false;
+        }
+    }
+
+    fn handle_delete_event(&mut self, event: &Event, area: Rect) -> bool {
+        let Some(id) = self.pending_delete else {
+            return false;
+        };
+        let decision = match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('y') => Some(true),
+                KeyCode::Char('n') | KeyCode::Esc => Some(false),
+                _ => None,
+            },
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                let popup = delete_confirmation_area(area);
+                if popup.contains((mouse.column, mouse.row).into())
+                    && mouse.row == popup.bottom().saturating_sub(1)
+                {
+                    Some(mouse.column < popup.x + popup.width / 2)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some(confirm) = decision else {
+            return true;
+        };
+        self.pending_delete = None;
+        if !confirm {
+            return true;
+        }
+        let Some(index) = self.agents.iter().position(|agent| agent.id == id) else {
+            return true;
+        };
+        let Some(mut draft) = self.team_setup.clone() else {
+            return true;
+        };
+        if index == 0
+            || Some(id) == self.team_lead
+            || draft.developers.get(index).is_none()
+            || draft
+                .developers
+                .iter()
+                .any(|developer| developer.reports_to == Some(index))
+            || self.team_edit_blocked()
+        {
+            self.warn("The team changed; deletion was cancelled.");
+            return true;
+        }
+        let removed = draft.developers.remove(index).name;
+        for developer in &mut draft.developers {
+            if let Some(parent) = developer.reports_to.as_mut()
+                && *parent > index
+            {
+                *parent -= 1;
+            }
+        }
+        self.setup_notice = Some(format!("{removed} removed from the team"));
+        self.setup_result = Some(draft);
+        self.quit = true;
+        true
+    }
+
+    fn open_workspace_picker(&mut self) {
+        if self.team_edit_blocked() {
+            self.warn("Finish or cancel pending work before changing workspaces.");
+            return;
+        }
+        self.workspace_editor = Some(crate::onboarding::Wizard::workspace(&self.workspace_root));
+    }
+
+    fn open_agent_setup(&mut self, adding: bool) {
+        if has_unsettled_tasks(&self.tasks)
             || self.retry_starting
             || self.pending_submissions > 0
             || self
@@ -436,13 +751,11 @@ impl AppModel {
                 .any(|approval| approval.decision == ApprovalDecision::Pending)
             || !self.lead_reviews.is_empty()
         {
-            self.composer_notice =
-                Some("Finish or cancel pending work before editing the team.".into());
+            self.warn("Finish or cancel pending work before editing the team.");
             return;
         }
         let Some(mut draft) = self.team_setup.clone() else {
-            self.composer_notice =
-                Some("This custom team cannot be represented safely in guided setup.".into());
+            self.warn("This custom team cannot be represented safely in guided setup.");
             return;
         };
         for (developer, agent) in draft.developers.iter_mut().zip(&self.agents) {
@@ -450,11 +763,20 @@ impl AppModel {
             developer.max_output_tokens = agent.max_output_tokens;
         }
         draft.working_directory = self.workspace_root.clone();
-        let mut wizard = crate::onboarding::Wizard::edit(self.model_catalog.clone(), draft);
-        if selected_role {
-            wizard.select_role(self.selected_agent);
-        }
-        self.setup_editor = Some(wizard);
+        let selected = self
+            .active_role_tab
+            .and_then(|id| self.agents.iter().position(|agent| agent.id == id))
+            .unwrap_or(self.selected_agent)
+            .min(draft.developers.len().saturating_sub(1));
+        self.setup_editor = Some(if adding {
+            if draft.developers.len() >= 32 {
+                self.warn("A team supports at most 32 agents.");
+                return;
+            }
+            crate::onboarding::Wizard::add_agent(self.model_catalog.clone(), draft, selected)
+        } else {
+            crate::onboarding::Wizard::configure_agent(self.model_catalog.clone(), draft, selected)
+        });
     }
 
     fn handle_credential_event(
@@ -553,10 +875,10 @@ impl AppModel {
                 KeyCode::Enter => {
                     let message = self.composer.lines().join("\n").trim().to_owned();
                     if message.is_empty() {
-                        self.composer_notice = Some("Describe a task first.".into());
+                        self.warn("Describe a task first.");
                         ComposerEvent::Consumed
                     } else if message.len() > 8_000 {
-                        self.composer_notice = Some("Keep messages under 8,000 bytes.".into());
+                        self.warn("Keep messages under 8,000 bytes.");
                         ComposerEvent::Consumed
                     } else {
                         self.composer.clear();
@@ -579,6 +901,14 @@ impl AppModel {
                 }
             },
             Event::Mouse(mouse)
+                if self.help_hitbox.contains((mouse.column, mouse.row).into())
+                    || self
+                        .workspace_hitbox
+                        .contains((mouse.column, mouse.row).into()) =>
+            {
+                ComposerEvent::Ignored
+            }
+            Event::Mouse(mouse)
                 if self
                     .composer_hitbox
                     .contains((mouse.column, mouse.row).into()) =>
@@ -586,37 +916,115 @@ impl AppModel {
                 self.composer.input(*mouse);
                 ComposerEvent::Consumed
             }
+            Event::Mouse(_) => ComposerEvent::Ignored,
             _ => ComposerEvent::Consumed,
         }
     }
 
-    fn quick_run_active(&self) -> bool {
-        self.quick_run_starting
-            || self.tasks.iter().any(|task| {
-                task.objective == QUICK_RUN_OBJECTIVE
-                    && matches!(
-                        task.status,
-                        TaskStatus::Queued
-                            | TaskStatus::Ready
-                            | TaskStatus::Running
-                            | TaskStatus::WaitingApproval
+    fn action_for_mouse(&self, mouse: MouseEvent, area: Rect) -> Action {
+        if self.pending_approval().is_none() {
+            if self.help || self.event_viewer {
+                let popup = if self.help {
+                    help_popup_area(area)
+                } else {
+                    centered_popup(
+                        area,
+                        area.width.saturating_sub(4).min(100),
+                        area.height.saturating_sub(4).min(32),
                     )
-            })
+                };
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && (!popup.contains((mouse.column, mouse.row).into())
+                        || mouse.row == popup.bottom().saturating_sub(1))
+                {
+                    return if self.help {
+                        Action::ToggleHelp
+                    } else {
+                        Action::ToggleEvents
+                    };
+                }
+                return Action::None;
+            }
+            if self.credential_input.is_some() || self.application_notice.is_some() {
+                return Action::None;
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let point = (mouse.column, mouse.row).into();
+                if self.help_hitbox.contains(point) {
+                    return Action::ToggleHelp;
+                }
+                if self.workspace_hitbox.contains(point) {
+                    return Action::ChangeWorkspace;
+                }
+                if self.panel == Panel::Agents && self.active_role_tab.is_none() {
+                    if self.team_edit_hitbox.contains(point) {
+                        return Action::AdjustTeam;
+                    }
+                    if self.team_add_hitbox.contains(point) {
+                        return Action::AddAgent;
+                    }
+                } else {
+                    if self.task_expand_hitbox.contains(point) {
+                        return Action::ToggleExpanded;
+                    }
+                    if self.task_retry_hitbox.contains(point) {
+                        return Action::RetryTask;
+                    }
+                }
+            }
+            return Action::Mouse(mouse);
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::None;
+        }
+        let popup = if self.approval_details {
+            centered_popup(
+                area,
+                area.width.saturating_sub(2).max(1),
+                area.height.saturating_sub(2).max(1),
+            )
+        } else {
+            compact_approval_area(area)
+        };
+        let point = (mouse.column, mouse.row).into();
+        if !popup.contains(point) {
+            return Action::None;
+        }
+        if mouse.row != popup.bottom().saturating_sub(1) {
+            return if self.approval_details {
+                Action::None
+            } else {
+                Action::ToggleApprovalDetails
+            };
+        }
+        let offset = mouse.column.saturating_sub(popup.x.saturating_add(1));
+        let (approve_end, deny_end, detail_end) = if self.approval_details {
+            (14, 27, 47)
+        } else {
+            (5, 9, 24)
+        };
+        if offset < approve_end {
+            Action::Approve
+        } else if offset < deny_end {
+            Action::Deny
+        } else if offset < detail_end {
+            Action::ToggleApprovalDetails
+        } else {
+            Action::None
+        }
     }
+
     pub fn apply_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::TaskUpdated(task) => {
-                let is_new = !self.tasks.iter().any(|existing| existing.id == task.id);
-                if task.objective == QUICK_RUN_OBJECTIVE
-                    && matches!(
-                        task.status,
-                        TaskStatus::Blocked
-                            | TaskStatus::Completed
-                            | TaskStatus::Failed
-                            | TaskStatus::Cancelled
-                    )
-                {
-                    self.quick_run_starting = false;
+                let previous_status = self
+                    .tasks
+                    .iter()
+                    .find(|existing| existing.id == task.id)
+                    .map(|existing| existing.status);
+                let is_new = previous_status.is_none();
+                if previous_status != Some(task.status) {
+                    self.notify_task_status(&task);
                 }
                 if let Some(old) = self.tasks.iter_mut().find(|x| x.id == task.id) {
                     *old = task
@@ -657,38 +1065,47 @@ impl AppModel {
                                     sanitize(reason)
                                 ),
                             );
-                            self.composer_notice = Some(format!(
-                                "Team Lead {}: {}",
+                            let reviewer = self
+                                .agents
+                                .iter()
+                                .find(|agent| agent.id == *lead)
+                                .map_or("Reporting agent", |agent| agent.name.as_str());
+                            let review = format!(
+                                "{reviewer} {}: {}",
                                 if *approved { "approved" } else { "rejected" },
                                 sanitize(reason)
-                            ));
+                            );
+                            if *approved {
+                                self.composer_notice = Some(review);
+                            } else {
+                                self.warn(&review);
+                            }
                         }
                         CanonicalEventKind::RevisionRequested { .. } => {
-                            self.composer_notice = Some(
-                                "Team Lead returned feedback → developer revising → fresh review."
-                                    .into(),
-                            );
+                            let reviewer = self
+                                .tasks
+                                .iter()
+                                .find(|task| task.id == task_id)
+                                .and_then(|task| task.parent)
+                                .and_then(|parent| self.tasks.iter().find(|task| task.id == parent))
+                                .and_then(|parent| {
+                                    self.agents.iter().find(|agent| agent.id == parent.owner)
+                                })
+                                .map_or("Team Lead", |agent| agent.name.as_str());
+                            self.composer_notice = Some(format!(
+                                "{reviewer} returned feedback → agent revising → fresh review."
+                            ));
                         }
                         CanonicalEventKind::RevisionStopped(reason) => {
-                            self.composer_notice =
-                                Some(format!("Revision stopped: {}", sanitize(reason)));
+                            self.warn(&format!("Revision stopped: {}", sanitize(reason)));
                         }
                         CanonicalEventKind::ApplicationIssue(message) => {
                             self.application_notice = Some(sanitize(message));
                         }
+                        CanonicalEventKind::ProviderWarning(message) => {
+                            self.warn(&format!("Provider warning: {}", sanitize(message)));
+                        }
                         _ => {}
-                    }
-                }
-                if let CanonicalEventKind::Usage {
-                    input_tokens,
-                    output_tokens,
-                } = &e.kind
-                {
-                    if let Some(amount) = self.usage_cost(e.task_id, *input_tokens, *output_tokens)
-                    {
-                        *self.estimated_cost.get_or_insert(0.0) += amount;
-                    } else {
-                        self.cost_partial = true;
                     }
                 }
                 self.push_scoped_event(e.task_id, &e.kind)
@@ -713,7 +1130,7 @@ impl AppModel {
                     self.artifacts.push(artifact)
                 }
             }
-            EngineEvent::ProviderHealth(health) => self.provider_health = health,
+            EngineEvent::ProviderHealth(_) => {}
         }
         if self.events.len() > 500 {
             let drain = self.events.len() - 500;
@@ -725,30 +1142,110 @@ impl AppModel {
             self.scoped_events.drain(..self.scoped_events.len() - 500);
         }
     }
-    fn usage_cost(
-        &self,
-        task_id: Option<voff_core::TaskId>,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) -> Option<f64> {
-        match (self.input_cost_per_million, self.output_cost_per_million) {
-            (Some(input_rate), Some(output_rate)) => Some(
-                input_tokens as f64 * input_rate / 1_000_000.0
-                    + output_tokens as f64 * output_rate / 1_000_000.0,
-            ),
-            (Some(_), None) | (None, Some(_)) => None,
-            (None, None) => {
-                let owner = self
-                    .tasks
-                    .iter()
-                    .find(|task| Some(task.id) == task_id)?
-                    .owner;
-                let agent = self.agents.iter().find(|agent| agent.id == owner)?;
-                let provider = self.agent_provider_kinds.get(&owner)?;
-                self.model_catalog
-                    .estimate_usd(provider, &agent.model, input_tokens, output_tokens)
+
+    fn notify(
+        &mut self,
+        title: &str,
+        message: &str,
+        level: Level,
+        accent: Color,
+        persistent: bool,
+    ) -> Option<u64> {
+        let mut lines = vec![Line::from(Span::styled(
+            title.to_owned(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))];
+        lines.extend(message.lines().map(|line| Line::from(line.to_owned())));
+        let content = Text::from(lines);
+        let notification = Notification::new(content)
+            .level(level)
+            .anchor(Anchor::TopLeft)
+            .margin(3)
+            .animation(Animation::Fade)
+            .auto_dismiss(if persistent {
+                AutoDismiss::Never
+            } else {
+                AutoDismiss::After(Duration::from_secs(5))
+            })
+            .max_size(SizeConstraint::Absolute(48), SizeConstraint::Absolute(5))
+            .style(theme::surface())
+            .border_style(Style::default().fg(accent))
+            .title_style(
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .build();
+        let id = notification
+            .ok()
+            .and_then(|notification| self.notifications.add(notification).ok());
+        if let Some(id) = id
+            && !persistent
+        {
+            self.transient_notification_ids.push_back(id);
+            if self.transient_notification_ids.len() > 2
+                && let Some(oldest) = self.transient_notification_ids.pop_front()
+            {
+                self.notifications.remove(oldest);
             }
         }
+        id
+    }
+
+    fn warn(&mut self, message: &str) {
+        self.composer_notice = None;
+        let _ = self.notify(
+            "Action unavailable",
+            message,
+            Level::Warn,
+            theme::YELLOW,
+            false,
+        );
+    }
+
+    fn sync_team_hint(&mut self) {
+        let visible = self.agents.len() == 1
+            && self.team_lead == self.agents.first().map(|agent| agent.id)
+            && self.panel == Panel::Agents
+            && self.active_role_tab.is_none()
+            && self.setup_editor.is_none()
+            && self.workspace_editor.is_none();
+        if visible && self.team_hint_id.is_none() {
+            self.team_hint_id = self.notify(
+                "Your team is ready",
+                "Press [a] to add an agent\nEnter to assign a task",
+                Level::Info,
+                theme::AQUA,
+                true,
+            );
+        } else if !visible && let Some(id) = self.team_hint_id.take() {
+            self.notifications.remove(id);
+        }
+    }
+
+    fn notify_task_status(&mut self, task: &Task) {
+        let (title, level, accent, action) = match task.status {
+            TaskStatus::Completed => ("Task completed", Level::Info, theme::GREEN, "Review"),
+            TaskStatus::Failed => ("Task failed", Level::Error, theme::RED, "Inspect"),
+            TaskStatus::Blocked => ("Task blocked", Level::Warn, theme::YELLOW, "Inspect"),
+            TaskStatus::Cancelled => ("Task cancelled", Level::Warn, theme::MUTED, "Inspect"),
+            _ => return,
+        };
+        let role = self
+            .agent_for_owner(task.owner)
+            .map_or("Agent", |agent| agent.name.as_str());
+        let role = sanitize(role).replace(['\n', '\t'], " ");
+        let _ = self.notify(
+            title,
+            &format!(
+                "{} · {} · {action} in [2] Tasks",
+                role,
+                short_task_id(task.id)
+            ),
+            level,
+            accent,
+            false,
+        );
     }
     fn pending_approval(&self) -> Option<&Approval> {
         let pending_count = self.pending_approval_count();
@@ -815,6 +1312,17 @@ impl AppModel {
     }
 
     fn push_scoped_event(&mut self, task_id: Option<voff_core::TaskId>, kind: &CanonicalEventKind) {
+        let reviewer = task_id
+            .and_then(|id| self.tasks.iter().find(|task| task.id == id))
+            .and_then(|task| task.parent)
+            .and_then(|parent| self.tasks.iter().find(|task| task.id == parent))
+            .and_then(|parent| self.agents.iter().find(|agent| agent.id == parent.owner))
+            .map(|agent| agent.name.clone());
+        let description = format_event(kind);
+        let description = reviewer.as_deref().map_or_else(
+            || description.clone(),
+            |name| description.replace("Team Lead", name),
+        );
         if let Some(owner) = task_id.and_then(|id| {
             self.tasks
                 .iter()
@@ -856,7 +1364,7 @@ impl AppModel {
             }
         } else {
             self.streaming_text = false;
-            self.events.push(format_event(kind));
+            self.events.push(description.clone());
             self.event_task_ids.push(task_id);
         }
         if let CanonicalEventKind::TextDelta(delta) | CanonicalEventKind::GenerationDelta(delta) =
@@ -883,9 +1391,13 @@ impl AppModel {
         } else {
             self.scoped_events.push(ScopedEvent {
                 task_id,
-                text: format_event(kind),
+                text: description,
                 is_output: false,
-                workflow: workflow_step(kind),
+                workflow: workflow_step(kind).map(|step| {
+                    reviewer
+                        .as_deref()
+                        .map_or_else(|| step.to_owned(), |name| step.replace("Team Lead", name))
+                }),
             });
         }
         self.on_events_changed();
@@ -943,6 +1455,37 @@ impl AppModel {
             .min(usize::from(u16::MAX)) as u16
     }
 }
+
+fn has_unsettled_tasks(tasks: &[Task]) -> bool {
+    tasks.iter().any(|task| {
+        matches!(
+            task.status,
+            TaskStatus::Queued
+                | TaskStatus::Ready
+                | TaskStatus::Running
+                | TaskStatus::WaitingApproval
+        )
+    })
+}
+
+fn new_composer() -> TextArea<'static> {
+    let mut composer = TextArea::default();
+    composer.set_cursor_line_style(Style::default());
+    composer.set_cursor_style(
+        Style::default()
+            .fg(theme::BACKGROUND)
+            .bg(theme::AQUA)
+            .add_modifier(Modifier::BOLD),
+    );
+    composer.set_selection_style(Style::default().fg(theme::BACKGROUND).bg(theme::YELLOW));
+    composer.set_style(theme::canvas());
+    composer.set_placeholder_style(Style::default().fg(theme::MUTED).bg(theme::BACKGROUND));
+    composer.set_wrap_mode(WrapMode::WordOrGlyph);
+    composer.set_tab_length(2);
+    composer.set_max_histories(200);
+    composer.set_placeholder_text("Ask Team Lead to do anything");
+    composer
+}
 #[must_use]
 pub const fn action_for_key(code: KeyCode) -> Action {
     match code {
@@ -951,10 +1494,8 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Tab => Action::NextPanel,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Enter => Action::FocusComposer,
-        KeyCode::Char('R') => Action::QuickRun,
         KeyCode::Char('r') => Action::RetryTask,
         KeyCode::Char('A') => Action::AddCredential,
-        KeyCode::Char('c') => Action::ConfigureModel,
         KeyCode::Char('x') => Action::Cancel,
         KeyCode::Char('y') => Action::Approve,
         KeyCode::Char('n') => Action::Deny,
@@ -965,11 +1506,14 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('+') | KeyCode::Char('=') => Action::ZoomTeamIn,
         KeyCode::Char('-') => Action::ZoomTeamOut,
         KeyCode::Char('0') => Action::ResetTeamZoom,
-        KeyCode::Char('t') => Action::AdjustTeam,
+        KeyCode::Char('c') => Action::AdjustTeam,
+        KeyCode::Char('g') => Action::ChangeWorkspace,
+        KeyCode::Char('a') => Action::AddAgent,
+        KeyCode::Delete => Action::DeleteAgent,
         KeyCode::Char('1') => Action::ShowTeam,
         KeyCode::Char('2') => Action::ShowTasks,
-        KeyCode::Char('s') => Action::ShowTaskDetails,
-        KeyCode::Char('a') => Action::ShowRoleActivity,
+        KeyCode::Char('t') => Action::OpenRoleTab,
+        KeyCode::Char('w') => Action::ChangeWorkspace,
         KeyCode::Char('v') => Action::ToggleExpanded,
         KeyCode::Char('d') => Action::ToggleApprovalDetails,
         KeyCode::Esc => Action::Escape,
@@ -980,6 +1524,11 @@ pub const fn action_for_key(code: KeyCode) -> Action {
 
 fn action_for_event(value: Event) -> Action {
     match value {
+        Event::Key(key)
+            if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Action::CloseRoleTab
+        }
         Event::Key(key) => action_for_key(key.code),
         Event::Mouse(mouse) => Action::Mouse(mouse),
         Event::FocusGained | Event::FocusLost | Event::Paste(_) | Event::Resize(_, _) => {
@@ -1181,41 +1730,41 @@ fn task_browser_order(tasks: &[Task], team_lead: Option<AgentId>) -> Vec<voff_co
 fn event_text_color(text: &str) -> Color {
     let text = text.to_ascii_lowercase();
     if text.starts_with("team lead → approved") {
-        Color::Green
+        theme::GREEN
     } else if text.starts_with("team lead → rejected")
         || text.starts_with("application needs attention")
         || text.starts_with("revision blocked:")
     {
-        Color::LightRed
+        theme::RED
     } else if text.contains("→ team lead") || text.starts_with("team lead → developer:") {
-        Color::LightCyan
+        theme::AQUA
     } else if text.starts_with("tool proposed:")
         || text.starts_with("approval requested:")
         || text.starts_with("approval:")
     {
-        Color::Yellow
+        theme::YELLOW
     } else if text.contains("failed")
         || text.contains("conflict")
         || text.contains("cancelled")
         || text.contains("denied")
     {
-        Color::LightRed
+        theme::RED
     } else if text.starts_with("provider completed")
         || text.starts_with("result:")
         || text.starts_with("artifact published:")
     {
-        Color::Green
+        theme::GREEN
     } else if text.starts_with("task ")
         || text.starts_with("task:")
         || text.starts_with("re-run attempt ")
         || text.starts_with("delegated ")
         || text.starts_with("dependency:")
     {
-        Color::LightCyan
+        theme::AQUA
     } else if text.starts_with("usage:") {
-        Color::LightMagenta
+        theme::PURPLE
     } else {
-        Color::White
+        theme::TEXT
     }
 }
 
@@ -1230,12 +1779,12 @@ fn event_viewer_lines(app: &AppModel) -> Vec<Line<'static>> {
             if first {
                 spans.push(Span::styled(
                     format!("#{} · ", index + 1),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT),
                 ));
                 if let Some(task_id) = task_id {
                     spans.push(Span::styled(
                         task_event_prefix(task_id),
-                        Style::default().fg(Color::LightBlue),
+                        Style::default().fg(theme::BLUE),
                     ));
                 }
                 first = false;
@@ -1299,8 +1848,6 @@ pub(crate) struct ConfiguredRun {
     pub owner: AgentId,
     pub model_name: String,
     pub system_prompt: String,
-    pub provider_label: String,
-    pub agent_name: String,
     pub agent_profiles: Vec<voff_core::AgentProfile>,
     pub known_agents: HashMap<AgentId, AgentProfile>,
     pub initial_tasks: Vec<Task>,
@@ -1311,20 +1858,20 @@ pub(crate) struct ConfiguredRun {
     pub workspace_context: String,
     pub workspace_root: std::path::PathBuf,
     pub max_parallel_tasks: usize,
-    pub input_cost_per_million: Option<f64>,
-    pub output_cost_per_million: Option<f64>,
-    pub cost_currency: String,
     pub model_catalog: ModelCatalog,
     pub agent_provider_kinds: HashMap<AgentId, String>,
     pub credential_target: Option<(String, crate::credential::CredentialSlot)>,
     pub team_lead: AgentId,
     pub team_setup: Option<crate::onboarding::SetupDraft>,
+    pub startup_notice: Option<String>,
 }
-pub(crate) async fn run_configured(
-    config: ConfiguredRun,
-) -> Result<Option<crate::onboarding::SetupDraft>, TuiError> {
+pub(crate) enum TuiExit {
+    Team(crate::onboarding::SetupDraft, Option<String>),
+    Workspace(PathBuf),
+}
+
+pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiExit>, TuiError> {
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
-    let model_label = config.model_name.clone();
     let credential_repository = Arc::clone(&config.repo);
     let agent_profiles = config.agent_profiles.clone();
     let engine = Arc::new(
@@ -1343,33 +1890,15 @@ pub(crate) async fn run_configured(
     let mut app = AppModel::new(config.session);
     app.automatic_review = config.automatic_review;
     app.workspace_root = config.workspace_root.clone();
-    app.provider_label = config.provider_label;
-    app.agent_name = config.agent_name;
     app.agents = agent_profiles;
     app.known_agents = config.known_agents;
-    app.model_label = model_label;
-    app.input_cost_per_million = config.input_cost_per_million;
-    app.output_cost_per_million = config.output_cost_per_million;
-    app.cost_currency =
-        if app.input_cost_per_million.is_some() || app.output_cost_per_million.is_some() {
-            config.cost_currency
-        } else {
-            "USD".into()
-        };
     app.model_catalog = config.model_catalog;
     app.agent_provider_kinds = config.agent_provider_kinds;
     app.credential_target = config.credential_target;
     app.team_lead = Some(config.team_lead);
     app.team_setup = config.team_setup;
-    if app.input_cost_per_million.is_some() && app.output_cost_per_million.is_some()
-        || app.agents.iter().any(|agent| {
-            app.agent_provider_kinds
-                .get(&agent.id)
-                .and_then(|provider| app.model_catalog.option(provider, &agent.model))
-                .is_some_and(|model| model.input_price.is_some() && model.output_price.is_some())
-        })
-    {
-        app.estimated_cost = Some(0.0);
+    if let Some(notice) = config.startup_notice {
+        let _ = app.notify("Team updated", &notice, Level::Info, theme::GREEN, false);
     }
     restore_initial_history(
         &mut app,
@@ -1391,7 +1920,15 @@ pub(crate) async fn run_configured(
         event_rx,
     )
     .await?;
-    Ok(app.setup_result.take())
+    Ok(app
+        .workspace_result
+        .take()
+        .map(TuiExit::Workspace)
+        .or_else(|| {
+            app.setup_result
+                .take()
+                .map(|draft| TuiExit::Team(draft, app.setup_notice.take()))
+        }))
 }
 
 fn restore_initial_history(
@@ -1420,16 +1957,6 @@ struct LoopConfig {
     max_parallel_tasks: usize,
     credential_repository: Arc<SqliteRepository>,
 }
-
-const QUICK_RUN_OBJECTIVE: &str = "Quick Run: analyze the workspace Markdown files as the project brief. Reconcile their active requirements, TODOs, acceptance criteria, and roadmap items with the current source; ignore work that is already completed, superseded, generated, or out of scope. Build a prioritized implementation plan, then create bounded tasks with concrete acceptance criteria. When enabled specialists are available, delegate every independent workstream to the best-fitting role with non-overlapping ownership; in a solo team, execute the work directly. Carry approved tasks through implementation and validation, request review where useful, and integrate the resulting evidence. Preserve user control: use the normal approval flow for every delegation, patch, command, or other side effect.";
-
-const QUICK_RUN_ACCEPTANCE: [&str; 5] = [
-    "Relevant Markdown requirements are reconciled with the current workspace state",
-    "Actionable work is prioritized into bounded tasks with concrete acceptance criteria",
-    "Independent workstreams are delegated to appropriate enabled specialists when available",
-    "Approved work is implemented and validated with inspectable evidence",
-    "Completed, superseded, generated, and out-of-scope items are not reimplemented",
-];
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -1475,16 +2002,18 @@ async fn terminal_loop<R: Repository + 'static>(
     let (credential_tx, mut credential_rx) = mpsc::channel(1);
     let (lead_submission_tx, mut lead_submission_rx) =
         mpsc::channel::<Result<&'static str, String>>(8);
-    let (quick_run_tx, mut quick_run_rx) = mpsc::channel::<Result<(), String>>(1);
     let (retry_tx, mut retry_rx) = mpsc::channel::<Result<(voff_core::TaskId, u16), String>>(1);
-    if model.automatic_review {
+    if model.automatic_review && has_unsettled_tasks(&model.tasks) {
         model.pending_submissions += 1;
         let engine = Arc::clone(&engine);
         let notices = lead_submission_tx.clone();
         tokio::spawn(async move {
-            if let Err(error) = engine.run_until_idle_bounded(max_parallel_tasks).await {
-                let _ = notices.send(Err(error.to_string())).await;
-            }
+            let result = engine
+                .run_until_idle_bounded(max_parallel_tasks)
+                .await
+                .map(|_| "Pending work processed.")
+                .map_err(|error| error.to_string());
+            let _ = notices.send(result).await;
         });
     }
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -1492,14 +2021,28 @@ async fn terminal_loop<R: Repository + 'static>(
     'terminal: while !model.quit {
         tokio::select! {
             Some(event)=input_rx.recv()=>{
+                if let Some(wizard) = model.workspace_editor.as_mut() {
+                    wizard.handle_event(&event, terminal.size()?.into());
+                    if wizard.cancelled() {
+                        model.workspace_editor = None;
+                    } else if wizard.complete() {
+                        model.workspace_result = Some(wizard.selected_workspace().to_path_buf());
+                        model.workspace_editor = None;
+                        model.quit = true;
+                    }
+                    continue;
+                }
                 if let Some(wizard) = model.setup_editor.as_mut() {
-                    wizard.handle_event(&event);
+                    wizard.handle_event(&event, terminal.size()?.into());
                     if wizard.cancelled() {
                         model.setup_editor = None;
                     } else if wizard.complete() {
                         model.setup_result = model.setup_editor.take().map(crate::onboarding::Wizard::into_draft);
                         model.quit = true;
                     }
+                    continue;
+                }
+                if model.handle_delete_event(&event, terminal.size()?.into()) {
                     continue;
                 }
                 let (handled, submission) = model.handle_credential_event(&event);
@@ -1517,12 +2060,31 @@ async fn terminal_loop<R: Repository + 'static>(
                 } else if !handled {
                     match model.handle_composer_event(&event) {
                         ComposerEvent::Submit(objective) => {
+                            let role_target = model
+                                .composer_target()
+                                .filter(|agent| Some(agent.id) != model.team_lead)
+                                .map(|agent| (agent.id, agent.name.clone()));
+                            let routed = model.routed_objective(&objective);
                             model.pending_submissions += 1;
-                            model.composer_notice = Some("Task sent to Team Lead.".into());
-                            model.push_ui_event(format!(
-                                "you → Team Lead task: {}",
-                                sanitize(&objective)
-                            ));
+                            if let Some((id, name)) = &role_target {
+                                model.role_requests.push((*id, objective.clone()));
+                                if model.role_requests.len() > 100 {
+                                    model.role_requests.remove(0);
+                                }
+                                model.composer_notice = Some(format!(
+                                    "Team Lead asked to delegate to {name}."
+                                ));
+                                model.push_ui_event(format!(
+                                    "you → Team Lead (requested {name}): {}",
+                                    sanitize(&objective)
+                                ));
+                            } else {
+                                model.composer_notice = Some("Task sent to Team Lead.".into());
+                                model.push_ui_event(format!(
+                                    "you → Team Lead task: {}",
+                                    sanitize(&objective)
+                                ));
+                            }
                             let engine = Arc::clone(&engine);
                             let lead_submission_tx = lead_submission_tx.clone();
                             tokio::spawn(async move {
@@ -1530,10 +2092,14 @@ async fn terminal_loop<R: Repository + 'static>(
                                     let task = engine
                                         .create_task(
                                             owner,
-                                            objective,
+                                            routed,
                                             vec![
-                                                "Team Lead completes or delegates the requested work"
-                                                    .into(),
+                                                if role_target.is_some() {
+                                                    "Team Lead delegates to the requested role and integrates its response, or reports a blocker"
+                                                } else {
+                                                    "Team Lead completes or delegates the requested work"
+                                                }
+                                                .into(),
                                             ],
                                         )
                                         .await?;
@@ -1548,54 +2114,16 @@ async fn terminal_loop<R: Repository + 'static>(
                         }
                         ComposerEvent::Consumed => {}
                         ComposerEvent::Ignored => {
-                            let action = action_for_event(event);
-                            match action {
-                                Action::QuickRun => {
-                                    if model.quick_run_active() {
-                                        model.composer_notice =
-                                            Some("Quick Run is already active in Tasks.".into());
-                                        model.panel = Panel::Tasks;
-                                    } else {
-                                        model.quick_run_starting = true;
-                                        model.panel = Panel::Tasks;
-                                        model.event_viewer = false;
-                                        model.help = false;
-                                        model.selected = 0;
-                                        model.composer_notice = Some(
-                                            "Quick Run started: Team Lead is analysing Markdown."
-                                                .into(),
-                                        );
-                                        model.push_ui_event(
-                                            "Quick Run → Team Lead: analyze Markdown, plan, delegate, execute"
-                                                .into(),
-                                        );
-                                        let engine = Arc::clone(&engine);
-                                        let quick_run_tx = quick_run_tx.clone();
-                                        tokio::spawn(async move {
-                                            let result = async {
-                                                let task = engine
-                                                    .create_task(
-                                                        owner,
-                                                        QUICK_RUN_OBJECTIVE,
-                                                        QUICK_RUN_ACCEPTANCE
-                                                            .iter()
-                                                            .map(|criterion| (*criterion).into())
-                                                            .collect(),
-                                                    )
-                                                    .await?;
-                                                engine.mark_ready(task.id).await?;
-                                                engine.run_task_and_schedule(task.id, max_parallel_tasks).await
-                                            }
-                                            .await
-                                            .map_err(|error| error.to_string());
-                                            let _ = quick_run_tx.send(result).await;
-                                        });
-                                    }
+                            let action = match event {
+                                Event::Mouse(mouse) => {
+                                    model.action_for_mouse(mouse, terminal.size()?.into())
                                 }
+                                other => action_for_event(other),
+                            };
+                            match action {
                                 Action::RetryTask if model.panel == Panel::Tasks => {
                                     if model.retry_starting {
-                                        model.composer_notice =
-                                            Some("A task re-run is already being prepared.".into());
+                                        model.warn("A task re-run is already being prepared.");
                                     } else if let Some(task) = model.selected_task().cloned() {
                                         if task.status.can_retry() {
                                             model.retry_starting = true;
@@ -1631,14 +2159,13 @@ async fn terminal_loop<R: Repository + 'static>(
                                                 }
                                             });
                                         } else {
-                                            model.composer_notice = Some(format!(
+                                            model.warn(&format!(
                                                 "A {:?} task cannot be re-run; cancel it first if it is active.",
                                                 task.status
                                             ));
                                         }
                                     } else {
-                                        model.composer_notice =
-                                            Some("Select a task to re-run.".into());
+                                        model.warn("Select a task to re-run.");
                                     }
                                 }
                                 Action::Cancel => {
@@ -1707,27 +2234,8 @@ async fn terminal_loop<R: Repository + 'static>(
                     Ok(notice) => model.composer_notice = Some(notice.into()),
                     Err(error) => {
                         let error = sanitize(&error);
-                        model.composer_notice = Some(format!(
-                            "Team Lead request failed: {error}"
-                        ));
+                        model.warn(&format!("Team Lead request failed: {error}"));
                         model.push_ui_event(format!("Team Lead request failed: {error}"));
-                    }
-                }
-            }
-            Some(result)=quick_run_rx.recv()=>{
-                match result {
-                    Ok(()) => {
-                        model.composer_notice = Some(
-                            if model.automatic_review { "Quick Run settled. Team Lead decisions are in Activity." } else { "Quick Run planned. Review and approve its visible actions." }.into()
-                        );
-                    }
-                    Err(error) => {
-                        model.quick_run_starting = false;
-                        let error = sanitize(&error);
-                        model.composer_notice = Some(format!(
-                            "Quick Run failed: {error}"
-                        ));
-                        model.push_ui_event(format!("Quick Run failed: {error}"));
                     }
                 }
             }
@@ -1742,9 +2250,7 @@ async fn terminal_loop<R: Repository + 'static>(
                     }
                     Err(error) => {
                         let error = sanitize(&error);
-                        model.composer_notice = Some(format!(
-                            "Could not re-run task: {error}"
-                        ));
+                        model.warn(&format!("Could not re-run task: {error}"));
                         model.push_ui_event(format!("Task re-run failed: {error}"));
                     }
                 }
@@ -1752,6 +2258,7 @@ async fn terminal_loop<R: Repository + 'static>(
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
                 model.team_flow.tick(Duration::from_millis(100));
+                model.notifications.tick(Duration::from_millis(100));
                 if let Err(error) = terminal.draw(|frame|render(frame,model)) {
                     loop_result = Err(TuiError::Io(error));
                     break 'terminal;
@@ -1791,160 +2298,309 @@ fn composer_height(app: &AppModel, area: Rect) -> u16 {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
-    if let Some(wizard) = &app.setup_editor {
-        crate::onboarding::render(frame, wizard);
-        return;
-    }
+    app.sync_team_hint();
+    frame.render_widget(Block::default().style(theme::canvas()), frame.area());
     let composer_height = composer_height(app, frame.area());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(2),
             Constraint::Min(8),
             Constraint::Length(composer_height),
         ])
         .split(frame.area());
-    let session = app.session.to_string();
-    let cost_source =
-        if app.input_cost_per_million.is_some() || app.output_cost_per_million.is_some() {
-            "manual rates"
-        } else {
-            "catalog"
-        };
-    let cost = app
-        .estimated_cost
-        .map(|value| {
-            format!(
-                "{value:.4} {} est. · {cost_source}{}",
-                app.cost_currency,
-                if app.cost_partial { " · partial" } else { "" }
-            )
-        })
-        .unwrap_or_else(|| "cost unconfigured".into());
-    let credential = app
-        .credential_target
-        .as_ref()
-        .map(|(_, slot)| {
-            if slot.is_available() {
-                " · token ready".to_owned()
-            } else {
-                " · no token [A]".to_owned()
-            }
-        })
-        .unwrap_or_default();
-    let view = match app.panel {
-        Panel::Agents => "Team",
-        Panel::Tasks => "Tasks",
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    " ◆ voff ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(
-                    "workspace · {}/{} developers enabled · {} · session {}",
-                    app.agents.iter().filter(|agent| agent.enabled).count(),
-                    app.agents.len(),
-                    view,
-                    &session[..session.len().min(8)]
-                )),
-            ]),
-            Line::from(vec![
-                menu_tab("[1 Team]", app.panel == Panel::Agents),
-                menu_tab("[2 Tasks]", app.panel == Panel::Tasks),
-                Span::styled(
-                    format!(
-                        " · {} · {} · circuit {:?} · {} retries · {cost}{credential}",
-                        app.provider_label,
-                        app.model_label,
-                        app.provider_health.circuit,
-                        app.provider_health.retries
-                    ),
-                    Style::default().fg(Color::Gray),
-                ),
-            ]),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        ),
-        rows[0],
-    );
+    render_tab_bar(frame, app, rows[0]);
 
-    match app.panel {
-        Panel::Agents => render_team(frame, app, rows[1]),
-        Panel::Tasks => render_tasks_workspace(frame, app, rows[1]),
+    if let Some(id) = app.active_role_tab {
+        render_role_workspace(frame, app, id, rows[1]);
+    } else {
+        match app.panel {
+            Panel::Agents => render_team(frame, app, rows[1]),
+            Panel::Tasks => render_tasks_workspace(frame, app, rows[1]),
+        }
     }
 
     let workspace = sanitize(&app.workspace_root.display().to_string());
-    app.composer.set_placeholder_text(if app.composer_active {
-        "Describe the task for the Team Lead"
+    let right_title = format!(" [?] help · [w] {workspace} ");
+    app.help_hitbox = Rect::new(
+        rows[2]
+            .right()
+            .saturating_sub(1)
+            .saturating_sub(right_title.chars().count() as u16),
+        rows[2].bottom().saturating_sub(1),
+        8,
+        1,
+    );
+    app.workspace_hitbox = Rect::new(
+        rows[2]
+            .right()
+            .saturating_sub(1)
+            .saturating_sub(workspace.chars().count() as u16 + 5),
+        rows[2].bottom().saturating_sub(1),
+        (workspace.chars().count() as u16 + 5).min(rows[2].width),
+        1,
+    );
+    let placeholder = if app.composer_active {
+        String::new()
     } else {
-        "Press Enter to assign a task"
-    });
+        app.composer_target().map_or_else(
+            || "Ask Team Lead to do anything".to_owned(),
+            |agent| format!("Ask {} to do anything", sanitize(&agent.name)),
+        )
+    };
+    app.composer.set_placeholder_text(placeholder);
     let composer_status = if app.composer_active {
         let DataCursor(line, column) = app.composer.cursor();
         Some((
             Line::from(format!(
-                " Enter send · Shift+Enter/Ctrl+J newline · Ctrl+Z/Y undo/redo · {}:{} ",
+                " Enter send · Shift+Enter newline · {}:{} ",
                 line + 1,
                 column + 1
             ))
-            .style(Style::default().fg(Color::LightCyan)),
+            .style(Style::default().fg(theme::MUTED)),
             Alignment::Left,
         ))
     } else {
-        Some(app.composer_notice.as_deref().map_or_else(
-            || {
-                (
-                    Line::from(" [R] ").style(Style::default().fg(Color::White)),
-                    Alignment::Center,
-                )
-            },
-            |notice| {
-                (
-                    Line::from(format!(" {} ", sanitize(notice)))
-                        .style(Style::default().fg(Color::DarkGray)),
-                    Alignment::Left,
-                )
-            },
-        ))
+        app.composer_notice.as_deref().map(|notice| {
+            (
+                Line::from(format!(" {} ", sanitize(notice)))
+                    .style(Style::default().fg(theme::TEXT)),
+                Alignment::Left,
+            )
+        })
     };
     let composer_color = if app.composer_active {
-        Color::LightCyan
+        theme::AQUA
     } else {
-        Color::DarkGray
+        theme::BORDER
     };
     let mut composer_block = Block::default()
-        .title(" Team Lead ")
         .title_bottom(
-            Line::from(format!(" ? help · cwd {workspace} "))
-                .style(Style::default().fg(Color::DarkGray))
+            Line::from(right_title)
+                .style(Style::default().fg(theme::TEXT))
                 .alignment(ratatui::layout::Alignment::Right),
         )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .style(theme::canvas())
         .border_style(Style::default().fg(composer_color));
     if let Some((status, status_alignment)) = composer_status {
         composer_block = composer_block.title_bottom(status.alignment(status_alignment));
     }
-    app.composer.set_block(composer_block);
+    frame.render_widget(composer_block, rows[2]);
+    let composer_inner = rows[2].inner(ratatui::layout::Margin::new(1, 1));
+    if composer_inner.width >= 4 {
+        frame.render_widget(
+            Paragraph::new("🐶").style(Style::default().fg(theme::ORANGE)),
+            Rect::new(composer_inner.x, composer_inner.y, 2, 1),
+        );
+    }
+    let input_offset = 2;
+    let input_area = Rect::new(
+        composer_inner.x.saturating_add(input_offset),
+        composer_inner.y,
+        composer_inner.width.saturating_sub(input_offset),
+        composer_inner.height,
+    );
+    app.composer
+        .set_block(Block::default().style(theme::canvas()));
     app.composer.set_cursor_style(if app.composer_active {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightCyan)
+            .fg(theme::BACKGROUND)
+            .bg(theme::AQUA)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     });
     app.composer_hitbox = rows[2];
-    frame.render_widget(&app.composer, rows[2]);
+    frame.render_widget(&app.composer, input_area);
+    if frame.area().width >= 48 && frame.area().height >= 12 {
+        app.notifications.render(frame, frame.area());
+    }
+    if let Some(wizard) = &app.setup_editor {
+        crate::onboarding::render_popup(frame, wizard);
+        return;
+    }
+    if let Some(wizard) = &app.workspace_editor {
+        crate::onboarding::render_popup(frame, wizard);
+        return;
+    }
     render_overlays(frame, app);
+}
+
+fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
+    let session = app.session.to_string();
+    let short = &session[..session.len().min(8)];
+    let mut spans = if area.width < 48 {
+        vec![
+            Span::styled(
+                " voff",
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("·{}  ", &short[..short.len().min(6)]),
+                Style::default().fg(theme::TEXT),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled(
+                " voff ",
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("· {short}   "), Style::default().fg(theme::TEXT)),
+        ]
+    };
+    let mut x = area
+        .x
+        .saturating_add(u16::try_from(Line::from(spans.clone()).width()).unwrap_or(u16::MAX));
+    let right = area.right().saturating_sub(1);
+    let row = area.y;
+    app.tab_hitboxes.clear();
+    app.add_role_tab_hitbox = Rect::default();
+    let active = app.active_tab();
+    for (id, label) in [(TabId::Team, "[1] Team"), (TabId::Tasks, "[2] Tasks")] {
+        let tab = menu_tab(label, active == id);
+        let width = u16::try_from(Line::from(tab.content.as_ref()).width()).unwrap_or(u16::MAX);
+        if x.saturating_add(width) > right {
+            break;
+        }
+        let hitbox = Rect::new(x, row, width, 1);
+        if id == TabId::Team {
+            app.team_tab_hitbox = hitbox;
+        } else {
+            app.tasks_tab_hitbox = hitbox;
+        }
+        app.tab_hitboxes.push(TabHitbox {
+            id,
+            area: hitbox,
+            close: None,
+        });
+        spans.push(tab);
+        x = x.saturating_add(width);
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+    }
+    let mut roles = app.role_tabs.clone();
+    if let Some(selected) = app.active_role_tab {
+        roles.retain(|id| *id != selected);
+        roles.insert(0, selected);
+    }
+    let mut hidden = 0;
+    for id in roles {
+        let Some(agent) = app.agents.iter().find(|agent| agent.id == id) else {
+            continue;
+        };
+        let name = truncate_text(&sanitize(&agent.name), 18);
+        let label = format!(" {name} × ");
+        let width = u16::try_from(Line::from(label.as_str()).width()).unwrap_or(u16::MAX);
+        if x.saturating_add(width).saturating_add(1) > right {
+            hidden += 1;
+            continue;
+        }
+        let hitbox = Rect::new(x, row, width, 1);
+        let close_x = x.saturating_add(width.saturating_sub(2));
+        app.tab_hitboxes.push(TabHitbox {
+            id: TabId::Role(id),
+            area: hitbox,
+            close: Some(Rect::new(close_x, row, 1, 1)),
+        });
+        spans.push(Span::styled(
+            label,
+            if active == TabId::Role(id) {
+                Style::default()
+                    .fg(theme::TEXT)
+                    .bg(theme::BORDER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(role_color(&agent.role))
+                    .bg(theme::ELEVATED)
+            },
+        ));
+        x = x.saturating_add(width);
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+    }
+    if hidden > 0 && x.saturating_add(3) < right {
+        spans.push(Span::styled(
+            format!("+{hidden} "),
+            Style::default().fg(theme::MUTED),
+        ));
+        x = x.saturating_add(3);
+    }
+    if x.saturating_add(3) <= right {
+        spans.push(Span::styled(
+            " + ",
+            Style::default().fg(theme::TEXT).bg(theme::ELEVATED),
+        ));
+        app.add_role_tab_hitbox = Rect::new(x, row, 3, 1);
+    }
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .style(theme::surface())
+            .border_style(Style::default().fg(theme::BORDER)),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::surface()),
+        Rect::new(area.x, row, area.width, 1),
+    );
+}
+
+fn render_role_workspace(
+    frame: &mut ratatui::Frame<'_>,
+    app: &mut AppModel,
+    id: AgentId,
+    area: Rect,
+) {
+    let Some(agent) = app.agents.iter().find(|agent| agent.id == id) else {
+        app.select_tab(TabId::Team);
+        render_team(frame, app, area);
+        return;
+    };
+    let latest = app.tasks.iter().find(|task| task.owner == id);
+    let mut activity = Vec::new();
+    for (_, message) in app
+        .role_requests
+        .iter()
+        .filter(|(target, _)| *target == id)
+        .rev()
+    {
+        activity.push(Line::from(Span::styled(
+            " You → Team Lead · requested this role",
+            Style::default()
+                .fg(theme::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for line in compact_text(&sanitize(message), false, false).lines() {
+            activity.push(Line::from(format!("  {line}")));
+        }
+        activity.push(Line::from(""));
+    }
+    if let Some(task) = latest {
+        activity.extend(role_activity_lines(app, task));
+    } else if activity.is_empty() {
+        activity.push(Line::from("No activity for this role yet."));
+    }
+    app.role_scroll = app
+        .role_scroll
+        .min(u16::try_from(activity.len().saturating_sub(1)).unwrap_or(u16::MAX));
+    frame.render_widget(
+        Paragraph::new(activity)
+            .wrap(Wrap { trim: true })
+            .scroll((app.role_scroll, 0))
+            .block(panel(
+                &format!(" {} · Activity · ↑/↓ scroll ", sanitize(&agent.name)),
+                true,
+            )),
+        area,
+    );
 }
 
 fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
@@ -1962,6 +2618,9 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
     let browser = panes[0];
     let inspector = panes[1];
     app.task_list_hitbox = browser;
+    app.task_inspector_hitbox = inspector;
+    app.task_expand_hitbox = Rect::default();
+    app.task_retry_hitbox = Rect::default();
 
     let active = app
         .tasks
@@ -1983,13 +2642,8 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
         .iter()
         .filter(|task| task.status == TaskStatus::Completed)
         .count();
-    let quick_run = if app.quick_run_active() {
-        " · R QUICK RUN"
-    } else {
-        ""
-    };
     let browser_title = format!(
-        " Tasks · lead first · newest peers · [r] re-run{quick_run} · {} total · {active} active · {attention} attention · {completed} done ",
+        " Tasks · {} total · {active} active · {attention} attention · {completed} done ",
         app.tasks.len()
     );
 
@@ -2004,11 +2658,7 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                 Line::from(""),
                 Line::from(Span::styled(
                     "Press Enter and describe work for the Team Lead.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    "Or press R for Quick Run: analyze Markdown, plan, delegate, execute.",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme::TEXT),
                 )),
             ])
             .wrap(Wrap { trim: true })
@@ -2035,7 +2685,7 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                 let selected = index == app.selected;
                 let (icon, status, color) = task_status_visual(task.status);
                 let (owner, owner_icon, owner_color) = app.agent_for_owner(task.owner).map_or_else(
-                    || (short_agent_id(task.owner), "●", Color::Cyan),
+                    || (short_agent_id(task.owner), "●", theme::AQUA),
                     |agent| {
                         (
                             sanitize(&agent.name),
@@ -2067,19 +2717,19 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                         } else {
                             String::new()
                         },
-                        Style::default().fg(Color::LightCyan),
+                        Style::default().fg(theme::AQUA),
                     ),
                 ];
                 let lines = vec![
                     Line::from(heading),
                     Line::from(Span::styled(
                         format!("{indent}{objective}"),
-                        Style::default().fg(if selected { Color::White } else { Color::Gray }),
+                        Style::default().fg(theme::TEXT),
                     )),
                 ];
                 ListItem::new(lines).style(if selected {
                     Style::default()
-                        .bg(Color::DarkGray)
+                        .bg(theme::ELEVATED)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -2095,39 +2745,33 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
     let Some(task) = app.selected_task().cloned() else {
         frame.render_widget(
             Paragraph::new("Select or create a task to inspect its work.")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::TEXT))
                 .block(panel(" Inspector ", true).border_type(BorderType::Rounded)),
             inspector,
         );
         return;
     };
-    let lines = match app.task_inspector {
-        TaskInspector::Details => task_detail_lines(app, &task),
-        TaskInspector::RoleActivity => role_activity_lines(app, &task),
-    };
-    let title = Line::from(vec![
-        menu_tab("[s] summary", app.task_inspector == TaskInspector::Details),
-        Span::raw(" "),
-        menu_tab(
-            "[a] activity",
-            app.task_inspector == TaskInspector::RoleActivity,
-        ),
-    ]);
+    let mut lines = task_detail_lines(app, &task);
+    lines.push(Line::from(""));
+    push_section(&mut lines, "ACTIVITY · newest first", theme::AQUA);
+    lines.extend(role_activity_lines(app, &task));
+    let footer = format!(
+        " [v] {} · [r] re-run · PgUp/PgDn scroll ",
+        if app.expanded_output {
+            "collapse"
+        } else {
+            "expand"
+        }
+    );
+    app.task_expand_hitbox = title_action_hitbox(inspector, &footer, "[v]", 4, false);
+    app.task_retry_hitbox = title_action_hitbox(inspector, &footer, "[r]", 4, false);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((app.task_inspector_scroll, 0))
             .block(
-                panel("", true)
-                    .title(title)
-                    .title_bottom(format!(
-                        " [v] {} · [r] re-run · PgUp/PgDn scroll ",
-                        if app.expanded_output {
-                            "collapse"
-                        } else {
-                            "expand"
-                        }
-                    ))
+                panel(" Inspector ", true)
+                    .title_bottom(footer)
                     .border_type(BorderType::Rounded),
             ),
         inspector,
@@ -2139,23 +2783,21 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
     let (icon, status, color) = task_status_visual(task.status);
     let agent = app.agent_for_owner(task.owner);
     let owner = agent.map_or_else(|| short_agent_id(task.owner), |agent| sanitize(&agent.name));
-    let role = agent.map_or_else(|| "stored role".into(), |agent| human_role(&agent.role));
     lines.push(Line::from(vec![
         Span::styled(
             format!(" {icon} {status} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  ·  {role}"), Style::default().fg(Color::Gray)),
     ]));
     lines.push(Line::from(Span::styled(
         format!(" {}  ·  attempt {}", task.id, task.attempt),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::TEXT),
     )));
     if let Some(previous) = task.retry_of {
         lines.push(Line::from(Span::styled(
             format!(" re-run of {previous}"),
-            Style::default().fg(Color::LightCyan),
+            Style::default().fg(theme::AQUA),
         )));
     }
     if let Some(work) = &task.work {
@@ -2166,11 +2808,11 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             } else {
                 "VERIFIED WORK · patch → test → acceptance"
             },
-            Color::LightCyan,
+            theme::AQUA,
         );
         lines.push(Line::from(format!(" Turn {}/32", work.turns)));
         if !work.contract.is_empty() {
-            push_section(&mut lines, "SHARED CONTRACT", Color::LightCyan);
+            push_section(&mut lines, "SHARED CONTRACT", theme::AQUA);
             push_text_lines(
                 &mut lines,
                 &compact_text(&sanitize(&work.contract), app.expanded_output, false),
@@ -2188,7 +2830,7 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         push_section(
             &mut lines,
             "LATEST OUTPUT · preview, not applied",
-            Color::LightCyan,
+            theme::AQUA,
         );
         push_text_lines(
             &mut lines,
@@ -2197,7 +2839,7 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         );
         lines.push(Line::from(""));
     }
-    push_section(&mut lines, "OBJECTIVE", Color::LightCyan);
+    push_section(&mut lines, "OBJECTIVE", theme::AQUA);
     push_text_lines(
         &mut lines,
         &compact_text(&sanitize(&task.objective), app.expanded_output, false),
@@ -2205,11 +2847,11 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
     );
 
     lines.push(Line::from(""));
-    push_section(&mut lines, "ACCEPTANCE", Color::LightCyan);
+    push_section(&mut lines, "ACCEPTANCE", theme::AQUA);
     if task.acceptance_criteria.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No explicit criteria",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::TEXT),
         )));
     } else {
         let criteria = task
@@ -2227,7 +2869,7 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
 
     if let Some(result) = &task.result {
         lines.push(Line::from(""));
-        push_section(&mut lines, "RESULT", Color::Green);
+        push_section(&mut lines, "RESULT", theme::GREEN);
         push_text_lines(
             &mut lines,
             &compact_text(&sanitize(&result.summary), app.expanded_output, false),
@@ -2244,7 +2886,7 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
                         .collect::<Vec<_>>()
                         .join(" · ")
                 ),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme::TEXT),
             )));
         }
     }
@@ -2256,17 +2898,17 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         .collect::<Vec<_>>();
     if !artifacts.is_empty() {
         lines.push(Line::from(""));
-        push_section(&mut lines, "ARTIFACTS", Color::LightMagenta);
+        push_section(&mut lines, "ARTIFACTS", theme::PURPLE);
         for artifact in artifacts {
             lines.push(Line::from(vec![
-                Span::styled("  ◆ ", Style::default().fg(Color::LightMagenta)),
+                Span::styled("  ◆ ", Style::default().fg(theme::PURPLE)),
                 Span::styled(
                     sanitize(&artifact.location),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {}", sanitize(&artifact.kind)),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(theme::TEXT),
                 ),
             ]));
             if !artifact.preview.trim().is_empty() {
@@ -2289,7 +2931,7 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             task.depth,
             task.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::TEXT),
     )));
     lines
 }
@@ -2300,19 +2942,10 @@ fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
         || short_agent_id(selected.owner),
         |agent| sanitize(&agent.name),
     );
-    let role = agent.map_or_else(|| "stored role".into(), |agent| human_role(&agent.role));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(" ◉ ", Style::default().fg(Color::LightMagenta)),
-            Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  ·  {role}"), Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(Span::styled(
-            " Newest first · all events from this role's tasks in the current session",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = vec![Line::from(Span::styled(
+        format!(" {owner} · all role events"),
+        Style::default().fg(theme::TEXT),
+    ))];
     push_review_loop(&mut lines, app, selected);
     let mut count = 0usize;
     for event in app.scoped_events.iter().rev() {
@@ -2326,25 +2959,18 @@ fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
             continue;
         }
         count += 1;
-        let selected_marker = if task.id == selected.id { "●" } else { "○" };
         let objective = truncate_text(&one_line(&sanitize(&task.objective)), 52);
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{selected_marker} "),
-                Style::default().fg(if task.id == selected.id {
-                    Color::LightCyan
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::styled(
-                task_event_prefix(task.id),
-                Style::default().fg(Color::LightBlue),
-            ),
+            Span::styled(task_event_prefix(task.id), Style::default().fg(theme::BLUE)),
             Span::styled(objective, Style::default().add_modifier(Modifier::BOLD)),
         ]));
         let event_style = Style::default().fg(event_text_color(&event.text));
-        for event_line in compact_text(&event.text, app.expanded_output, event.is_output).lines() {
+        let visible = if event.is_output && !app.expanded_output {
+            "Provider output hidden · [v] expand".to_owned()
+        } else {
+            compact_text(&event.text, app.expanded_output, event.is_output)
+        };
+        for event_line in visible.lines() {
             lines.push(Line::from(Span::styled(event_line.to_owned(), event_style)));
         }
         lines.push(Line::from(""));
@@ -2352,7 +2978,7 @@ fn role_activity_lines(app: &AppModel, selected: &Task) -> Vec<Line<'static>> {
     if count == 0 {
         lines.push(Line::from(Span::styled(
             "  No task-scoped events recorded for this role yet.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::TEXT),
         )));
     }
     lines
@@ -2389,7 +3015,7 @@ fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &T
     push_section(
         lines,
         "REVIEW LOOP · selected task + its attempts",
-        Color::LightCyan,
+        theme::AQUA,
     );
     let latest = app
         .tasks
@@ -2397,9 +3023,15 @@ fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &T
         .filter(|task| attempts.contains(&task.id))
         .max_by_key(|task| task.attempt)
         .unwrap_or(selected);
+    let reporting_name = latest
+        .parent
+        .and_then(|parent| app.tasks.iter().find(|task| task.id == parent))
+        .and_then(|parent| app.agents.iter().find(|agent| agent.id == parent.owner))
+        .map_or("Team Lead", |agent| agent.name.as_str());
     let (_, status, color) = task_status_visual(latest.status);
+    let review_status = format!("{reporting_name} reviewing");
     let status = if app.lead_reviews.contains_key(&latest.id) {
-        "Team Lead reviewing"
+        review_status.as_str()
     } else {
         status
     };
@@ -2411,9 +3043,9 @@ fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &T
         ),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(
-        " Develop → Lead review → feedback → revise → Lead review",
-    ));
+    lines.push(Line::from(format!(
+        " Develop → {reporting_name} review → feedback → revise → {reporting_name} review"
+    )));
     lines.push(Line::from(
         " Recent handoffs · oldest → newest · [v] full feedback",
     ));
@@ -2424,7 +3056,7 @@ fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &T
         lines.push(Line::from(Span::styled(
             format!(
                 " Attempt {attempt} · {}",
-                event.workflow.unwrap_or_default()
+                event.workflow.as_deref().unwrap_or_default()
             ),
             style.add_modifier(Modifier::BOLD),
         )));
@@ -2438,7 +3070,7 @@ fn push_review_loop(lines: &mut Vec<Line<'static>>, app: &AppModel, selected: &T
         }
     }
     lines.push(Line::from(""));
-    push_section(lines, "ROLE ACTIVITY · newest first", Color::LightMagenta);
+    push_section(lines, "ROLE ACTIVITY · newest first", theme::PURPLE);
 }
 
 fn push_section(lines: &mut Vec<Line<'static>>, title: &str, color: Color) {
@@ -2458,22 +3090,22 @@ fn compact_text(text: &str, expanded: bool, tail: bool) -> String {
         let start = text
             .char_indices()
             .rev()
-            .nth(959)
+            .nth(239)
             .map_or(0, |(index, _)| index);
         &text[start..]
     } else {
         let end = text
             .char_indices()
-            .nth(960)
+            .nth(480)
             .map_or(text.len(), |(index, _)| index);
         &text[..end]
     };
     let lines = bounded.lines().collect::<Vec<_>>();
-    let hidden = bounded.len() < text.len() || lines.len() > 8;
+    let hidden = bounded.len() < text.len() || lines.len() > if tail { 3 } else { 5 };
     let excerpt = if tail {
-        lines[lines.len().saturating_sub(8)..].join("\n")
+        lines[lines.len().saturating_sub(3)..].join("\n")
     } else {
-        lines.into_iter().take(8).collect::<Vec<_>>().join("\n")
+        lines.into_iter().take(5).collect::<Vec<_>>().join("\n")
     };
     if hidden {
         if tail {
@@ -2491,11 +3123,11 @@ fn menu_tab(label: &str, active: bool) -> Span<'static> {
         format!(" {label} "),
         if active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightCyan)
+                .fg(theme::TEXT)
+                .bg(theme::BORDER)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme::TEXT).bg(theme::ELEVATED)
         },
     )
 }
@@ -2515,7 +3147,16 @@ fn popup_section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!(" {title} "),
         Style::default()
-            .fg(Color::LightMagenta)
+            .fg(theme::PURPLE)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn help_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {title} "),
+        Style::default()
+            .fg(theme::ORANGE)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -2535,21 +3176,50 @@ fn centered_popup(area: Rect, requested_width: u16, requested_height: u16) -> Re
     }
 }
 
-fn task_status_visual(status: TaskStatus) -> (&'static str, &'static str, Color) {
-    match status {
-        TaskStatus::Queued => ("○", "queued", Color::Gray),
-        TaskStatus::Ready => ("◇", "ready", Color::LightBlue),
-        TaskStatus::Running => ("▶", "running", Color::LightCyan),
-        TaskStatus::WaitingApproval => ("◆", "approval", Color::Yellow),
-        TaskStatus::Blocked => ("!", "blocked", Color::LightRed),
-        TaskStatus::Completed => ("✓", "completed", Color::Green),
-        TaskStatus::Failed => ("×", "failed", Color::Red),
-        TaskStatus::Cancelled => ("–", "cancelled", Color::DarkGray),
-    }
+fn help_popup_area(area: Rect) -> Rect {
+    centered_popup(
+        area,
+        area.width.saturating_sub(2).min(74),
+        area.height.saturating_sub(2).min(30),
+    )
 }
 
-fn human_role(role: &str) -> String {
-    role.replace('_', " ")
+fn delete_confirmation_area(area: Rect) -> Rect {
+    centered_popup(area, area.width.saturating_sub(4).min(58), 7)
+}
+
+fn title_action_hitbox(area: Rect, title: &str, label: &str, width: u16, top: bool) -> Rect {
+    let Some(index) = title.find(label) else {
+        return Rect::default();
+    };
+    let x = area
+        .x
+        .saturating_add(1)
+        .saturating_add(title[..index].chars().count() as u16);
+    let available = area.right().saturating_sub(1).saturating_sub(x);
+    Rect::new(
+        x,
+        if top {
+            area.y
+        } else {
+            area.bottom().saturating_sub(1)
+        },
+        width.min(available),
+        1,
+    )
+}
+
+fn task_status_visual(status: TaskStatus) -> (&'static str, &'static str, Color) {
+    match status {
+        TaskStatus::Queued => ("○", "queued", theme::BLUE),
+        TaskStatus::Ready => ("◇", "ready", theme::BLUE),
+        TaskStatus::Running => ("▶", "running", theme::AQUA),
+        TaskStatus::WaitingApproval => ("◆", "approval", theme::YELLOW),
+        TaskStatus::Blocked => ("!", "blocked", theme::RED),
+        TaskStatus::Completed => ("✓", "completed", theme::GREEN),
+        TaskStatus::Failed => ("×", "failed", theme::RED),
+        TaskStatus::Cancelled => ("–", "cancelled", theme::RED),
+    }
 }
 
 fn short_task_id(id: voff_core::TaskId) -> String {
@@ -2597,14 +3267,12 @@ fn trim_response_buffer(response: &mut String) {
 fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
     let handoff = handoff_summary(&app.tasks, &app.approvals);
     let title = if app.panel == Panel::Agents {
-        format!(
-            " specialist → Lead → specialist · {handoff} · · available / ▶ live · [t] team · [c] config · +/- zoom · f fit "
-        )
+        format!(" Team · {handoff} · [t] tab · [a] add agent · [c] config · +/- zoom · f fit ")
     } else {
-        format!(
-            " specialist → Lead → specialist · {handoff} · · available / ▶ live · [t] team · [c] config "
-        )
+        format!(" Team · {handoff} · [t] tab · [a] add agent · [c] config ")
     };
+    app.team_edit_hitbox = title_action_hitbox(area, &title, "[c]", 8, true);
+    app.team_add_hitbox = title_action_hitbox(area, &title, "[a]", 10, true);
     frame.render_widget(
         panel(&title, app.panel == Panel::Agents).border_type(BorderType::Rounded),
         area,
@@ -2615,7 +3283,7 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
     });
     if app.agents.is_empty() || inner.width < 8 || inner.height < 4 {
         frame.render_widget(
-            Paragraph::new("No configured developers.").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("No configured developers.").style(Style::default().fg(theme::TEXT)),
             inner,
         );
         return;
@@ -2664,68 +3332,111 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                         .title(title)
                         .title_bottom(
                             Line::from(footer)
-                                .style(Style::default().fg(Color::LightCyan))
+                                .style(Style::default().fg(theme::AQUA))
                                 .alignment(ratatui::layout::Alignment::Center),
                         )
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .style(theme::surface())
+                        .border_style(Style::default().fg(theme::BORDER)),
                 ),
             popup,
         );
     }
     if app.help {
-        let area = frame.area();
-        let popup = centered_popup(
-            area,
-            area.width.saturating_sub(4).min(68),
-            area.height.saturating_sub(4).min(24),
-        );
+        let popup = help_popup_area(frame.area());
         frame.render_widget(Clear, popup);
-        let help = vec![
-            popup_section("WORKSPACE"),
-            Line::from("  1 / 2         Team / Tasks"),
-            Line::from("  Tab           Toggle Team / Tasks"),
-            Line::from("  ↑/↓ or j/k    Browse tasks and developers"),
+        let mut help = vec![
+            help_section("NAVIGATION"),
+            Line::from("  1/2  Team / Tasks"),
+            Line::from("  Tab  Cycle tabs"),
+            Line::from("  j/k  Browse"),
+            Line::from("  Click  Select role"),
+            Line::from("  t / double-click  Open tab"),
+            Line::from("  Ctrl+W  Close tab"),
             Line::from(""),
-            popup_section("TASK DEBUGGING"),
-            Line::from("  s             Selected task summary"),
-            Line::from("  a             Owning role's activity"),
-            Line::from("  v             Expand/collapse long output and details"),
-            Line::from("  d             Expand/collapse pending approval details"),
-            Line::from("  PgUp/PgDn     Scroll details or events"),
-            Line::from("  x             Cancel selected active task"),
-            Line::from("  r             Re-run selected terminal/blocked task"),
+            help_section("TASKS & EVENTS"),
+            Line::from("  e  Session events"),
+            Line::from("  v  Expand output"),
+            Line::from("  PgUp/Dn  Scroll details"),
+            Line::from("  r  Re-run task"),
+            Line::from("  x  Cancel task"),
             Line::from(""),
-            popup_section("TEAM & INPUT"),
-            Line::from("  R             Quick Run Markdown → tasks → execution"),
-            Line::from("  Enter         Create a Team Lead task"),
-            Line::from("  Shift+Enter   Insert newline (composer grows)"),
-            Line::from("  Ctrl+J/Alt+↵  Newline fallback"),
-            Line::from("  ←/→ · Home/End · Ctrl+←/→   Navigate text"),
-            Line::from("  Ctrl+W/K      Delete word / to line end"),
-            Line::from("  Ctrl+Z/Y      Undo / redo"),
-            Line::from("  Shift+arrows  Select · PgUp/PgDn scroll"),
-            Line::from("  t             Add or adjust the team"),
-            Line::from("  c             Configure role provider/model"),
-            Line::from("  +/-/0/f       Zoom / reset / fit team"),
-            Line::from("  e             Session event viewer"),
+            help_section("TEAM & PROMPT"),
+            Line::from("  a  Add agent"),
+            Line::from("  Del  Delete agent"),
+            Line::from("  c  Configure agent"),
+            Line::from("  w  Workspace"),
+            Line::from("  +/-/0/f  Zoom/fit"),
+            Line::from("  Enter  Talk to role"),
+            Line::from("  Shift+⏎  New line"),
+            Line::from("  Ctrl+Z/Y  Undo/redo"),
         ];
+        if popup.height < 27 {
+            help = vec![
+                help_section("NAVIGATION"),
+                Line::from("  1/2 Team/Tasks · Tab cycle"),
+                Line::from("  j/k browse · Click select"),
+                Line::from("  t/double-click open · Ctrl+W close"),
+                Line::from(""),
+                help_section("TASKS & EVENTS"),
+                Line::from("  e events · v expand"),
+                Line::from("  PgUp/Dn scroll · r retry · x cancel"),
+                Line::from(""),
+                help_section("TEAM & PROMPT"),
+                Line::from("  a add · Del delete · c configure"),
+                Line::from("  w workspace · +/-/0/f zoom/fit"),
+                Line::from("  Enter talk · Shift+Enter new line"),
+                Line::from("  Ctrl+Z/Y undo/redo"),
+            ];
+        }
+        let title = format!(" Help · voff v{} ", env!("CARGO_PKG_VERSION"));
         frame.render_widget(
-            Paragraph::new(help).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .title(" Help ")
-                    .title_bottom(
-                        Line::from(" ? / Esc close · q safe exit ")
-                            .style(Style::default().fg(Color::LightCyan))
-                            .alignment(ratatui::layout::Alignment::Center),
-                    )
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
+            Block::default()
+                .title(Line::from(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(theme::ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .title_bottom(
+                    Line::from(" ? / Esc close · q safe exit ")
+                        .style(Style::default().fg(theme::AQUA))
+                        .alignment(Alignment::Center),
+                )
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .style(theme::surface())
+                .border_style(Style::default().fg(theme::BORDER))
+                .title_style(
+                    Style::default()
+                        .fg(theme::ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ),
             popup,
         );
+        let content = popup.inner(Margin::new(2, 2));
+        let logo = crate::onboarding::logo_text_for(theme::SURFACE);
+        let logo_width = logo.as_ref().map_or(0, |image| {
+            image.lines.iter().map(Line::width).max().unwrap_or(0) as u16
+        });
+        let logo_height = logo.as_ref().map_or(0, |image| image.lines.len() as u16);
+        if content.width >= logo_width.saturating_add(28)
+            && content.height >= logo_height
+            && let Some(logo) = logo
+        {
+            let logo_area = Rect::new(content.x, content.y, logo_width, logo_height);
+            let help_area = Rect::new(
+                content.x + logo_width + 2,
+                content.y,
+                content.width.saturating_sub(logo_width + 2),
+                content.height,
+            );
+            frame.render_widget(Paragraph::new(logo), logo_area);
+            frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), help_area);
+        } else {
+            frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), content);
+        }
     }
     if let Some(approval) = app.pending_approval() {
         render_approval_popup(frame, app, approval);
@@ -2738,7 +3449,8 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                 .block(
                     Block::bordered()
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::LightRed))
+                        .style(theme::surface())
+                        .border_style(Style::default().fg(theme::RED))
                         .title(" Application needs attention ")
                         .title_bottom(" [e] events · [A] token · [Esc] dismiss "),
                 ),
@@ -2767,7 +3479,7 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(format!(
-                "Paste the configured provider API credential\n\n  {status}  \n\nStored in the local .voff SQLite database, never in project config or logs.{error}"
+                "Paste the provider API credential\n\n  {status}  \n\nStored in the local .voff SQLite database, never in logs.{error}"
             ))
             .alignment(ratatui::layout::Alignment::Center)
             .wrap(Wrap { trim: true })
@@ -2776,12 +3488,43 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                     .title(" Add token (optional) ")
                     .title_bottom(
                         Line::from(" Enter save · Esc cancel ")
-                            .style(Style::default().fg(Color::LightCyan))
+                            .style(Style::default().fg(theme::AQUA))
                             .alignment(ratatui::layout::Alignment::Center),
                     )
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::LightCyan)),
+                    .style(theme::surface())
+                    .border_style(Style::default().fg(theme::BORDER)),
+            ),
+            popup,
+        );
+    }
+    if let Some(id) = app.pending_delete {
+        let popup = delete_confirmation_area(frame.area());
+        let name = app
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map_or("this agent", |agent| agent.name.as_str());
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Remove {} from the active team?\nHistorical tasks will remain.",
+                sanitize(name)
+            ))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Delete agent ")
+                    .title_bottom(
+                        Line::from(" [y] Delete       [n] Keep ")
+                            .style(Style::default().fg(theme::AQUA))
+                            .alignment(Alignment::Center),
+                    )
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .style(theme::surface())
+                    .border_style(Style::default().fg(theme::RED)),
             ),
             popup,
         );
@@ -2819,7 +3562,7 @@ fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, appro
         format!("{} · {}", sanitize(owner), sanitize(&approval.action))
     };
     let subtitle = if approval.action == "provider.continue" {
-        "Regenerate; may cost more. y continue / n cancel".to_owned()
+        "Regenerate output? y continue / n cancel".to_owned()
     } else {
         let summary = serde_json::from_str::<serde_json::Value>(&approval.reason)
             .ok()
@@ -2848,7 +3591,7 @@ fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, appro
             Line::from(Span::styled(
                 truncate_text(&caption, usize::from(popup.width.saturating_sub(2))),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::YELLOW)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(truncate_text(
@@ -2856,29 +3599,27 @@ fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, appro
                 usize::from(popup.width.saturating_sub(2)),
             )),
         ])
-        .style(Style::default().bg(Color::Black).fg(Color::White))
+        .style(theme::surface())
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(Style::default().fg(theme::YELLOW))
                 .title(title)
                 .title_bottom(Line::from(vec![
                     Span::styled(
                         " [y] ",
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(theme::GREEN)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         "[n] ",
-                        Style::default()
-                            .fg(Color::LightRed)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         "[d] details ",
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme::TEXT)
                             .add_modifier(Modifier::UNDERLINED),
                     ),
                 ])),
@@ -2929,26 +3670,26 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
         Line::from(Span::styled(
             format!("  {}", sanitize(&approval.action)),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::YELLOW)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!("  Task  {}", approval.task_id),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         )),
         Line::from(Span::styled(
             format!(
                 "  Working directory  {}",
                 sanitize(&approval.working_directory)
             ),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         )),
         Line::from(""),
         popup_section("REQUEST"),
     ];
     if let Some(proposal) = delegation {
         lines.push(Line::from(vec![
-            Span::styled("  Target: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Target: ", Style::default().fg(theme::TEXT)),
             Span::styled(
                 sanitize(&proposal.target_agent),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -2978,7 +3719,7 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
                 sanitize(&artifact.location),
                 sanitize(&artifact.kind)
             ),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         )));
         push_text_lines(&mut lines, &sanitize(&artifact.preview), "  ");
     }
@@ -2992,20 +3733,20 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
         Span::styled(
             " [y] Approve",
             Style::default()
-                .fg(Color::Green)
+                .fg(theme::GREEN)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" · "),
         Span::styled(
             "[n] Deny ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
         ),
     ];
     footer.push(Span::raw(" · [d] minimize · PgUp/PgDn scroll "));
     if pending_count > 1 {
         footer.push(Span::styled(
             "· ↑/↓ request ",
-            Style::default().fg(Color::LightCyan),
+            Style::default().fg(theme::AQUA),
         ));
     }
     frame.render_widget(Clear, popup);
@@ -3013,7 +3754,7 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((app.approval_scroll, 0))
-            .style(Style::default().bg(Color::Black))
+            .style(theme::surface())
             .block(
                 Block::default()
                     .title(format!(
@@ -3023,7 +3764,7 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
                     .title_bottom(Line::from(footer).alignment(ratatui::layout::Alignment::Left))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(Style::default().fg(theme::YELLOW)),
             ),
         popup,
     );
@@ -3041,7 +3782,7 @@ fn render_continuation_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, app
         Line::from(Span::styled(
             format!(" {} · {}", sanitize(owner), short_task_id(approval.task_id)),
             Style::default()
-                .fg(Color::White)
+                .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(task.map_or_else(String::new, |task| {
@@ -3052,12 +3793,12 @@ fn render_continuation_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, app
         Line::from(Span::styled(
             allowance,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::YELLOW)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from("Continue regenerates this response with a higher allowance."),
-        Line::from("It may take longer and cost more. Tool approvals still apply."),
+        Line::from("It may take longer. Tool approvals still apply."),
         Line::from("Cancel stops this task; its history and partial preview are kept."),
     ];
     let popup = centered_popup(
@@ -3070,24 +3811,24 @@ fn render_continuation_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, app
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((app.approval_scroll, 0))
-            .style(Style::default().bg(Color::Black).fg(Color::White))
+            .style(theme::surface())
             .block(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Yellow))
+                    .border_style(Style::default().fg(theme::YELLOW))
                     .title(" Output limit · Continue task? ")
                     .title_bottom(Line::from(vec![
                         Span::styled(
                             " [y] Continue ",
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::LightCyan)
+                                .fg(theme::BACKGROUND)
+                                .bg(theme::ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             " [n] Cancel ",
                             Style::default()
-                                .fg(Color::White)
+                                .fg(theme::TEXT)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(" · [d] minimize · PgUp/PgDn scroll "),
@@ -3106,10 +3847,11 @@ fn panel(title: &str, active: bool) -> Block<'_> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .style(theme::surface())
         .border_style(if active {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme::AQUA)
         } else {
-            Style::default()
+            Style::default().fg(theme::BORDER)
         })
 }
 struct TerminalGuard;
@@ -3202,7 +3944,7 @@ mod tests {
         let edge = &app.team_flow.edges()[0];
         assert_eq!(edge.source, worker.id.to_string());
         assert_eq!(edge.target, lead.id.to_string());
-        assert!(edge.animated);
+        assert!(!edge.animated);
         assert_eq!(
             app.team_flow.connection_positions(0),
             Some((
@@ -3225,6 +3967,33 @@ mod tests {
         assert_eq!(
             app.team_flow.connection_positions(0).unwrap().0,
             app.team_flow.connection_positions(0).unwrap().1
+        );
+    }
+
+    #[test]
+    fn nested_review_returns_to_direct_reporting_agent() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Team Lead", "team_lead", vec!["Backend Agent".into()]);
+        let backend = agent("Backend Agent", "backend_agent", vec!["Helper".into()]);
+        let helper = agent("Helper", "custom_agent", vec![]);
+        app.team_lead = Some(lead.id);
+        let root = Task::root(lead.id, "root", vec![], Default::default());
+        let mut child = Task::root(backend.id, "backend", vec![], Default::default());
+        child.parent = Some(root.id);
+        let mut grandchild = Task::root(helper.id, "helper", vec![], Default::default());
+        grandchild.parent = Some(child.id);
+        app.lead_reviews
+            .insert(grandchild.id, "Reviewing proposal".into());
+        app.tasks = vec![root, child, grandchild];
+        app.agents = vec![lead, backend.clone(), helper.clone()];
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .any(|edge| edge.source == helper.id.to_string()
+                    && edge.target == backend.id.to_string())
         );
     }
 
@@ -3252,18 +4021,35 @@ mod tests {
             .insert(child.id, "Reviewing proposal".into());
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert_eq!(
-            app.team_flow.edges().last().unwrap().target,
-            lead.id.to_string()
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .any(|edge| edge.target == lead.id.to_string())
         );
-        let (left, _, right, bottom) = app.team_flow.node_terminal_rect(0).unwrap();
+        let (left, top, right, bottom) = app.team_flow.node_terminal_rect(0).unwrap();
+        let incoming = app
+            .team_flow
+            .edges()
+            .iter()
+            .find(|edge| edge.target == lead.id.to_string())
+            .unwrap();
         let buffer = terminal.backend().buffer();
-        let port = (bottom..=(bottom + 2))
-            .flat_map(|y| (left..=right).map(move |x| buffer[(x as u16, y as u16)].symbol()))
+        let (x_start, x_end, y_start, y_end) = match incoming.target_handle.as_deref() {
+            Some("left") => (left - 2, left, top, bottom),
+            Some("right") => (right - 1, right + 2, top, bottom),
+            Some("top") => (left, right, top - 2, top),
+            _ => (left, right, bottom - 1, bottom + 2),
+        };
+        let port = (y_start..=y_end)
+            .flat_map(|y| {
+                (x_start..=x_end).map(move |x| buffer[(x.max(0) as u16, y.max(0) as u16)].symbol())
+            })
             .collect::<String>();
         assert!(
-            port.contains('▲'),
-            "Lead bottom port must show an incoming arrow: {port}"
+            port.chars()
+                .any(|symbol| matches!(symbol, '▲' | '▼' | '◀' | '▶')),
+            "Lead's chosen port must show an incoming arrow: {port}"
         );
     }
 
@@ -3411,12 +4197,15 @@ mod tests {
     #[test]
     fn keys_map_to_actions() {
         assert_eq!(action_for_key(KeyCode::Char('r')), Action::RetryTask);
-        assert_eq!(action_for_key(KeyCode::Char('R')), Action::QuickRun);
+        assert_eq!(action_for_key(KeyCode::Char('R')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('A')), Action::AddCredential);
         assert_eq!(action_for_key(KeyCode::Enter), Action::FocusComposer);
-        assert_eq!(action_for_key(KeyCode::Char('t')), Action::AdjustTeam);
+        assert_eq!(action_for_key(KeyCode::Char('t')), Action::OpenRoleTab);
+        assert_eq!(action_for_key(KeyCode::Char('b')), Action::None);
+        assert_eq!(action_for_key(KeyCode::Char('o')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('/')), Action::None);
-        assert_eq!(action_for_key(KeyCode::Char('c')), Action::ConfigureModel);
+        assert_eq!(action_for_key(KeyCode::Char('c')), Action::AdjustTeam);
+        assert_eq!(action_for_key(KeyCode::Char('g')), Action::ChangeWorkspace);
         assert_eq!(action_for_key(KeyCode::Char('x')), Action::Cancel);
         assert_eq!(action_for_key(KeyCode::Char('q')), Action::Quit);
         assert_eq!(action_for_key(KeyCode::Char('y')), Action::Approve);
@@ -3430,8 +4219,8 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('2')), Action::ShowTasks);
         assert_eq!(action_for_key(KeyCode::Char('3')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('4')), Action::None);
-        assert_eq!(action_for_key(KeyCode::Char('s')), Action::ShowTaskDetails);
-        assert_eq!(action_for_key(KeyCode::Char('a')), Action::ShowRoleActivity);
+        assert_eq!(action_for_key(KeyCode::Char('s')), Action::None);
+        assert_eq!(action_for_key(KeyCode::Char('a')), Action::AddAgent);
         assert_eq!(
             action_for_key(KeyCode::Char('d')),
             Action::ToggleApprovalDetails
@@ -3440,29 +4229,117 @@ mod tests {
     }
 
     #[test]
-    fn quick_run_is_an_explicit_team_lead_workflow() {
-        assert!(QUICK_RUN_OBJECTIVE.contains("Markdown"));
-        assert!(QUICK_RUN_OBJECTIVE.contains("delegate"));
-        assert!(QUICK_RUN_OBJECTIVE.contains("normal approval flow"));
-        assert_eq!(QUICK_RUN_ACCEPTANCE.len(), 5);
-
+    fn workspace_picker_opens_independently_from_team_settings() {
+        let workspace = tempfile::tempdir().unwrap();
         let mut app = AppModel::new(SessionId::new());
-        assert!(!app.quick_run_active());
-        app.quick_run_starting = true;
-        assert!(app.quick_run_active());
-        app.quick_run_starting = false;
-        app.tasks.push(Task::root(
-            AgentId::new(),
-            QUICK_RUN_OBJECTIVE,
-            QUICK_RUN_ACCEPTANCE
-                .iter()
-                .map(|criterion| (*criterion).into())
-                .collect(),
-            voff_core::TaskLimits::default(),
+        app.workspace_root = workspace.path().to_path_buf();
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let click = Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.workspace_hitbox.x + 1,
+            app.workspace_hitbox.y,
         ));
-        assert!(app.quick_run_active());
-        app.tasks[0].status = TaskStatus::Blocked;
-        assert!(!app.quick_run_active());
+        assert_eq!(app.handle_composer_event(&click), ComposerEvent::Ignored);
+        let Event::Mouse(click) = click else {
+            unreachable!()
+        };
+        assert_eq!(app.action_for_mouse(click, area), Action::ChangeWorkspace);
+        app.reduce(Action::ChangeWorkspace);
+        assert!(app.workspace_editor.is_some());
+        assert!(app.setup_editor.is_none());
+    }
+
+    #[test]
+    fn task_notifications_only_follow_important_status_transitions() {
+        let mut app = AppModel::new(SessionId::new());
+        let mut task = Task::root(
+            AgentId::new(),
+            "Build a feature",
+            vec![],
+            voff_core::TaskLimits::default(),
+        );
+        app.apply_event(EngineEvent::TaskUpdated(task.clone()));
+        assert!(!app.notifications.has_notification());
+
+        task.status = TaskStatus::Completed;
+        app.apply_event(EngineEvent::TaskUpdated(task.clone()));
+        assert!(app.notifications.has_notification());
+        app.notifications.tick(Duration::from_millis(500));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Task completed"), "{rendered}");
+        let notification_row = (0..buffer.area.height)
+            .find(|&y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Task completed")
+            })
+            .unwrap();
+        assert!(notification_row >= 3, "notification overlaps the top bar");
+        app.notifications.clear();
+
+        app.apply_event(EngineEvent::TaskUpdated(task));
+        assert!(!app.notifications.has_notification());
+    }
+
+    #[test]
+    fn lone_lead_hint_returns_on_team_view_and_hides_on_other_tabs() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Team Lead", "team_lead", vec![]);
+        app.team_lead = Some(lead.id);
+        app.agents.push(lead);
+        app.sync_team_hint();
+        assert!(app.team_hint_id.is_some());
+        app.notifications.tick(Duration::from_secs(20));
+        assert!(
+            app.notifications.has_notification(),
+            "the hint must persist"
+        );
+        for _ in 0..3 {
+            let _ = app.notify(
+                "Task completed",
+                "[2] Tasks",
+                Level::Info,
+                theme::GREEN,
+                false,
+            );
+        }
+        assert!(
+            app.notifications.remove(app.team_hint_id.unwrap()),
+            "task toasts must not evict the team hint"
+        );
+        app.team_hint_id = None;
+        app.sync_team_hint();
+        app.reduce(Action::ShowTasks);
+        app.sync_team_hint();
+        assert!(app.team_hint_id.is_none());
+        app.reduce(Action::ShowTeam);
+        app.sync_team_hint();
+        assert!(app.team_hint_id.is_some());
+        app.notifications.tick(Duration::from_millis(500));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let add_row = lines
+            .iter()
+            .position(|line| line.contains("Press [a] to add an agent"))
+            .unwrap();
+        assert!(lines[add_row + 1].contains("Enter to assign a task"));
+        assert!(!lines[add_row].contains('·'));
     }
 
     #[test]
@@ -3540,7 +4417,10 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("restored summary"), "{rendered}");
         assert!(rendered.contains("Historical Reviewer"), "{rendered}");
-        assert!(rendered.contains("code reviewer"), "{rendered}");
+        assert!(
+            !rendered.contains("Historical Reviewer  ·  code reviewer"),
+            "{rendered}"
+        );
         assert!(rendered.contains("reports/restored.txt"), "{rendered}");
         assert!(rendered.contains("test report"), "{rendered}");
     }
@@ -3592,10 +4472,7 @@ mod tests {
         let latest = rendered.find("latest task marker").unwrap();
         let older = rendered.find("older task marker").unwrap();
         assert!(latest < older, "{rendered}");
-        assert!(
-            rendered.contains("Tasks · lead first · newest peers"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Tasks · 2 total"), "{rendered}");
         assert!(rendered.contains("[r] re-run"), "{rendered}");
         assert!(rendered.contains("↻ attempt 2"), "{rendered}");
     }
@@ -3672,9 +4549,9 @@ mod tests {
             let cell = &buffer[((x - 2) as u16, y as u16)];
             (cell.symbol().to_owned(), cell.fg)
         };
-        assert_eq!(icon_cell(lead_position), ("◆".into(), Color::Magenta));
-        assert_eq!(icon_cell(frontend_position), ("▣".into(), Color::LightCyan));
-        assert_eq!(icon_cell(backend_position), ("⬢".into(), Color::Blue));
+        assert_eq!(icon_cell(lead_position), ("◆".into(), theme::ORANGE));
+        assert_eq!(icon_cell(frontend_position), ("▣".into(), theme::AQUA));
+        assert_eq!(icon_cell(backend_position), ("⬢".into(), theme::YELLOW));
 
         let root_objective = position("root objective");
         let child_objective = position("child objective");
@@ -3707,10 +4584,9 @@ mod tests {
         assert!(rendered.contains("Narrow terminal task"), "{rendered}");
         assert!(rendered.contains("OBJECTIVE"), "{rendered}");
         assert!(rendered.contains("API Engineer"), "{rendered}");
-        assert!(rendered.contains("· Tasks · session"), "{rendered}");
+        assert!(rendered.contains("voff · ses_"), "{rendered}");
         assert!(!rendered.contains("Tasks view"), "{rendered}");
-        assert!(rendered.contains("[s] summary"), "{rendered}");
-        assert!(rendered.contains("[a] activity"), "{rendered}");
+        assert!(rendered.contains("Inspector"), "{rendered}");
     }
 
     #[test]
@@ -3744,7 +4620,7 @@ mod tests {
                 kind: CanonicalEventKind::ProviderFailed(message.into()),
             }));
         }
-        app.reduce(action_for_key(KeyCode::Char('a')));
+        app.reduce(Action::ShowTasks);
 
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3784,21 +4660,15 @@ mod tests {
         assert!(child_prefix.starts_with('['), "{child_prefix}");
         assert!(!root_prefix.starts_with(' '), "{root_prefix}");
         assert!(!child_prefix.starts_with(' '), "{child_prefix}");
-        assert_eq!(event_text_color("tool proposed: file.patch"), Color::Yellow);
-        assert_eq!(
-            event_text_color("provider failed: timeout"),
-            Color::LightRed
-        );
-        assert_eq!(event_text_color("provider completed"), Color::Green);
-        assert_eq!(event_text_color("task created"), Color::LightCyan);
+        assert_eq!(event_text_color("tool proposed: file.patch"), theme::YELLOW);
+        assert_eq!(event_text_color("provider failed: timeout"), theme::RED);
+        assert_eq!(event_text_color("provider completed"), theme::GREEN);
+        assert_eq!(event_text_color("task created"), theme::AQUA);
         assert_eq!(
             event_text_color("re-run attempt 2: abc -> def"),
-            Color::LightCyan
+            theme::AQUA
         );
-        assert_eq!(
-            event_text_color("usage: 10 in / 2 out"),
-            Color::LightMagenta
-        );
+        assert_eq!(event_text_color("usage: 10 in / 2 out"), theme::PURPLE);
 
         app.push_scoped_event(
             Some(child.id),
@@ -3841,39 +4711,366 @@ mod tests {
     }
 
     #[test]
-    fn team_button_opens_the_common_intro_with_continue_control() {
+    fn add_agent_uses_selected_map_agent_as_reporting_parent() {
         let mut app = editable_team();
-        app.reduce(Action::AdjustTeam);
-        assert!(app.setup_editor.is_some());
-        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        let backend = agent("Backend Agent", "backend_agent", vec![]);
+        app.agents.push(backend);
+        let mut draft = crate::onboarding::DeveloperDraft::new(
+            "Backend Agent",
+            crate::onboarding::DeveloperRole::Backend,
+            crate::onboarding::ProviderChoice::CodexCli,
+            "default",
+            16384,
+        );
+        draft.reports_to = Some(0);
+        app.team_setup.as_mut().unwrap().developers.push(draft);
+        app.selected_agent = 1;
+        app.reduce(Action::AddAgent);
+        let draft = app.setup_editor.take().unwrap().into_draft();
+        assert_eq!(draft.developers.len(), 3);
+        assert_eq!(draft.developers[2].reports_to, Some(1));
+    }
+
+    #[test]
+    fn delete_agent_requires_confirmation_and_keeps_historical_tasks() {
+        let mut app = editable_team();
+        let lead = app.agents[0].id;
+        app.team_lead = Some(lead);
+        let specialist = agent("Backend Agent", "backend_agent", vec![]);
+        let specialist_id = specialist.id;
+        app.agents.push(specialist);
+        let mut draft = crate::onboarding::DeveloperDraft::new(
+            "Backend Agent",
+            crate::onboarding::DeveloperRole::Backend,
+            crate::onboarding::ProviderChoice::CodexCli,
+            "default",
+            16384,
+        );
+        draft.reports_to = Some(0);
+        app.team_setup.as_mut().unwrap().developers.push(draft);
+        let mut historical = Task::root(specialist_id, "Previous work", vec![], Default::default());
+        historical.status = TaskStatus::Completed;
+        app.tasks.push(historical);
+
+        app.reduce(Action::DeleteAgent);
+        assert!(app.pending_delete.is_none(), "the lead cannot be deleted");
+        assert!(app.notifications.has_notification());
+        assert!(app.composer_notice.is_none());
+        app.notifications.tick(Duration::from_millis(500));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let warning = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(
+            warning.contains("The Team Lead cannot be deleted."),
+            "{warning}"
+        );
+        app.selected_agent = 1;
+        app.reduce(Action::DeleteAgent);
+        assert_eq!(app.pending_delete, Some(specialist_id));
+        assert!(app.handle_delete_event(
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::NONE
+            )),
+            Rect::new(0, 0, 100, 30),
+        ));
+        assert!(app.setup_result.is_none());
+
+        app.reduce(Action::DeleteAgent);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("voff team builder"));
-        assert!(rendered.contains("[c] Continue"));
-        assert!(rendered.contains("Developers"));
-        assert!(rendered.contains("Team settings"));
-        assert!(rendered.contains("Edit your current team"));
+        assert!(rendered.contains("Historical tasks will remain"));
+        assert!(rendered.contains("[y] Delete"));
+
+        assert!(app.handle_delete_event(
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE
+            )),
+            Rect::new(0, 0, 100, 30),
+        ));
+        assert!(app.quit);
+        assert_eq!(app.setup_result.as_ref().unwrap().developers.len(), 1);
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(
+            app.setup_notice.as_deref(),
+            Some("Backend Agent removed from the team")
+        );
+    }
+
+    #[test]
+    fn delete_agent_rejects_reports_and_active_work() {
+        let mut app = editable_team();
+        app.team_lead = Some(app.agents[0].id);
+        let specialist = agent("Backend Agent", "backend_agent", vec!["Helper".into()]);
+        let specialist_id = specialist.id;
+        app.agents.push(specialist);
+        let mut draft = crate::onboarding::DeveloperDraft::new(
+            "Backend Agent",
+            crate::onboarding::DeveloperRole::Backend,
+            crate::onboarding::ProviderChoice::CodexCli,
+            "default",
+            16384,
+        );
+        draft.reports_to = Some(0);
+        app.team_setup.as_mut().unwrap().developers.push(draft);
+        let mut helper = crate::onboarding::DeveloperDraft::new(
+            "Helper",
+            crate::onboarding::DeveloperRole::Custom,
+            crate::onboarding::ProviderChoice::CodexCli,
+            "default",
+            16384,
+        );
+        helper.reports_to = Some(1);
+        app.team_setup.as_mut().unwrap().developers.push(helper);
+        app.selected_agent = 1;
+        app.reduce(Action::DeleteAgent);
+        assert!(app.pending_delete.is_none());
+        assert!(app.notifications.has_notification());
+        assert!(app.composer_notice.is_none());
+
+        app.team_setup.as_mut().unwrap().developers.pop();
+        app.tasks.push(Task::root(
+            specialist_id,
+            "Active",
+            vec![],
+            Default::default(),
+        ));
+        app.reduce(Action::DeleteAgent);
+        assert!(app.pending_delete.is_none());
+        assert!(app.notifications.has_notification());
+        assert!(app.composer_notice.is_none());
+    }
+
+    #[test]
+    fn team_button_opens_the_common_intro_with_continue_control() {
+        let mut app = editable_team();
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let before_header = (0..100)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        app.reduce(Action::AdjustTeam);
+        assert!(app.setup_editor.is_some());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let after_header = (0..100)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert_eq!(after_header, before_header);
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Agent settings"));
+        assert!(rendered.contains("🐶"), "{rendered}");
+        assert!(rendered.contains("voff · ses_"), "{rendered}");
+        assert!(rendered.contains("Enter save"));
+        assert!(rendered.contains("Team Lead"));
         assert!(!rendered.contains("quick defaults"));
         assert!(!rendered.contains("Adjust team"));
     }
 
     #[test]
-    fn role_button_opens_the_same_editor_at_the_selected_role() {
+    fn team_builder_is_the_only_team_config_entry_point() {
         let mut app = editable_team();
-        app.reduce(Action::ConfigureModel);
+        app.reduce(action_for_key(KeyCode::Char('b')));
+        assert!(app.setup_editor.is_none());
+        app.reduce(action_for_key(KeyCode::Char('c')));
         assert!(app.setup_editor.is_some());
-        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("voff team builder"));
-        assert!(rendered.contains("Codex · CLI"));
-        assert!(!rendered.contains("API token"));
+        assert!(rendered.contains("Agent settings"));
+        assert!(rendered.contains("voff · ses_"), "{rendered}");
+        assert!(rendered.contains("Team Lead"));
+        assert!(!rendered.contains("[c] config"));
+    }
+
+    #[test]
+    fn help_shows_the_bundled_logo_and_version() {
+        let mut app = AppModel::new(SessionId::new());
+        app.help = true;
+        let mut terminal = Terminal::new(TestBackend::new(112, 32)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(
+            rendered.contains(&format!("voff v{}", env!("CARGO_PKG_VERSION"))),
+            "{rendered}"
+        );
+        let popup = help_popup_area(Rect::new(0, 0, 112, 32));
+        let content = popup.inner(Margin::new(2, 2));
+        let colored_logo_cells = (content.y..content.bottom())
+            .flat_map(|y| (content.x..content.x + 40).map(move |x| buffer[(x, y)].fg))
+            .filter(|color| *color != theme::TEXT && *color != theme::SURFACE)
+            .count();
+        assert!(
+            colored_logo_cells > 10,
+            "ANSI logo should retain its colors"
+        );
+        assert!(rendered.contains("Add agent"));
+        assert_eq!(popup.width, 74);
+        assert_eq!(popup.height, 30);
+        let title_row = (0..112)
+            .map(|x| buffer[(x, popup.y)].symbol())
+            .collect::<String>();
+        let title_x = title_row[..title_row.find("Help · voff").unwrap()]
+            .chars()
+            .count() as u16;
+        assert_eq!(
+            buffer[(title_x, popup.y)].fg,
+            theme::ORANGE,
+            "title_row={title_row:?}, title_x={title_x}, popup={popup:?}"
+        );
+        let heading = (content.y..content.bottom())
+            .find_map(|y| {
+                let row = (0..112)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                row.find("NAVIGATION")
+                    .map(|byte| (row[..byte].chars().count() as u16, y))
+            })
+            .unwrap();
+        assert_eq!(buffer[heading].fg, theme::ORANGE);
+        assert!(matches!(
+            buffer[(content.x, content.y)].bg,
+            ratatui::style::Color::Reset | ratatui::style::Color::Rgb(_, _, _)
+        ));
+    }
+
+    #[test]
+    fn role_tabs_are_clickable_closable_and_route_prompts_via_the_lead() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
+        let specialist = agent("Linus", "backend_developer", vec![]);
+        let specialist_id = specialist.id;
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, specialist];
+        app.selected_agent = 1;
+        app.reduce(Action::OpenRoleTab);
+        assert_eq!(app.active_tab(), TabId::Role(specialist_id));
+        assert!(
+            app.routed_objective("Build an API")
+                .contains("User request:\nBuild an API")
+        );
+        assert!(app.routed_objective("Build an API").contains("Team Lead"));
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        let header = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(
+            header.contains("[1] Team")
+                && header.contains("[2] Tasks")
+                && header.contains("Linus ×")
+                && !header.contains('|'),
+            "{header}"
+        );
+        assert!(rendered.contains("Ask Linus to do anything"), "{rendered}");
+        assert!(rendered.contains("Activity") && !rendered.contains("Inspector"));
+        let role = app
+            .tab_hitboxes
+            .iter()
+            .find(|tab| tab.id == TabId::Role(specialist_id))
+            .copied()
+            .unwrap();
+        let close = role.close.unwrap();
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            close.x,
+            close.y,
+        )));
+        assert_eq!(app.active_tab(), TabId::Team);
+        assert!(app.role_tabs.is_empty());
+        app.reduce(Action::CloseRoleTab);
+        assert_eq!(app.active_tab(), TabId::Team);
+    }
+
+    #[test]
+    fn fixed_tabs_and_role_tabs_cycle_without_closing_fixed_tabs() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Ada", "technical_lead", vec![]);
+        let lead_id = lead.id;
+        app.team_lead = Some(lead_id);
+        app.agents = vec![lead];
+        app.reduce(Action::OpenRoleTab);
+        app.reduce(Action::ShowTeam);
+        app.reduce(Action::NextPanel);
+        assert_eq!(app.active_tab(), TabId::Tasks);
+        app.reduce(Action::NextPanel);
+        assert_eq!(app.active_tab(), TabId::Role(lead_id));
+        app.reduce(Action::CloseRoleTab);
+        assert_eq!(app.active_tab(), TabId::Team);
+        app.reduce(Action::ShowTasks);
+        app.reduce(Action::CloseRoleTab);
+        assert_eq!(app.active_tab(), TabId::Tasks);
+    }
+
+    #[test]
+    fn switching_tabs_preserves_each_unsent_prompt_draft() {
+        let mut app = AppModel::new(SessionId::new());
+        let specialist = agent("Linus", "backend_developer", vec![]);
+        let id = specialist.id;
+        app.agents = vec![specialist];
+        app.composer.insert_str("Team Lead draft");
+        app.open_role_tab(id);
+        assert_eq!(app.composer.lines(), [""]);
+        app.composer.insert_str("Backend draft");
+        app.reduce(Action::ShowTeam);
+        assert_eq!(app.composer.lines(), ["Team Lead draft"]);
+        app.close_role_tab(id);
+        app.open_role_tab(id);
+        assert_eq!(app.composer.lines(), ["Backend draft"]);
+    }
+
+    #[test]
+    fn fixed_tabs_remain_visible_on_a_narrow_terminal() {
+        let mut app = AppModel::new(SessionId::new());
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let header = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert!(
+            header.contains("[1] Team") && header.contains("[2] Tasks"),
+            "{header}"
+        );
+        assert!(!app.team_tab_hitbox.is_empty());
+        assert!(!app.tasks_tab_hitbox.is_empty());
+    }
+
+    #[test]
+    fn plus_tab_opens_the_selected_role() {
+        let mut app = AppModel::new(SessionId::new());
+        let specialist = agent("Linus", "backend_developer", vec![]);
+        let id = specialist.id;
+        app.agents = vec![specialist];
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let plus = app.add_role_tab_hitbox;
+        assert!(!plus.is_empty());
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            plus.x + 1,
+            plus.y,
+        )));
+        assert_eq!(app.active_tab(), TabId::Role(id));
     }
 
     #[test]
@@ -3885,16 +5082,20 @@ mod tests {
             vec![],
             voff_core::TaskLimits::default(),
         ));
-        for action in [Action::AdjustTeam, Action::ConfigureModel] {
-            app.reduce(action);
-            assert!(app.setup_editor.is_none());
-            assert!(
-                app.composer_notice
-                    .as_deref()
-                    .unwrap()
-                    .contains("Finish or cancel")
-            );
-        }
+        app.reduce(Action::AdjustTeam);
+        assert!(app.setup_editor.is_none());
+        assert!(app.notifications.has_notification());
+        assert!(app.composer_notice.is_none());
+    }
+
+    #[test]
+    fn fresh_automatic_review_session_can_edit_the_team() {
+        let mut app = editable_team();
+        app.automatic_review = true;
+        assert!(!has_unsettled_tasks(&app.tasks));
+        app.reduce(Action::AdjustTeam);
+        assert!(app.setup_editor.is_some());
+        assert!(app.composer_notice.is_none());
     }
 
     #[test]
@@ -3983,6 +5184,147 @@ mod tests {
         assert!(app.composer_active);
         assert_eq!(app.composer.lines(), ["a"]);
         assert!(app.credential_input.is_none());
+    }
+
+    #[test]
+    fn mouse_switches_tabs_and_scrolls_the_inspector_independently() {
+        let mut app = AppModel::new(SessionId::new());
+        app.tasks.push(Task::root(
+            AgentId::new(),
+            "Inspect this task",
+            vec![],
+            voff_core::TaskLimits::default(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.panel, Panel::Agents);
+        app.composer_active = true;
+        assert_eq!(
+            app.handle_composer_event(&Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                app.help_hitbox.x + 2,
+                app.help_hitbox.y,
+            ))),
+            ComposerEvent::Ignored
+        );
+        app.composer_active = false;
+        app.help = true;
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    app.tasks_tab_hitbox.x + 2,
+                    app.tasks_tab_hitbox.y,
+                ),
+                Rect::new(0, 0, 100, 30),
+            ),
+            Action::ToggleHelp
+        );
+        app.help = false;
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    app.team_edit_hitbox.x + 1,
+                    app.team_edit_hitbox.y,
+                ),
+                Rect::new(0, 0, 100, 30),
+            ),
+            Action::AdjustTeam
+        );
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.tasks_tab_hitbox.x + 2,
+            app.tasks_tab_hitbox.y,
+        )));
+        assert_eq!(app.panel, Panel::Tasks);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    app.task_expand_hitbox.x + 1,
+                    app.task_expand_hitbox.y,
+                ),
+                Rect::new(0, 0, 100, 30),
+            ),
+            Action::ToggleExpanded
+        );
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    app.task_retry_hitbox.x + 1,
+                    app.task_retry_hitbox.y,
+                ),
+                Rect::new(0, 0, 100, 30),
+            ),
+            Action::RetryTask
+        );
+        let point = (
+            app.task_inspector_hitbox.x + 2,
+            app.task_inspector_hitbox.y + 2,
+        );
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            point.0,
+            point.1,
+        )));
+        assert_eq!(app.task_inspector_scroll, 3);
+        assert_eq!(app.selected, 0);
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.team_tab_hitbox.x + 2,
+            app.team_tab_hitbox.y,
+        )));
+        assert_eq!(app.panel, Panel::Agents);
+    }
+
+    #[test]
+    fn approval_buttons_are_mouse_accessible_without_click_through() {
+        let mut app = AppModel::new(SessionId::new());
+        app.approvals.push(Approval {
+            id: voff_core::ApprovalId::new(),
+            task_id: voff_core::TaskId::new(),
+            tool_call_id: voff_core::ToolCallId::new(),
+            action: "provider.continue".into(),
+            working_directory: ".".into(),
+            reason: "continue".into(),
+            decision: ApprovalDecision::Pending,
+            created_at: chrono::Utc::now(),
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = compact_approval_area(area);
+        let bottom = popup.bottom() - 1;
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), popup.x + 2, bottom),
+                area
+            ),
+            Action::Approve
+        );
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), popup.x + 7, bottom),
+                area
+            ),
+            Action::Deny
+        );
+        assert_eq!(
+            app.action_for_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    popup.x + 12,
+                    bottom
+                ),
+                area
+            ),
+            Action::ToggleApprovalDetails
+        );
+        assert_eq!(
+            app.action_for_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1), area),
+            Action::None
+        );
     }
 
     #[test]
@@ -4151,37 +5493,20 @@ mod tests {
     }
 
     #[test]
-    fn usage_is_priced_for_the_task_owners_catalog_model() {
+    fn usage_events_are_recorded() {
         let mut app = AppModel::new(SessionId::new());
-        let mut openai = agent("Ada", "technical_lead", vec![]);
-        openai.provider = "cloud".into();
-        openai.model = "gpt-5-mini".into();
-        let task = Task::root(
-            openai.id,
-            "price this run",
-            vec!["usage recorded".into()],
-            voff_core::TaskLimits::default(),
-        );
-        app.model_catalog = ModelCatalog::bundled().unwrap();
-        app.agent_provider_kinds.insert(openai.id, "openai".into());
-        app.agents.push(openai);
-        app.tasks.push(task.clone());
-
         app.apply_event(EngineEvent::Canonical(voff_core::CanonicalEvent {
             id: voff_core::EventId::new(),
             session_id: app.session,
-            task_id: Some(task.id),
+            task_id: None,
             created_at: chrono::Utc::now(),
             kind: CanonicalEventKind::Usage {
                 input_tokens: 1_000,
                 output_tokens: 500,
             },
         }));
-
-        assert!(app.estimated_cost.is_some_and(|cost| cost > 0.0));
-        assert!(!app.cost_partial);
+        assert!(!app.events.is_empty());
     }
-
     #[test]
     fn team_graph_renders_developer_cards_and_delegation_threads() {
         let mut app = AppModel::new(SessionId::new());
@@ -4204,12 +5529,11 @@ mod tests {
         assert!(rendered.contains("4096 token limit"));
         assert!(!rendered.contains("no delegation"));
         assert!(
-            rendered.contains("[1 Team]") && rendered.contains("[2 Tasks]"),
+            rendered.contains("[1] Team") && rendered.contains("[2] Tasks"),
             "{rendered}"
         );
-        assert!(!rendered.contains("[R Quick Run]"), "{rendered}");
         assert!(!rendered.contains("[3 Events]"), "{rendered}");
-        assert!(rendered.contains("· Team · session"), "{rendered}");
+        assert!(rendered.contains("voff · ses_"), "{rendered}");
         assert!(!rendered.contains("Team view"), "{rendered}");
         assert_eq!(app.team_flow.edges().len(), 1);
         assert!(
@@ -4223,39 +5547,26 @@ mod tests {
             .collect::<String>();
         assert!(composer.contains("Team Lead"), "{composer}");
         assert!(
-            composer.contains("Press Enter to assign a task"),
+            composer.contains("🐶") && composer.contains("Ask Team Lead to do anything"),
             "{composer}"
         );
         assert!(!composer.contains("/task assign"), "{composer}");
         assert!(!composer.contains("/tasks browse"), "{composer}");
-        assert!(composer.contains("[R]"), "{composer}");
-        assert!(!composer.contains("Quick Run"), "{composer}");
+        // The wide emoji occupies a continuation cell; the next cell is the visible gap.
+        assert!(
+            composer.contains("🐶  Ask Team Lead to do anything"),
+            "{composer}"
+        );
+        assert!(!composer.contains("[R]"), "{composer}");
         assert!(!composer.contains("1/2/3 views"), "{composer}");
         let bottom_border = (0..buffer.area.width)
             .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
             .collect::<String>();
-        assert!(bottom_border.contains("? help · cwd"), "{bottom_border}");
-        let hint_x = (0..buffer.area.width.saturating_sub(2))
-            .find(|x| {
-                buffer[(*x, buffer.area.height - 1)].symbol() == "["
-                    && buffer[(x.saturating_add(1), buffer.area.height - 1)].symbol() == "R"
-            })
-            .expect("Quick Run should be visible on the bottom border");
-        assert!(
-            hint_x.abs_diff(buffer.area.width / 2) <= 10,
-            "{bottom_border}"
-        );
-        assert_eq!(buffer[(hint_x, buffer.area.height - 1)].fg, Color::White);
-        assert_eq!(
-            buffer[(hint_x + 1, buffer.area.height - 1)].fg,
-            Color::White
-        );
-        assert_eq!(
-            buffer[(hint_x + 2, buffer.area.height - 1)].fg,
-            Color::White
-        );
+        assert!(bottom_border.contains("[?] help · [w]"), "{bottom_border}");
+        assert!(!bottom_border.contains("Prompt"), "{bottom_border}");
+        assert!(!composer.contains("Prompt · Team Lead"), "{composer}");
         let cwd = bottom_border
-            .find("cwd /workspaces/voff-demo")
+            .find("[w] /workspaces/voff-demo")
             .expect("cwd should be visible on the bottom border");
         assert!(cwd > usize::from(buffer.area.width / 2), "{bottom_border}");
     }
@@ -4263,7 +5574,7 @@ mod tests {
     #[test]
     fn role_cards_render_one_icon_labeled_identity_inside_the_border() {
         let mut app = AppModel::new(SessionId::new());
-        app.agents = vec![agent("Backend Developer", "backend_developer", vec![])];
+        app.agents = vec![agent("Backend Agent 2", "backend_agent", vec![])];
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -4273,12 +5584,45 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("⬢ Backend Developer"), "{rendered}");
-        assert_eq!(
-            rendered.matches("Backend Developer").count(),
-            1,
-            "{rendered}"
-        );
+        assert!(rendered.contains("⬢ Backend Agent 2"), "{rendered}");
+        assert!(!rendered.contains("Backend Agent ·"), "{rendered}");
+        assert_eq!(rendered.matches("Backend Agent 2").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn team_cards_end_at_their_content_after_zoom_changes() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Team Lead", "team_lead", vec![]);
+        app.team_lead = Some(lead.id);
+        app.agents.push(lead);
+        app.agents
+            .push(agent("Backend Agent", "backend_agent", vec![]));
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        for action in [
+            Action::ResetTeamZoom,
+            Action::ZoomTeamOut,
+            Action::ZoomTeamOut,
+        ] {
+            app.reduce(action);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for index in 0..app.agents.len() {
+                let (left, _, right, bottom) = app.team_flow.node_terminal_rect(index).unwrap();
+                let last_content_row = bottom - 2;
+                if last_content_row < 0 || last_content_row >= i32::from(buffer.area.height) {
+                    continue;
+                }
+                assert!(
+                    ((left + 1)..(right - 1)).any(|x| {
+                        x >= 0
+                            && x < i32::from(buffer.area.width)
+                            && buffer[(x as u16, last_content_row as u16)].symbol() != " "
+                    }),
+                    "card {index} ended with an empty content row at zoom {}",
+                    app.team_flow.zoom_level()
+                );
+            }
+        }
     }
 
     #[test]
@@ -4337,17 +5681,30 @@ mod tests {
             "{composer}"
         );
         assert!(
-            composer.contains("Describe the task for the Team Lead"),
+            composer.contains("🐶") && !composer.contains("Ask Team Lead to do anything"),
             "{composer}"
         );
+        assert!(
+            composer.contains("Enter send · Shift+Enter newline"),
+            "{composer}"
+        );
+        assert!(!composer.contains("Ctrl+Z/Y undo/redo"), "{composer}");
         assert!(!composer.contains("/task"), "{composer}");
         assert!(!composer.contains("/tasks"), "{composer}");
         let cursor = (
-            app.composer_hitbox.x.saturating_add(1),
+            app.composer_hitbox.x.saturating_add(3),
             app.composer_hitbox.y.saturating_add(1),
         );
-        assert_eq!(buffer[cursor].bg, Color::LightCyan);
-        assert_eq!(buffer[cursor].fg, Color::Black);
+        assert_eq!(buffer[cursor].bg, theme::AQUA);
+        assert_eq!(buffer[cursor].fg, theme::BACKGROUND);
+
+        app.composer.insert_str("Build a test app");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let composer = (buffer.area.height.saturating_sub(3)..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(composer.contains("🐶 Build a test app"), "{composer}");
     }
 
     #[test]
@@ -4548,11 +5905,11 @@ mod tests {
         assert!(rendered.contains("[y] Approve"), "{rendered}");
         assert!(rendered.contains("[n] Deny"), "{rendered}");
         let action_position = action_position.expect("action should be visible");
-        assert_eq!(buffer[action_position].fg, Color::Yellow);
+        assert_eq!(buffer[action_position].fg, theme::YELLOW);
     }
 
     #[test]
-    fn live_delegation_animates_the_edge_and_spins_on_working_roles() {
+    fn live_delegation_draws_a_continuous_edge_and_spins_on_working_roles() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
         let implementer = agent("Linus", "backend_developer", vec![]);
@@ -4600,14 +5957,7 @@ mod tests {
                 .iter()
                 .any(|frame| rendered.contains(*frame))
         );
-        assert_eq!(
-            app.team_flow
-                .edges()
-                .iter()
-                .filter(|edge| edge.animated)
-                .count(),
-            1
-        );
+        assert!(app.team_flow.edges().iter().all(|edge| !edge.animated));
         assert!(
             app.team_flow
                 .edges()
@@ -4660,8 +6010,7 @@ mod tests {
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
         assert!(rendered.contains("1 handoff complete"));
-        assert!(rendered.contains("⬢ Backend Developer"), "{rendered}");
-        assert!(rendered.contains("Linus"), "{rendered}");
+        assert!(rendered.contains("⬢ Linus"), "{rendered}");
         assert!(
             app.team_flow
                 .edges()
@@ -4707,7 +6056,43 @@ mod tests {
     }
 
     #[test]
-    fn mouse_selecting_a_role_highlights_its_lead_connections_in_yellow() {
+    fn team_card_side_borders_have_no_handle_gaps() {
+        let mut app = AppModel::new(SessionId::new());
+        app.agents = vec![agent("Ada", "technical_lead", vec![])];
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (left, top, right, bottom) = app.team_flow.node_terminal_rect(0).unwrap();
+        let middle = u16::try_from((top + bottom) / 2).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(u16::try_from(left).unwrap(), middle)].symbol(), "│");
+        assert_eq!(
+            buffer[(u16::try_from(right - 1).unwrap(), middle)].symbol(),
+            "│"
+        );
+    }
+
+    #[test]
+    fn connector_ports_change_when_a_specialist_moves_beside_the_lead() {
+        let mut app = AppModel::new(SessionId::new());
+        let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
+        let specialist = agent("Linus", "backend_developer", vec![]);
+        app.team_lead = Some(lead.id);
+        app.agents = vec![lead, specialist];
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let lead_position = app.team_flow.node_position(0).unwrap();
+        app.team_flow.set_node_position_for_test(
+            1,
+            rataflow::Position::new(lead_position.x + 100.0, lead_position.y),
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let edge = &app.team_flow.edges()[0];
+        assert_eq!(edge.source_handle.as_deref(), Some("right"));
+        assert_eq!(edge.target_handle.as_deref(), Some("left"));
+    }
+
+    #[test]
+    fn mouse_selecting_a_role_draws_its_lead_connection_solid_and_yellow() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Ada", "technical_lead", vec!["Linus".into()]);
         let specialist = agent("Linus", "backend_developer", vec![]);
@@ -4731,6 +6116,19 @@ mod tests {
             x,
             y,
         )));
+        assert_eq!(app.active_role_tab, None);
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+        )));
+        app.reduce(Action::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            y,
+        )));
+        assert_eq!(app.active_role_tab, Some(specialist_id));
+        app.reduce(Action::ShowTeam);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert_eq!(app.team_flow.mouse_highlight(), Some(specialist_id));
@@ -4738,7 +6136,11 @@ mod tests {
         let yellow_route_cells = (0..buffer.area.height)
             .flat_map(|row| (0..buffer.area.width).map(move |column| &buffer[(column, row)]))
             .filter(|cell| {
-                cell.fg == Color::Yellow && matches!(cell.symbol(), "·" | "◆" | "▲" | "△" | "●")
+                cell.fg == theme::YELLOW
+                    && matches!(
+                        cell.symbol(),
+                        "─" | "│" | "┌" | "┐" | "└" | "┘" | "◆" | "▲" | "△" | "●"
+                    )
             })
             .count();
         assert!(yellow_route_cells > 0);
@@ -4756,8 +6158,8 @@ mod tests {
         let mut app = AppModel::new(SessionId::new());
         app.reduce(Action::ToggleExpanded);
         assert!(app.expanded_output);
-        assert_eq!(menu_tab("summary", false).style.fg, Some(Color::White));
-        assert_eq!(menu_tab("summary", true).style.bg, Some(Color::LightCyan));
+        assert_eq!(menu_tab("summary", false).style.fg, Some(theme::TEXT));
+        assert_eq!(menu_tab("summary", true).style.bg, Some(theme::BORDER));
         assert_eq!(
             menu_tab("summary", true).content,
             menu_tab("summary", false).content

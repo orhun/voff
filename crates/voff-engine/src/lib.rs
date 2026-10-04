@@ -353,22 +353,6 @@ impl<R: Repository + 'static> Engine<R> {
             .attempt
             .checked_add(1)
             .ok_or(EngineError::RetryLimitReached)?;
-        // Legacy launches minted new IDs for the same configured lead. Rebind
-        // only the new root attempt, without changing historical ownership or
-        // promoting a specialist to coordinator.
-        let mut owner = previous.owner;
-        if previous.parent.is_none()
-            && let Some(lead) = self.team_lead.filter(|lead| *lead != owner)
-        {
-            let old = self.repo.agent(owner).await?;
-            let current = self.repo.agent(lead).await?;
-            if let (Some(old), Some(current)) = (old, current)
-                && old.name == current.name
-                && old.role == current.role
-            {
-                owner = lead;
-            }
-        }
         let now = chrono::Utc::now();
         let retry = Task {
             id: TaskId::new(),
@@ -376,7 +360,7 @@ impl<R: Repository + 'static> Engine<R> {
             retry_of: Some(previous.id),
             work: previous.work.clone(),
             parent: previous.parent,
-            owner,
+            owner: previous.owner,
             objective: guidance.map_or_else(|| previous.objective.clone(), |guidance| format!("{}\n\nTeam Lead repair instructions for attempt {attempt} (preserve original scope and acceptance):\n{guidance}", previous.objective)),
             acceptance_criteria: previous.acceptance_criteria,
             limits: previous.limits,
@@ -422,7 +406,6 @@ impl<R: Repository + 'static> Engine<R> {
         proposals: &[DelegationProposal],
     ) -> Result<Vec<Approval>, EngineError> {
         let task = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
-        self.require_team_lead(task.owner)?;
         if task.status != TaskStatus::Ready {
             return Err(EngineError::NotRunnable(task.status));
         }
@@ -709,12 +692,9 @@ impl<R: Repository + 'static> Engine<R> {
         drop(start_guard);
         self.record(Some(id), CanonicalEventKind::ProviderStarted)
             .await?;
-        let delegation_targets = if self.require_team_lead(agent.id).is_ok() {
-            self.enabled_delegation_targets(&agent.allowed_targets)
-                .await?
-        } else {
-            Vec::new()
-        };
+        let delegation_targets = self
+            .enabled_delegation_targets(&agent.allowed_targets)
+            .await?;
         let delegation_target_names = delegation_targets
             .iter()
             .map(|target| target.name.clone())
@@ -735,7 +715,7 @@ impl<R: Repository + 'static> Engine<R> {
             )
         } else if can_delegate {
             format!(
-                "{}\n\nYou are the coordinating lead. Classify the request as information, review, diagnosis, implementation, or high-risk action. Answer simple questions directly using available evidence; do not delegate, propose tools, or invent implementation work for a question you can answer yourself. For implementation requiring specialists, decompose the objective into every independent workstream needed for a usable, verified result. Call task.delegate exactly once with a proposals array containing the complete bounded plan. Assign each workstream to the best-qualified enabled role; use distinct roles when the objective spans specialties, but do not invent filler work merely to use the whole team. Independent proposals will run concurrently after approval. An implementation request requires actual work and verification, not just an answer claiming completion. You may propose at most {} children. Enabled targets:\n{}",
+                "{}\n\nYou coordinate your direct reports. Answer simple questions directly yourself. Delegate only to the enabled direct reports listed below, with bounded scope and acceptance criteria. Review their results and return the integrated outcome to your own reporting agent. Never delegate to unrelated roles. You may propose at most {} children. Enabled targets:\n{}",
                 agent.system_prompt,
                 task.limits.max_children,
                 delegation_roster(&delegation_targets)
@@ -1053,7 +1033,6 @@ impl<R: Repository + 'static> Engine<R> {
             ));
         }
         if !proposals.is_empty() {
-            self.require_team_lead(agent.id)?;
             self.validate_delegation_proposals(&task, &agent, &proposals)
                 .await?;
         }
@@ -1097,19 +1076,6 @@ impl<R: Repository + 'static> Engine<R> {
                         continue;
                     }
                     if is_delegation {
-                        if self.require_team_lead(agent.id).is_err() {
-                            self.record(
-                                Some(id),
-                                CanonicalEventKind::ProviderFailed(
-                                    "delegation denied: route the decision through the Team Lead"
-                                        .into(),
-                                ),
-                            )
-                            .await?;
-                            self.transition(id, TaskStatus::Blocked).await?;
-                            waiting_approval = true;
-                            continue;
-                        }
                         let proposals = if request.name == "task.delegate" {
                             serde_json::from_str::<DelegationArguments>(&request.arguments_json)?
                                 .into_proposals()
@@ -1551,7 +1517,6 @@ impl<R: Repository + 'static> Engine<R> {
                     .task(approval.task_id)
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
-                self.require_team_lead(parent.owner)?;
                 let delegator = self
                     .repo
                     .agent(parent.owner)
@@ -2503,7 +2468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_team_lead_owns_root_and_delegation_decisions() {
+    async fn only_team_lead_owns_roots_but_child_agents_can_delegate_to_direct_reports() {
         let repo = Arc::new(InMemoryRepository::default());
         let lead_id = AgentId::new();
         let specialist = AgentProfile {
@@ -2520,6 +2485,20 @@ mod tests {
             delegation_limits: Some(TaskLimits::default()),
         };
         repo.save_agent(specialist.clone()).await.unwrap();
+        let lead = AgentProfile {
+            id: lead_id,
+            name: "Lead".into(),
+            allowed_targets: vec![specialist.name.clone()],
+            ..specialist.clone()
+        };
+        let peer = AgentProfile {
+            id: AgentId::new(),
+            name: "Peer".into(),
+            allowed_targets: vec![],
+            ..specialist.clone()
+        };
+        repo.save_agent(lead).await.unwrap();
+        repo.save_agent(peer).await.unwrap();
         let (tx, _rx) = mpsc::channel(16);
         let engine = Engine::new(
             repo.clone(),
@@ -2536,31 +2515,36 @@ mod tests {
             Err(EngineError::TeamLeadRequired)
         ));
 
-        let mut specialist_task = Task::root(
-            specialist.id,
-            "delegate directly",
-            vec![],
-            TaskLimits::default(),
-        );
-        specialist_task.transition(TaskStatus::Ready).unwrap();
-        repo.save_task(specialist_task.clone()).await.unwrap();
-        assert!(matches!(
-            engine
-                .propose_delegation_plan(
-                    specialist_task.id,
-                    &[DelegationProposal {
-                        target_agent: "Peer".into(),
-                        objective: "overlapping peer work".into(),
-                        acceptance_criteria: vec![],
-                    }],
-                )
-                .await,
-            Err(EngineError::TeamLeadRequired)
-        ));
+        let root = engine
+            .create_task(lead_id, "coordinate", vec![])
+            .await
+            .unwrap();
+        let specialist_task = engine
+            .delegate_task(
+                root.id,
+                specialist.id,
+                "delegate assigned work".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        engine.mark_ready(specialist_task.id).await.unwrap();
+        let approvals = engine
+            .propose_delegation_plan(
+                specialist_task.id,
+                &[DelegationProposal {
+                    target_agent: "Peer".into(),
+                    objective: "bounded peer work".into(),
+                    acceptance_criteria: vec!["verified".into()],
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(approvals.len(), 1);
     }
 
     #[tokio::test]
-    async fn specialist_requests_exclude_legacy_coordination_permissions() {
+    async fn specialist_requests_include_coordination_for_direct_reports() {
         let repo = Arc::new(InMemoryRepository::default());
         let lead = AgentId::new();
         let specialist = AgentProfile {
@@ -2606,21 +2590,17 @@ mod tests {
             .unwrap();
         engine.mark_ready(child.id).await.unwrap();
         engine.run_task(child.id).await.unwrap();
-        assert_eq!(
-            *choice.lock().await,
-            Some(ToolChoice::Specific(vec!["file.patch".into()]))
-        );
-        assert_eq!(
-            tools
-                .lock()
-                .await
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["file.patch"]
-        );
+        assert_eq!(*choice.lock().await, Some(ToolChoice::Auto));
+        let requested = tools.lock().await;
+        let names = requested
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"task.delegate"));
+        assert!(names.contains(&"review.request"));
+        assert!(names.contains(&"file.patch"));
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 //! Contract-first plans and evidence-gated multi-step work.
 use super::*;
 
-pub(super) const WORK_INSTRUCTIONS: &str = "For implementation, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified agent. Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. Integration waits for all implementations. Do not delegate simple questions. Workers: produce actual project files, not a script that generates an unexecuted application. You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. Completion requires a successful test suite after the last workspace patch, plus Lead acceptance review. Tests run at the workspace root: provide a root test harness that exercises the relevant components together. Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. Report a blocker if dependencies or required checks are unavailable. Never claim generated tests were executed. The task has at most 32 turns across retries.";
+pub(super) const WORK_INSTRUCTIONS: &str = "For implementation, if you have direct reports, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified direct report. Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. Integration waits for all implementations. Do not delegate simple questions. Workers: produce actual project files, not a script that generates an unexecuted application. You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. Completion requires a successful test suite after the last workspace patch, plus reporting-agent acceptance review. Tests run at the workspace root: provide a root test harness that exercises the relevant components together. Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. Report a blocker if dependencies or required checks are unavailable. Never claim generated tests were executed. The task has at most 32 turns across retries.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_legacy_shape_missing_contract_or_integration() {
+    fn plan_requires_contract_and_integration_fields() {
         assert!(serde_json::from_str::<Plan>(r#"{"proposals":[]}"#).is_err());
         assert!(
             serde_json::from_str::<Plan>(r#"{"shared_contract":"API","proposals":[]}"#).is_err()
@@ -336,7 +336,6 @@ impl<R: Repository + 'static> Engine<R> {
         agent: &AgentProfile,
         json: &str,
     ) -> Result<(), EngineError> {
-        self.require_team_lead(task.owner)?;
         if !agent.tools.iter().any(|tool| tool == "task.delegate") {
             return Err(invalid("task owner cannot delegate"));
         }

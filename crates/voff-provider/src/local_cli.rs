@@ -492,7 +492,7 @@ fn classify_process_failure(
             (
                 ProviderErrorKind::InvalidResponse,
                 false,
-                "failed; run 'voff doctor' and verify the CLI login and model",
+                "failed; verify the CLI installation, login, and selected model",
             )
         };
     ProviderError {
