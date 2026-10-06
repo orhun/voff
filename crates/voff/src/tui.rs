@@ -1,4 +1,5 @@
 //! Responsive Ratatui shell and pure action reducer.
+mod task_layout;
 mod team_flow;
 
 use crate::model_catalog::ModelCatalog;
@@ -83,6 +84,8 @@ pub enum Action {
     ZoomTeamIn,
     ZoomTeamOut,
     ResetTeamZoom,
+    ResizeTasks(i8),
+    ResetTaskLayout,
     AdjustTeam,
     ChangeWorkspace,
     AddAgent,
@@ -158,6 +161,7 @@ pub struct AppModel {
     task_inspector_scroll: u16,
     expanded_output: bool,
     task_list_hitbox: Rect,
+    task_layout: task_layout::TaskLayout,
     task_inspector_hitbox: Rect,
     team_tab_hitbox: Rect,
     tasks_tab_hitbox: Rect,
@@ -235,6 +239,7 @@ impl AppModel {
             task_inspector_scroll: 0,
             expanded_output: false,
             task_list_hitbox: Rect::default(),
+            task_layout: task_layout::TaskLayout::default(),
             task_inspector_hitbox: Rect::default(),
             team_tab_hitbox: Rect::default(),
             tasks_tab_hitbox: Rect::default(),
@@ -297,6 +302,7 @@ impl AppModel {
         }
         let current = self.active_tab();
         if current != tab {
+            self.task_layout.cancel_drag();
             self.task_inspector_scroll = 0;
             self.notifications.clear();
             self.transient_notification_ids.clear();
@@ -372,6 +378,20 @@ impl AppModel {
             return;
         }
         match action {
+            Action::ResizeTasks(_) | Action::ResetTaskLayout => {
+                if self.active_tab() == TabId::Tasks
+                    && !self.help
+                    && !self.event_viewer
+                    && !self.composer_active
+                    && self.pending_approval().is_none()
+                {
+                    if let Action::ResizeTasks(steps) = action {
+                        self.task_layout.adjust(steps);
+                    } else {
+                        self.task_layout.reset();
+                    }
+                }
+            }
             Action::Up => {
                 if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
@@ -563,6 +583,10 @@ impl AppModel {
             return;
         }
         if self.panel == Panel::Tasks {
+            if self.task_layout.handle_mouse(mouse) {
+                self.composer_active = false;
+                return;
+            }
             let over_inspector = self
                 .task_inspector_hitbox
                 .contains((mouse.column, mouse.row).into());
@@ -1413,7 +1437,7 @@ impl AppModel {
                     task_id,
                     text: clean,
                     is_output: true,
-                    headline: Some("Response · preview"),
+                    headline: Some("Reply"),
                     related_task: None,
                     source_task: None,
                     accent: theme::BLUE,
@@ -1648,6 +1672,16 @@ pub const fn action_for_key(code: KeyCode) -> Action {
 
 fn action_for_event(value: Event) -> Action {
     match value {
+        Event::Key(key)
+            if key.modifiers == KeyModifiers::ALT && key.kind != KeyEventKind::Release =>
+        {
+            match key.code {
+                KeyCode::Up => Action::ResizeTasks(-1),
+                KeyCode::Down => Action::ResizeTasks(1),
+                KeyCode::Char('0') => Action::ResetTaskLayout,
+                _ => Action::None,
+            }
+        }
         Event::Key(key)
             if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -2785,10 +2819,7 @@ fn render_role_workspace(
 }
 
 fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
-    let panes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
+    let panes = app.task_layout.panes(area);
     let browser = panes[0];
     let inspector = panes[1];
     app.task_list_hitbox = browser;
@@ -2820,6 +2851,13 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
         " Tasks · {} total · {active} active · {attention} attention · {completed} done ",
         app.tasks.len()
     );
+    let browser_block = panel(&browser_title, true)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if app.task_layout.dragging() {
+            theme::AQUA
+        } else {
+            theme::BORDER
+        }));
 
     if app.tasks.is_empty() {
         app.task_window_start = 0;
@@ -2836,7 +2874,7 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                 )),
             ])
             .wrap(Wrap { trim: true })
-            .block(panel(&browser_title, true).border_type(BorderType::Rounded)),
+            .block(browser_block),
             browser,
         );
     } else {
@@ -2910,10 +2948,7 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                 })
             })
             .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(items).block(panel(&browser_title, true).border_type(BorderType::Rounded)),
-            browser,
-        );
+        frame.render_widget(List::new(items).block(browser_block), browser);
         let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
             .position(start)
             .viewport_content_length(visible);
@@ -3333,12 +3368,37 @@ fn conversation_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut previous_thread = None;
-    let mut review_numbers = HashMap::new();
+    let mut previous_entry = None;
+    let completed_reviews: HashSet<_> = app
+        .scoped_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .review
+                .as_ref()
+                .filter(|review| review.decision.is_some())
+                .and(event.approval_id.map(|id| (event.task_id, id)))
+        })
+        .collect();
     for event in &app.scoped_events {
         let Some(task_id) = event.task_id else {
             continue;
         };
         if !event.conversational || (!app.expanded_output && event.details_only) {
+            continue;
+        }
+        // Expanding a conversation reveals full messages, not provider envelopes
+        // or duplicate proposal/review bookkeeping. Raw events remain in `e`.
+        if (event.is_output && event.details_only)
+            || event.tool_call_id.is_some()
+            || (event
+                .review
+                .as_ref()
+                .is_some_and(|review| review.decision.is_none())
+                && event
+                    .approval_id
+                    .is_some_and(|id| completed_reviews.contains(&(event.task_id, id))))
+        {
             continue;
         }
         if (!ids.contains(&task_id) && !event.related_task.is_some_and(|id| ids.contains(&id)))
@@ -3398,21 +3458,10 @@ fn conversation_lines(
             .and_then(|id| app.approvals.iter().find(|approval| approval.id == id))
             .map_or("proposal", |approval| approval.action.as_str());
         if !connected {
-            let (heading, heading_color) =
-                if let Some(id) = approval_id.filter(|_| app.expanded_output) {
-                    let next = review_numbers.len() + 1;
-                    let number = review_numbers.entry(id).or_insert(next);
-                    (
-                        format!(" Review {number} · {}", sanitize(action)),
-                        theme::TEXT,
-                    )
-                } else {
-                    (
-                        format!(" {owner}"),
-                        app.agent_for_owner(source.owner)
-                            .map_or(theme::TEXT, |agent| role_color(&agent.role)),
-                    )
-                };
+            let heading = format!(" {owner}");
+            let heading_color = app
+                .agent_for_owner(source.owner)
+                .map_or(theme::TEXT, |agent| role_color(&agent.role));
             for row in textwrap::wrap(&heading, usize::from(width.max(1))) {
                 lines.push(Line::from(Span::styled(
                     row.into_owned(),
@@ -3423,24 +3472,47 @@ fn conversation_lines(
             }
         }
         let mut title = event.headline.unwrap_or("Details").to_owned();
-        if event.is_output && !app.expanded_output {
-            title = "Reply".into();
+        if event.is_output {
+            title.clear();
+        } else if title == "✓ Result" {
+            title = "✓".into();
         }
+        let mut delegation_label = None;
         if let Some(target) = related.filter(|target| target.owner != source.owner) {
             let target_name = app.agent_for_owner(target.owner).map_or_else(
                 || short_agent_id(target.owner),
                 |agent| sanitize(&agent.name),
             );
-            title.push_str(&format!(" · {owner} → {target_name}"));
+            let label = format!("{owner} → {target_name}");
+            title = format!("↳ {label}");
+            delegation_label = Some((
+                label,
+                owner.len(),
+                app.agent_for_owner(target.owner)
+                    .map_or(theme::TEXT, |agent| role_color(&agent.role)),
+            ));
         }
         if task.attempt > 1 && app.expanded_output {
             title.push_str(&format!(" · attempt {}", task.attempt));
         }
+        let mut reviewer_highlight = None;
         let detail = if let Some(review) = &event.review {
             let reviewer = app.agent_for_owner(review.reviewer).map_or_else(
                 || short_agent_id(review.reviewer),
                 |agent| sanitize(&agent.name),
             );
+            if review.reviewer != task.owner {
+                let start = match &review.decision {
+                    Some((true, _)) => 0,
+                    Some((false, _)) => "↶ ".len(),
+                    None => "↶ Waiting for ".len(),
+                };
+                reviewer_highlight = Some((
+                    start..start + reviewer.len(),
+                    app.agent_for_owner(review.reviewer)
+                        .map_or(theme::TEXT, |agent| role_color(&agent.role)),
+                ));
+            }
             if let Some((approved, reason)) = &review.decision {
                 title = if review.reviewer == task.owner {
                     if *approved {
@@ -3460,54 +3532,75 @@ fn conversation_lines(
                         }
                     )
                 };
-                compact_text(reason, app.expanded_output, false)
+                if approval_id.is_some() {
+                    title.push_str(&format!(" · {}", conversation_action(action)));
+                }
+                reason.clone()
             } else {
                 title = if review.reviewer == task.owner {
                     "↶ Reviewing".into()
                 } else {
-                    format!("↶ {owner} → {reviewer}")
+                    format!("↶ Waiting for {reviewer}")
                 };
                 if approval_id.is_some() {
-                    format!("Review requested for {}.", sanitize(action))
+                    format!("Checking whether to allow {}.", conversation_action(action))
                 } else {
                     "Diagnosing the failed attempt.".into()
                 }
             }
         } else if let Some(related) = related {
-            compact_text(&sanitize(&related.objective), app.expanded_output, false)
+            sanitize(&related.objective)
         } else if event.is_output {
-            compact_text(&event.text, app.expanded_output, true)
+            event.text.clone()
         } else {
-            compact_text(
-                event.text.strip_prefix("result: ").unwrap_or(&event.text),
-                app.expanded_output,
-                false,
-            )
+            event
+                .text
+                .strip_prefix("result: ")
+                .unwrap_or(&event.text)
+                .to_owned()
         };
         let start = lines.len();
-        push_activity_card(
+        push_activity_entry(
             &mut lines,
             &title,
             &detail,
             color,
             width,
-            if app.expanded_output {
-                usize::MAX
-            } else if event.is_output {
-                3
-            } else {
-                5
-            },
+            if app.expanded_output { usize::MAX } else { 3 },
         );
-        if connected {
-            // Join the preceding card's closing border to this reply while
-            // preserving chronological order, including interleaved agents.
-            lines[start - 2] = Line::from(Span::styled(" │", Style::default().fg(color)));
-            lines[start - 1] = Line::from(Span::styled(" │", Style::default().fg(color)));
-            if let Some(span) = lines[start].spans.first_mut() {
-                span.content = span.content.replacen(" ╭ ", " ├ ", 1).into();
-            }
+        if let Some((label, owner_len, target_color)) = delegation_label {
+            color_delegation_label(
+                &mut lines[start..],
+                &label,
+                owner_len,
+                color,
+                target_color,
+                width,
+            );
         }
+        if let Some(highlight) = reviewer_highlight {
+            let label = title.strip_prefix('✓').map_or(title.as_str(), str::trim);
+            color_activity_label(&mut lines[start..], label, &[highlight], width);
+        }
+        if connected && let Some(index) = previous_entry {
+            let previous: &mut Line<'static> = &mut lines[index];
+            let connector_style = previous
+                .spans
+                .first()
+                .map_or(Style::default(), |span| span.style);
+            if let Some(span) = previous.spans.first_mut() {
+                span.content = span.content.replacen(" ╰", " ├", 1).into();
+            }
+            // Only entries with a following sibling carry a vertical line
+            // through their wrapped body and the gap before that sibling.
+            for line in &mut lines[index + 1..start - 1] {
+                if let Some(span) = line.spans.first_mut() {
+                    span.content = " │   ".into();
+                }
+            }
+            lines[start - 1] = Line::from(Span::styled(" │", connector_style));
+        }
+        previous_entry = Some(start);
         previous_thread = Some(thread);
     }
     if lines.is_empty() {
@@ -3518,7 +3611,18 @@ fn conversation_lines(
     lines
 }
 
-fn push_activity_card(
+fn conversation_action(action: &str) -> &str {
+    match action {
+        "process.test" => "running checks",
+        "file.patch" => "editing files",
+        "file.read" => "reading files",
+        "task.complete" => "accepting the result",
+        "task.plan" | "task.delegate" => "delegating work",
+        _ => "the next step",
+    }
+}
+
+fn push_activity_entry(
     lines: &mut Vec<Line<'static>>,
     title: &str,
     body: &str,
@@ -3526,30 +3630,101 @@ fn push_activity_card(
     width: u16,
     limit: usize,
 ) {
-    let inner = usize::from(width.saturating_sub(4).max(1));
-    for (index, line) in textwrap::wrap(title, inner).iter().enumerate() {
-        let prefix = if index == 0 { " ╭ " } else { " │ " };
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{line}"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
-    }
-    let wrapped = textwrap::wrap(body, inner);
-    let folded = wrapped.len() > limit;
-    for line in wrapped.iter().take(limit) {
+    let inner = usize::from(width.saturating_sub(6).max(1));
+    let (marker, label) = if title.is_empty() {
+        ("•", "")
+    } else if let Some(label) = title.strip_prefix("✓") {
+        ("✓", label.trim())
+    } else if let Some(label) = title.strip_prefix("↳") {
+        ("↳", label.trim())
+    } else {
+        ("•", title)
+    };
+    // Bound preview work and preserve the beginning of a sentence, rather than
+    // cutting into a word at the tail of the provider output.
+    let end = body
+        .char_indices()
+        .nth(inner.saturating_mul(limit))
+        .map_or(body.len(), |(i, _)| i);
+    let content = if label.is_empty() {
+        body[..end].trim().to_owned()
+    } else {
+        format!("{label}\n{}", body[..end].trim())
+    };
+    let wrapped = textwrap::wrap(&content, inner);
+    let folded = end < body.len() || wrapped.len() > limit;
+    let count = wrapped.len().min(limit);
+    for (index, line) in wrapped.iter().take(limit).enumerate() {
+        let mut text = line.to_string();
+        if folded && index + 1 == count {
+            text = truncate_text(&format!("{text} …"), inner);
+        }
         lines.push(Line::from(vec![
-            Span::styled(" │ ", Style::default().fg(color)),
-            Span::styled(line.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled(
+                if index == 0 {
+                    format!(" ╰─{marker} ")
+                } else {
+                    "     ".into()
+                },
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::default().fg(theme::TEXT)),
         ]));
     }
-    if folded {
-        lines.push(Line::from(Span::styled(
-            " │ … [v] details",
-            Style::default().fg(theme::AQUA),
-        )));
-    }
-    lines.push(Line::from(Span::styled(" ╰─", Style::default().fg(color))));
     lines.push(Line::from(""));
+}
+
+fn color_delegation_label(
+    lines: &mut [Line<'static>],
+    label: &str,
+    owner_len: usize,
+    owner_color: Color,
+    target_color: Color,
+    width: u16,
+) {
+    color_activity_label(
+        lines,
+        label,
+        &[
+            (0..owner_len, owner_color),
+            (owner_len + " → ".len()..label.len(), target_color),
+        ],
+        width,
+    );
+}
+
+fn color_activity_label(
+    lines: &mut [Line<'static>],
+    label: &str,
+    highlights: &[(std::ops::Range<usize>, Color)],
+    width: u16,
+) {
+    let mut offset = 0;
+    for (line, row) in lines.iter_mut().zip(textwrap::wrap(
+        label,
+        usize::from(width.saturating_sub(6).max(1)),
+    )) {
+        offset += label[offset..].find(row.as_ref()).unwrap_or(0);
+        let Some(body) = line.spans.get(1) else { break };
+        let text = body.content.to_string();
+        line.spans.truncate(1);
+        for (index, ch) in text.char_indices() {
+            let position = offset + index;
+            let color = if index < row.len() {
+                highlights
+                    .iter()
+                    .find(|(range, _)| range.contains(&position))
+                    .map_or(theme::TEXT, |(_, color)| *color)
+            } else {
+                theme::TEXT
+            };
+            line.spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        offset += row.len();
+    }
 }
 
 fn push_section(lines: &mut Vec<Line<'static>>, title: &str, color: Color) {
@@ -3851,7 +4026,7 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             Line::from("  Shift+⏎  New line"),
             Line::from("  Ctrl+Z/Y  Undo/redo"),
         ];
-        if popup.height < 27 {
+        if usize::from(popup.height) < help.len() + 4 {
             help = vec![
                 help_section("NAVIGATION"),
                 Line::from("  1/2 Team/Tasks · Tab cycle"),
@@ -4663,7 +4838,25 @@ mod tests {
                 .join("\n")
         };
         let text = render(&app);
-        assert!(text.find("Delegated").unwrap() < text.find("Fix the failing check").unwrap());
+        assert!(
+            text.find("─↳ Lead → Backend").unwrap() < text.find("Fix the failing check").unwrap()
+        );
+        assert!(!text.contains("Delegated") && !text.contains("• ↳"));
+        let lines = conversation_lines(&app, &ids, 80, None);
+        let delegation = lines
+            .iter()
+            .find(|line| line.to_string().contains("Lead → Backend"))
+            .unwrap();
+        let colored = |color| {
+            delegation
+                .spans
+                .iter()
+                .filter(|span| span.style.fg == Some(color))
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(colored(theme::ORANGE).contains("Lead"));
+        assert_eq!(colored(theme::YELLOW), "Backend");
         assert!(
             text.contains("Lead → Backend") && text.contains("Fix the failing check"),
             "{text}"
@@ -4686,9 +4879,25 @@ mod tests {
         let lead_id = lead.id;
         app.agents = vec![lead, worker];
         app.tasks = vec![task.clone()];
-        let first = Some(voff_core::ApprovalId::new());
+        let first_id = voff_core::ApprovalId::new();
+        let first = Some(first_id);
         let second = Some(voff_core::ApprovalId::new());
+        let tool_call_id = voff_core::ToolCallId::new();
+        app.approvals.push(Approval {
+            id: first_id,
+            task_id: task.id,
+            tool_call_id,
+            action: "process.test".into(),
+            working_directory: ".".into(),
+            reason: "{}".into(),
+            decision: ApprovalDecision::ApprovedOnce,
+            created_at: chrono::Utc::now(),
+        });
         for kind in [
+            CanonicalEventKind::ToolProposed {
+                tool_call_id,
+                name: "process.test".into(),
+            },
             CanonicalEventKind::LeadReviewStarted {
                 lead: lead_id,
                 approval_id: first,
@@ -4723,16 +4932,20 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(text.matches("Review 1").count(), 1);
-        assert_eq!(text.matches("Review 2").count(), 1);
-        assert!(text.contains("Backend Agent → pashaaaaa"), "{text}");
-        assert!(text.contains("├ ✓ pashaaaaa approved"), "{text}");
+        assert!(!text.contains("Review 1") && !text.contains("Review 2"));
+        assert_eq!(text.matches("Waiting for pashaaaaa").count(), 1);
+        assert_eq!(text.matches("✓ pashaaaaa approved").count(), 1);
+        assert!(text.contains("approved · running checks"));
+        assert!(!text.contains("process.test") && !text.contains("Action proposed"));
         assert!(
             !text.contains("Developer") && !text.contains("Sent for review"),
             "{text}"
         );
-        assert_eq!(text.matches(" ╭ ").count(), 2);
-        assert!(text.find("The API checks passed.").unwrap() < text.find("Review 2").unwrap());
+        assert_eq!(text.matches(" ╰─").count(), 2);
+        assert!(
+            text.find("The API checks passed.").unwrap()
+                < text.find("Waiting for pashaaaaa").unwrap()
+        );
         assert!(lines.iter().all(|line| line.width() <= 80));
     }
 
@@ -4806,17 +5019,7 @@ mod tests {
                     && !text.contains("WaitingApproval"),
                 "{text}"
             );
-            for (message, color) in [
-                (
-                    if expanded {
-                        "Response · preview"
-                    } else {
-                        "Reply"
-                    },
-                    worker_color,
-                ),
-                ("Lead requested changes", lead_color),
-            ] {
+            for (message, color) in [("─•", worker_color), ("─•", lead_color)] {
                 assert!(
                     lines
                         .iter()
@@ -4841,7 +5044,9 @@ mod tests {
         app.tasks = vec![task.clone()];
         for event in [
             CanonicalEventKind::TextDelta("I am building the API.".into()),
-            CanonicalEventKind::GenerationDelta("INTERNAL_PATCH_JSON".into()),
+            CanonicalEventKind::GenerationDelta(
+                r#"{"text":"The routes are ready.","tool_calls":[]}"#.into(),
+            ),
             CanonicalEventKind::TextDelta("The routes are ready.".into()),
             CanonicalEventKind::ToolProposed {
                 tool_call_id: voff_core::ToolCallId::new(),
@@ -4860,16 +5065,227 @@ mod tests {
         };
         let chat = render(&app);
         assert!(chat.contains("I am building the API.") && chat.contains("The routes are ready."));
-        assert!(!chat.contains("INTERNAL_PATCH_JSON") && !chat.contains("file.patch"));
+        assert!(!chat.contains("tool_calls") && !chat.contains("file.patch"));
         app.expanded_output = true;
         let details = render(&app);
-        assert!(details.contains("INTERNAL_PATCH_JSON") && details.contains("file.patch"));
+        assert!(!details.contains("tool_calls") && !details.contains("file.patch"));
+        assert_eq!(details.matches("The routes are ready.").count(), 1);
+        assert!(!details.contains("preview"));
+        assert!(app.events.iter().any(|event| event.contains("tool_calls")));
+    }
+
+    #[test]
+    fn conversation_uses_bullets_and_a_completion_checkmark() {
+        let mut app = AppModel::new(SessionId::new());
+        let task = Task::root(AgentId::new(), "Build app", vec![], Default::default());
+        app.tasks.push(task.clone());
+        for event in [
+            CanonicalEventKind::TextDelta("Patched the backend files.".into()),
+            CanonicalEventKind::ProviderStarted,
+            CanonicalEventKind::TextDelta("All eight tests passed.".into()),
+            CanonicalEventKind::TaskResultPublished {
+                summary: "Backend finished.".into(),
+                evidence: vec![],
+            },
+        ] {
+            app.push_scoped_event(Some(task.id), &event);
+        }
+        let lines = conversation_lines(&app, &HashSet::from([task.id]), 80, None);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("├─• Patched the backend files."), "{text}");
+        assert!(text.contains("├─• All eight tests passed."), "{text}");
+        assert!(text.contains("╰─✓ Backend finished."), "{text}");
+        assert!(!text.contains("Reply") && !text.contains("Result"));
+    }
+
+    #[test]
+    fn review_labels_color_only_the_reviewer_name_even_when_wrapped() {
+        for decision in [None, Some(true), Some(false)] {
+            let mut app = AppModel::new(SessionId::new());
+            let lead = agent("pashaaaaa 開発", "technical_lead", vec![]);
+            let worker = agent("Frontend Agent", "frontend_agent", vec![]);
+            let task = Task::root(worker.id, "Build UI", vec![], Default::default());
+            let event = match decision {
+                Some(approved) => CanonicalEventKind::LeadReviewFinished {
+                    lead: lead.id,
+                    approval_id: Some(voff_core::ApprovalId::new()),
+                    approved,
+                    reason: "Review explanation stays neutral".into(),
+                },
+                None => CanonicalEventKind::LeadReviewStarted {
+                    lead: lead.id,
+                    approval_id: Some(voff_core::ApprovalId::new()),
+                },
+            };
+            let reviewer_name = lead.name.clone();
+            app.agents = vec![lead, worker];
+            app.tasks.push(task.clone());
+            app.expanded_output = true;
+            app.push_scoped_event(Some(task.id), &event);
+            for width in [22, 100] {
+                let lines = conversation_lines(&app, &HashSet::from([task.id]), width, None);
+                let colored_name: String = lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter().skip(1))
+                    .filter(|span| span.style.fg == Some(theme::ORANGE))
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert_eq!(
+                    colored_name.replace(' ', ""),
+                    reviewer_name.replace(' ', "")
+                );
+                assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_names_keep_their_colors_when_wrapped() {
+        let label = "Léåd → 開発 Backend";
+        let mut lines = Vec::new();
+        push_activity_entry(
+            &mut lines,
+            &format!("↳ {label}"),
+            "Objective stays neutral",
+            theme::ORANGE,
+            18,
+            usize::MAX,
+        );
+        color_delegation_label(
+            &mut lines,
+            label,
+            "Léåd".len(),
+            theme::ORANGE,
+            theme::YELLOW,
+            18,
+        );
+        assert!(lines.iter().all(|line| line.width() <= 18));
+        let colored = |color| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.style.fg == Some(color))
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(colored(theme::ORANGE).contains("Léåd"));
+        assert_eq!(colored(theme::YELLOW).replace(' ', ""), "開発Backend");
+        assert!(!colored(theme::YELLOW).contains("Objective"));
+    }
+
+    #[test]
+    fn last_thread_entry_has_no_connector_below_its_elbow() {
+        for title in ["", "✓"] {
+            for (body, width) in [
+                ("First line\nSecond line\nThird line", 40),
+                ("First line Second line Third line", 17),
+            ] {
+                let mut lines = Vec::new();
+                push_activity_entry(&mut lines, title, body, theme::AQUA, width, 3);
+                let rows: Vec<_> = lines.iter().map(ToString::to_string).collect();
+                assert_eq!(
+                    rows,
+                    vec![
+                        format!(" ╰─{} First line", if title.is_empty() { "•" } else { "✓" }),
+                        "     Second line".into(),
+                        "     Third line".into(),
+                        "".into(),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thread_connectors_span_wrapped_siblings_but_stop_at_the_last_entry() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = agent("Backend", "backend_agent", vec![]);
+        let task = Task::root(owner.id, "Build app", vec![], Default::default());
+        app.agents.push(owner);
+        app.tasks.push(task.clone());
+        app.push_scoped_event(
+            Some(task.id),
+            &CanonicalEventKind::TextDelta("First line\nSecond line".into()),
+        );
+        // Invisible events must not break the visible thread.
+        app.push_scoped_event(
+            Some(task.id),
+            &CanonicalEventKind::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+            },
+        );
+        app.push_scoped_event(
+            Some(task.id),
+            &CanonicalEventKind::TaskResultPublished {
+                summary: "Finished\nVerified".into(),
+                evidence: vec![],
+            },
+        );
+        for expanded in [false, true] {
+            app.expanded_output = expanded;
+            let lines = conversation_lines(&app, &HashSet::from([task.id]), 40, None);
+            let rows: Vec<_> = lines.iter().map(ToString::to_string).collect();
+            assert_eq!(
+                rows,
+                [
+                    " Backend",
+                    " ├─• First line",
+                    " │   Second line",
+                    " │",
+                    " ╰─✓ Finished",
+                    "     Verified",
+                    ""
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn thread_connectors_do_not_join_different_tasks() {
+        let mut app = AppModel::new(SessionId::new());
+        let owner = agent("Backend", "backend_agent", vec![]);
+        app.agents.push(owner.clone());
+        let mut ids = HashSet::new();
+        for _ in 0..2 {
+            let task = Task::root(owner.id, "Build app", vec![], Default::default());
+            ids.insert(task.id);
+            app.tasks.push(task.clone());
+            app.push_scoped_event(
+                Some(task.id),
+                &CanonicalEventKind::TaskResultPublished {
+                    summary: "Finished\nVerified".into(),
+                    evidence: vec![],
+                },
+            );
+        }
+        let rows: Vec<_> = conversation_lines(&app, &ids, 40, None)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                " Backend",
+                " ╰─✓ Finished",
+                "     Verified",
+                "",
+                " Backend",
+                " ╰─✓ Finished",
+                "     Verified",
+                ""
+            ]
+        );
     }
 
     #[test]
     fn conversation_cards_wrap_unicode_and_bound_previews() {
         let mut lines = Vec::new();
-        push_activity_card(
+        push_activity_entry(
             &mut lines,
             "Response · 🐶 開発者",
             &"長い出力を確認する ".repeat(40),
@@ -4878,11 +5294,7 @@ mod tests {
             3,
         );
         assert!(lines.iter().all(|line| line.width() <= 32));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.to_string().contains("[v] details"))
-        );
+        assert!(lines.iter().any(|line| line.to_string().contains('…')));
         assert!(lines.len() <= 9);
     }
 
@@ -5323,6 +5735,48 @@ mod tests {
         let grandchild_objective = position("grandchild objective");
         assert_eq!(child_objective.0, root_objective.0 + 2);
         assert_eq!(grandchild_objective.0, root_objective.0 + 4);
+    }
+
+    #[test]
+    fn task_tiles_resize_without_changing_selection_or_tab_order() {
+        let mut app = AppModel::new(SessionId::new());
+        app.reduce(Action::ShowTasks);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let initial = app.task_list_hitbox;
+        let key = |code| Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::ALT));
+        app.reduce(action_for_event(key(KeyCode::Down)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.task_list_hitbox.height > initial.height);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            10,
+            app.task_list_hitbox.bottom() - 1,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            10,
+            initial.y + 20,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.task_list_hitbox.height > initial.height);
+        assert_eq!(app.selected, 0);
+        let resized = app.task_list_hitbox;
+        app.reduce(Action::ShowTeam);
+        assert!(!app.task_layout.dragging());
+        app.reduce(action_for_event(key(KeyCode::Up)));
+        app.reduce(Action::ShowTasks);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.task_list_hitbox, resized);
+        app.help = true;
+        app.reduce(action_for_event(key(KeyCode::Up)));
+        app.help = false;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.task_list_hitbox, resized);
+        app.reduce(action_for_event(key(KeyCode::Char('0'))));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.task_list_hitbox, initial);
+        assert_eq!(app.active_tab(), TabId::Tasks);
     }
 
     #[test]
