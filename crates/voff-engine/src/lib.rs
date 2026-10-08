@@ -121,6 +121,13 @@ struct TestArguments {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReadArguments {
+    path: PathBuf,
+    #[serde(default)]
+    offset: usize,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlockedReport {
     reason: String,
 }
@@ -1025,6 +1032,10 @@ impl<R: Repository + 'static> Engine<R> {
                     "review.request" => proposals.push(serde_json::from_str::<DelegationProposal>(
                         &call.arguments_json,
                     )?),
+                    "file.read" => {
+                        let _: ReadArguments = serde_json::from_str(&call.arguments_json)?;
+                        side_effects += 1;
+                    }
                     "file.patch" => {
                         let _: PatchArguments = serde_json::from_str(&call.arguments_json)?;
                         side_effects += 1;
@@ -1180,6 +1191,9 @@ impl<R: Repository + 'static> Engine<R> {
                     )
                     .await?;
                     match request.name.as_str() {
+                        "file.read" if agent.tools.iter().any(|tool| tool == "file.read") => {
+                            let _: ReadArguments = serde_json::from_str(&request.arguments_json)?;
+                        }
                         "task.complete" if task.work.is_some() => {
                             self.validate_completion(&task, &request.arguments_json)
                                 .await?;
@@ -1389,7 +1403,10 @@ impl<R: Repository + 'static> Engine<R> {
                             });
                     if !has_pending {
                         let continuing = parent.work.is_some()
-                            && matches!(approval.action.as_str(), "file.patch" | "process.test");
+                            && matches!(
+                                approval.action.as_str(),
+                                "file.patch" | "process.test" | "file.read"
+                            );
                         self.transition(
                             approval.task_id,
                             if continuing {
@@ -1513,6 +1530,24 @@ impl<R: Repository + 'static> Engine<R> {
                     .as_ref()
                     .ok_or(EngineError::WorkflowNotConfigured)?
                     .apply_patch(&proposal, true)?;
+                Ok(())
+            }
+            "file.read" => {
+                let args: ReadArguments = serde_json::from_str(&approval.reason)?;
+                let preview = self
+                    .workspace
+                    .as_ref()
+                    .ok_or(EngineError::WorkflowNotConfigured)?
+                    .read_page(&args.path, args.offset)?;
+                self.publish_artifact(Artifact {
+                    id: ArtifactId::new(),
+                    producer: approval.task_id,
+                    kind: "file_read".into(),
+                    location: args.path.display().to_string(),
+                    digest: String::new(),
+                    preview,
+                })
+                .await?;
                 Ok(())
             }
             "process.test" => {
@@ -2273,6 +2308,7 @@ fn tool_definitions(
     max_delegations: u16,
 ) -> Vec<ToolDefinition> {
     names.iter().filter_map(|name| match name.as_str() {
+        "file.read" => Some(ToolDefinition { name: name.clone(), description: "Inspect a bounded page of a workspace text file before editing. offset is a character offset (start at 0); each page has at most 1200 characters. Missing files return an absence report, not a task failure. Sensitive paths are denied. Contents are returned as a file_read artifact after approval.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["path","offset"],"additionalProperties":false}"#.into() }),
         "file.patch" => Some(ToolDefinition { name: name.clone(), description: "Propose creating or replacing one workspace text file; user approval and base-digest validation are mandatory.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
         "process.test" => Some(ToolDefinition { name: name.clone(), description: "Propose one allowlisted verification command at the workspace root; per-action approval is mandatory. Dependencies must already be installed. No shell or package installation.".into(), input_schema: r#"{"type":"object","properties":{"command":{"type":"string","enum":["cargo test","cargo check","cargo clippy","cargo fmt --check","python3 -m unittest discover","node --test","npm test","npm run build"]}},"required":["command"]}"#.into() }),
         "task.delegate" if !allowed_targets.is_empty() && max_delegations > 0 => Some(delegation_plan_tool(name, allowed_targets, max_delegations)),

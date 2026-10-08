@@ -495,13 +495,12 @@ impl AppModel {
                 self.composer_active = true;
             }
             Action::AddCredential => {
-                if self
-                    .credential_target
-                    .as_ref()
-                    .is_some_and(|(_, slot)| !slot.is_available())
-                {
+                if self.credential_target.is_some() {
                     self.credential_input = Some(String::new());
                     self.credential_error = None;
+                    self.composer_active = false;
+                } else {
+                    self.warn("This provider has no API token to edit. Check the agent's provider settings or local CLI login.");
                 }
             }
             Action::ToggleEvents => {
@@ -878,6 +877,11 @@ impl AppModel {
     }
 
     fn handle_composer_event(&mut self, event: &Event) -> ComposerEvent {
+        if self.application_notice.is_some()
+            && matches!(event, Event::Key(key) if matches!(key.code, KeyCode::Char('A' | 'e')))
+        {
+            return ComposerEvent::Ignored;
+        }
         if self.application_notice.is_some()
             && matches!(event, Event::Key(key) if key.code == KeyCode::Esc)
         {
@@ -4106,7 +4110,11 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                         .style(theme::surface())
                         .border_style(Style::default().fg(theme::RED))
                         .title(" Application needs attention ")
-                        .title_bottom(" [e] events · [A] token · [Esc] dismiss "),
+                        .title_bottom(if app.credential_target.is_some() {
+                            " [e] events · [A] token · [Esc] dismiss "
+                        } else {
+                            " [e] events · [Esc] dismiss "
+                        }),
                 ),
             popup,
         );
@@ -4139,7 +4147,11 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             .wrap(Wrap { trim: true })
             .block(
                 Block::default()
-                    .title(" Add token (optional) ")
+                    .title(if app.credential_target.as_ref().is_some_and(|(_, slot)| slot.is_available()) {
+                        " Replace provider token "
+                    } else {
+                        " Add provider token "
+                    })
                     .title_bottom(
                         Line::from(" Enter save · Esc cancel ")
                             .style(Style::default().fg(theme::AQUA))
@@ -6694,6 +6706,31 @@ mod tests {
         assert!(app.credential_input.is_none());
         assert!(!app.quit);
     }
+    #[test]
+    fn attention_popup_can_replace_an_existing_token_while_composing() {
+        let mut app = AppModel::new(SessionId::new());
+        let slot = crate::credential::CredentialSlot::new(Some("expired".into()));
+        app.credential_target = Some(("OPENAI_API_KEY".into(), slot.clone()));
+        app.application_notice = Some("Provider needs attention".into());
+        app.composer_active = true;
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.handle_composer_event(&event), ComposerEvent::Ignored);
+        app.reduce(action_for_event(event));
+        assert!(app.credential_input.is_some());
+        assert!(!app.composer_active);
+        assert_eq!(slot.get().as_deref(), Some("expired"));
+        app.handle_credential_event(&Event::Paste("replacement".into()));
+        let (_, submission) = app.handle_credential_event(&Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+        let (reference, _, token) = submission.unwrap();
+        assert_eq!(reference, "OPENAI_API_KEY");
+        assert_eq!(token, "replacement");
+    }
+
     #[test]
     fn full_screen_events_open_and_scroll_without_moving_task_selection() {
         let mut app = AppModel::new(SessionId::new());

@@ -26,6 +26,47 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "task.blocked"));
     }
 
+    #[tokio::test]
+    async fn missing_file_inspection_returns_evidence_and_continues_work() {
+        let (engine, repo, task, _) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine.with_safe_workflow(dir.path()).unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+        engine
+            .transition(task.id, TaskStatus::Running)
+            .await
+            .unwrap();
+        let approval = engine
+            .request_approval(
+                task.id,
+                ToolCallId::new(),
+                "file.read".into(),
+                ".".into(),
+                r#"{"path":"frontend/vite.config.ts","offset":0}"#.into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        assert!(!dir.path().join("frontend").exists());
+        assert!(
+            engine
+                .work_context(&task)
+                .await
+                .unwrap()
+                .contains("File does not exist")
+        );
+        let tools = tool_definitions(&["file.read".into()], &[], 0);
+        assert_eq!(tools[0].name, "file.read");
+        assert!(tool_definitions(&[], &[], 0).is_empty());
+    }
+
     async fn fixture() -> (
         Engine<InMemoryRepository>,
         Arc<InMemoryRepository>,
