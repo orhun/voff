@@ -1510,7 +1510,7 @@ pub(crate) fn logo_text_for(background: Color) -> Option<Text<'static>> {
                     let style = if column < row_left || column >= row_right {
                         Style::default().bg(background)
                     } else {
-                        span.style
+                        theme::indexed_logo_style(span.style)
                     };
                     spans.push(Span::styled(character.to_string(), style));
                 }
@@ -1520,7 +1520,7 @@ pub(crate) fn logo_text_for(background: Color) -> Option<Text<'static>> {
         if column < right {
             spans.push(Span::raw(" ".repeat(right - column)));
         }
-        lines.push(Line::from(spans).style(line.style));
+        lines.push(Line::from(spans).style(theme::indexed_logo_style(line.style)));
     }
     Some(Text::from(lines))
 }
@@ -2716,14 +2716,14 @@ mod tests {
             logo.lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .any(|span| span.style.fg == Some(Color::Rgb(0, 0, 0))),
+                .any(|span| span.style.fg == Some(Color::Indexed(16))),
             "black outline pixels must not be made transparent"
         );
         assert!(
             logo.lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _))))
+                .all(|span| !matches!(span.style.fg, Some(Color::Rgb(_, _, _))))
         );
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(render_intro).unwrap();
@@ -2737,7 +2737,7 @@ mod tests {
         let black_outline_cells = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
             .filter(|&(x, y)| {
-                buffer[(x, y)].fg == Color::Rgb(0, 0, 0) && buffer[(x, y)].symbol() != " "
+                buffer[(x, y)].fg == Color::Indexed(16) && buffer[(x, y)].symbol() != " "
             })
             .count();
         assert!(
