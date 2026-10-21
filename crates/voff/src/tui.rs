@@ -71,6 +71,7 @@ pub enum Action {
     Down,
     NextTab,
     PreviousTab,
+    ToggleTaskFocus,
     ToggleTaskPane,
     ToggleHelp,
     FocusComposer,
@@ -86,11 +87,13 @@ pub enum Action {
     ZoomTeamIn,
     ZoomTeamOut,
     ResetTeamZoom,
+    MoveSelectedAgent(i8, i8),
     ResizeTasks(i8),
     ResetTaskLayout,
     AdjustTeam,
     ChangeWorkspace,
     AddAgent,
+    OpenSelectedAgentTab,
     DeleteAgent,
     ShowTeam,
     ShowTasks,
@@ -408,6 +411,12 @@ impl AppModel {
             .and_then(|id| self.agents.iter().find(|agent| agent.id == id))
     }
 
+    fn root_agent(&self) -> Option<&AgentProfile> {
+        self.team_lead
+            .and_then(|id| self.agents.iter().find(|agent| agent.id == id))
+            .or_else(|| self.agents.first())
+    }
+
     fn routed_objective(&self, message: &str) -> String {
         self.composer_target().map_or_else(
             || message.to_owned(),
@@ -528,21 +537,58 @@ impl AppModel {
             Action::ZoomTeamIn if self.panel == Panel::Agents => self.team_flow.zoom_in(),
             Action::ZoomTeamOut if self.panel == Panel::Agents => self.team_flow.zoom_out(),
             Action::ResetTeamZoom if self.panel == Panel::Agents => self.team_flow.reset_zoom(),
-            Action::AdjustTeam => self.open_team_setup(),
+            Action::MoveSelectedAgent(dx, dy)
+                if self.panel == Panel::Agents
+                    && self.active_role_tab.is_none()
+                    && !self.task_pane_focused
+                    && !self.help
+                    && !self.event_viewer
+                    && !self.composer_active
+                    && self.pending_approval().is_none()
+                    && self.credential_input.is_none()
+                    && self.application_notice.is_none() =>
+            {
+                self.team_flow.move_node(self.selected_agent, dx, dy);
+            }
+            Action::AdjustTeam => {
+                if let Some(id) = self.active_role_tab {
+                    self.close_role_tab(id);
+                } else {
+                    self.open_team_setup();
+                }
+            }
             Action::ChangeWorkspace => self.open_workspace_picker(),
             Action::AddAgent => {
                 if self.panel == Panel::Agents || self.active_role_tab.is_some() {
                     self.open_agent_setup(true);
                 }
             }
+            Action::OpenSelectedAgentTab => {
+                if self.panel == Panel::Agents
+                    && self.active_role_tab.is_none()
+                    && let Some(id) = self.agents.get(self.selected_agent).map(|agent| agent.id)
+                {
+                    self.open_role_tab(id);
+                }
+            }
             Action::DeleteAgent => self.open_delete_confirmation(),
             Action::ShowTeam => self.select_tab(TabId::Team),
             Action::ShowTasks => self.select_tab(TabId::Tasks),
+            Action::ToggleTaskFocus => {
+                if self.panel == Panel::Agents
+                    && self.active_role_tab.is_none()
+                    && self.task_pane_visible
+                {
+                    self.task_pane_focused = !self.task_pane_focused;
+                }
+            }
             Action::ToggleTaskPane => {
-                self.task_pane_visible = !self.task_pane_visible;
-                self.task_pane_focused = self.task_pane_visible;
-                if self.task_pane_visible {
-                    self.task_layout.cancel_drag();
+                if self.active_role_tab.is_none() {
+                    self.task_pane_visible = !self.task_pane_visible;
+                    self.task_pane_focused = self.task_pane_visible;
+                    if self.task_pane_visible {
+                        self.task_layout.cancel_drag();
+                    }
                 }
             }
             Action::CloseTab => {
@@ -595,6 +641,7 @@ impl AppModel {
             | Action::ZoomTeamIn
             | Action::ZoomTeamOut
             | Action::ResetTeamZoom
+            | Action::MoveSelectedAgent(_, _)
             | Action::None => {}
         }
     }
@@ -918,10 +965,6 @@ impl AppModel {
             .unwrap_or(self.selected_agent)
             .min(draft.developers.len().saturating_sub(1));
         self.setup_editor = Some(if adding {
-            if draft.developers.len() >= 32 {
-                self.warn("A team supports at most 32 agents.");
-                return;
-            }
             crate::onboarding::Wizard::add_agent(self.model_catalog.clone(), draft, selected)
         } else {
             crate::onboarding::Wizard::configure_agent(self.model_catalog.clone(), draft, selected)
@@ -1047,6 +1090,9 @@ impl AppModel {
                     ComposerEvent::Consumed
                 }
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ComposerEvent::Ignored
+                }
+                KeyCode::F(4) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     ComposerEvent::Ignored
                 }
                 KeyCode::Tab | KeyCode::BackTab => ComposerEvent::Ignored,
@@ -1724,11 +1770,10 @@ fn new_composer() -> TextArea<'static> {
     );
     composer.set_selection_style(Style::default().fg(theme::BACKGROUND).bg(theme::YELLOW));
     composer.set_style(theme::canvas());
-    composer.set_placeholder_style(Style::default().fg(theme::MUTED).bg(theme::BACKGROUND));
     composer.set_wrap_mode(WrapMode::WordOrGlyph);
     composer.set_tab_length(2);
     composer.set_max_histories(200);
-    composer.set_placeholder_text("Ask Team Lead to do anything");
+    composer.set_placeholder_text("");
     composer
 }
 #[must_use]
@@ -1755,9 +1800,12 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('c') => Action::AdjustTeam,
         KeyCode::Char('g') => Action::ChangeWorkspace,
         KeyCode::Char('a') => Action::AddAgent,
+        KeyCode::Char('o') => Action::OpenSelectedAgentTab,
         KeyCode::Char('1') => Action::ShowTeam,
         KeyCode::Char('2') => Action::ShowTasks,
-        KeyCode::Char('t') => Action::ToggleTaskPane,
+        KeyCode::Char('i') => Action::ShowTasks,
+        KeyCode::Char('t') => Action::ToggleTaskFocus,
+        KeyCode::Char('h') => Action::ToggleTaskPane,
         KeyCode::Delete => Action::DeleteAgent,
         KeyCode::Char('w') => Action::ChangeWorkspace,
         KeyCode::Char('v') => Action::ToggleExpanded,
@@ -1779,6 +1827,22 @@ fn action_for_event(value: Event) -> Action {
             Action::Quit
         }
         Event::Key(key)
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                )
+                && key.kind != KeyEventKind::Release =>
+        {
+            match key.code {
+                KeyCode::Left => Action::MoveSelectedAgent(-1, 0),
+                KeyCode::Right => Action::MoveSelectedAgent(1, 0),
+                KeyCode::Up => Action::MoveSelectedAgent(0, -1),
+                KeyCode::Down => Action::MoveSelectedAgent(0, 1),
+                _ => Action::None,
+            }
+        }
+        Event::Key(key)
             if key.modifiers == KeyModifiers::ALT && key.kind != KeyEventKind::Release =>
         {
             match key.code {
@@ -1790,6 +1854,11 @@ fn action_for_event(value: Event) -> Action {
         }
         Event::Key(key)
             if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Action::CloseTab
+        }
+        Event::Key(key)
+            if key.code == KeyCode::F(4) && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             Action::CloseTab
         }
@@ -2808,7 +2877,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
     app.task_inspector_hitbox = Rect::default();
     app.task_expand_hitbox = Rect::default();
     app.task_retry_hitbox = Rect::default();
-    let sidebar_visible = app.task_pane_visible && rows[1].width >= 40;
+    let sidebar_visible =
+        app.task_pane_visible && app.active_role_tab.is_none() && rows[1].width >= 40;
     if sidebar_visible {
         let [sidebar, gutter, workspace] = task_sidebar_panes(rows[1]);
         app.task_pane_hitbox = sidebar;
@@ -2853,15 +2923,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         (workspace.chars().count() as u16 + 5).min(rows[2].width),
         1,
     );
-    let placeholder = if app.composer_active {
-        String::new()
-    } else {
-        app.composer_target().map_or_else(
-            || "Ask Team Lead to do anything".to_owned(),
-            |agent| format!("Ask {} to do anything", sanitize(&agent.name)),
-        )
-    };
-    app.composer.set_placeholder_text(placeholder);
+    app.composer.set_placeholder_text("");
     let composer_status = if app.composer_active {
         let DataCursor(line, column) = app.composer.cursor();
         Some((
@@ -2902,14 +2964,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
             Rect::new(composer_inner.x, composer_inner.y, 2, 1),
         );
     }
-    // TextArea adds a cell before its placeholder, but not before typed text.
-    // Keep the first typed character aligned with the placeholder after the dog.
-    let input_offset = if !app.composer_active && app.composer.lines().iter().all(String::is_empty)
-    {
-        2
-    } else {
-        3
-    };
+    // Leave one cell between the wide dog emoji and the composer text.
+    let input_offset = 3;
     let input_area = Rect::new(
         composer_inner.x.saturating_add(input_offset),
         composer_inner.y,
@@ -2928,6 +2984,19 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
     });
     app.composer_hitbox = rows[2];
     frame.render_widget(&app.composer, input_area);
+    if !app.composer_active && app.composer.lines().iter().all(String::is_empty) {
+        let target = app.composer_target().or_else(|| app.root_agent());
+        let (name, color) = target.map_or_else(
+            || ("Team Lead".to_owned(), theme::AQUA),
+            |agent| (sanitize(&agent.name), app.agent_color(agent)),
+        );
+        let placeholder = Line::from(vec![
+            Span::styled("Ask ", Style::default().fg(theme::MUTED)),
+            Span::styled(name, Style::default().fg(color)),
+            Span::styled(" to do anything", Style::default().fg(theme::MUTED)),
+        ]);
+        frame.render_widget(Paragraph::new(placeholder), input_area);
+    }
     if frame.area().width >= 48 && frame.area().height >= 12 {
         app.notifications.render(frame, frame.area());
     }
@@ -3102,7 +3171,10 @@ fn render_role_workspace(
         frame,
         activity,
         panel(
-            &format!(" {} · Activity · ↑/↓ scroll ", sanitize(&agent.name)),
+            &format!(
+                " {} · Activity · ↑/↓ scroll · [c] close tab ",
+                sanitize(&agent.name)
+            ),
             true,
         ),
         area,
@@ -3130,8 +3202,10 @@ fn render_task_sidebar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area:
     app.task_expand_hitbox = Rect::default();
     app.task_retry_hitbox = Rect::default();
 
-    let title = if app.task_pane_focused {
-        format!(" > Tasks · {} ", app.tasks.len())
+    let title = if area.width >= 28 {
+        format!(" Tasks · {} · [i] inspect ", app.tasks.len())
+    } else if area.width >= 20 {
+        format!(" Tasks · {} · [i] ", app.tasks.len())
     } else {
         format!(" Tasks · {} ", app.tasks.len())
     };
@@ -3170,8 +3244,6 @@ fn render_task_sidebar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area:
         .saturating_sub(visible)
         .min(app.tasks.len().saturating_sub(visible));
     app.task_window_start = start;
-    let owner_width = usize::from(area.width.saturating_sub(6)).max(3);
-    let objective_width = usize::from(area.width.saturating_sub(4)).max(3);
     let items = app
         .tasks
         .iter()
@@ -3180,12 +3252,21 @@ fn render_task_sidebar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area:
         .take(visible)
         .map(|(index, task)| {
             let (icon, _, color) = task_status_visual(task.status);
+            let max_visible_depth = usize::from(area.width.saturating_sub(10) / 2);
+            let indent = "  ".repeat(usize::from(task.depth).min(max_visible_depth));
             let (owner, owner_color) = app.agent_for_owner(task.owner).map_or_else(
                 || (short_agent_id(task.owner), theme::AQUA),
                 |agent| (sanitize(&agent.name), app.agent_color(agent)),
             );
+            let owner_width = usize::from(area.width.saturating_sub(6))
+                .saturating_sub(indent.len())
+                .max(3);
+            let objective_width = usize::from(area.width.saturating_sub(4))
+                .saturating_sub(indent.len())
+                .max(3);
             let lines = vec![
                 Line::from(vec![
+                    Span::raw(indent.clone()),
                     Span::styled(format!("{icon} "), Style::default().fg(color)),
                     Span::styled(
                         truncate_text(&owner, owner_width),
@@ -3195,7 +3276,10 @@ fn render_task_sidebar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area:
                     ),
                 ]),
                 Line::from(Span::styled(
-                    truncate_text(&one_line(&sanitize(&task.objective)), objective_width),
+                    format!(
+                        "{indent}{}",
+                        truncate_text(&one_line(&sanitize(&task.objective)), objective_width)
+                    ),
                     Style::default().fg(theme::MUTED),
                 )),
             ];
@@ -3209,21 +3293,23 @@ fn render_task_sidebar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area:
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items).block(block), area);
-    let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
-        .position(start)
-        .viewport_content_length(visible);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_style(Style::default().fg(theme::BORDER))
-            .thumb_style(Style::default().fg(theme::AQUA)),
-        area.inner(Margin {
-            horizontal: 0,
-            vertical: 1,
-        }),
-        &mut scrollbar,
-    );
+    if app.tasks.len() > visible {
+        let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
+            .position(start)
+            .viewport_content_length(visible);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(Style::default().fg(theme::BORDER))
+                .thumb_style(Style::default().fg(theme::AQUA)),
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar,
+        );
+    }
 }
 
 fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
@@ -3362,21 +3448,23 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
             })
             .collect::<Vec<_>>();
         frame.render_widget(List::new(items).block(browser_block), browser);
-        let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
-            .position(start)
-            .viewport_content_length(visible);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_style(Style::default().fg(theme::BORDER))
-                .thumb_style(Style::default().fg(theme::AQUA)),
-            browser.inner(Margin {
-                horizontal: 0,
-                vertical: 1,
-            }),
-            &mut scrollbar,
-        );
+        if app.tasks.len() > visible {
+            let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
+                .position(start)
+                .viewport_content_length(visible);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_style(Style::default().fg(theme::BORDER))
+                    .thumb_style(Style::default().fg(theme::AQUA)),
+                browser.inner(Margin {
+                    horizontal: 0,
+                    vertical: 1,
+                }),
+                &mut scrollbar,
+            );
+        }
     }
 
     render_task_inspector(frame, app, inspector);
@@ -3411,7 +3499,7 @@ fn render_task_inspector(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ins
         inspector.width.saturating_sub(2),
         pair,
     ));
-    let footer = format!(
+    let controls = format!(
         " [v] {} · [r] re-run · PgUp/PgDn scroll ",
         if app.expanded_output {
             "compact"
@@ -3419,14 +3507,13 @@ fn render_task_inspector(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ins
             "details"
         }
     );
-    app.task_expand_hitbox = title_action_hitbox(inspector, &footer, "[v]", 4, false);
-    app.task_retry_hitbox = title_action_hitbox(inspector, &footer, "[r]", 4, false);
+    let title = format!(" Inspector ·{controls}");
+    app.task_expand_hitbox = title_action_hitbox(inspector, &title, "[v]", 4, true);
+    app.task_retry_hitbox = title_action_hitbox(inspector, &title, "[r]", 4, true);
     render_chat(
         frame,
         lines,
-        panel(" Inspector ", true)
-            .title_bottom(footer)
-            .border_type(BorderType::Rounded),
+        panel(&title, true).border_type(BorderType::Rounded),
         inspector,
         &mut app.task_inspector_scroll,
     );
@@ -3450,21 +3537,23 @@ fn render_chat(
     let position = max_scroll.saturating_sub(usize::from(*from_bottom));
     frame.render_widget(block, area);
     frame.render_widget(paragraph.scroll((position as u16, 0)), inner);
-    let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
-        .position(position)
-        .viewport_content_length(height);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_style(Style::default().fg(theme::BORDER))
-            .thumb_style(Style::default().fg(theme::AQUA)),
-        area.inner(Margin {
-            horizontal: 0,
-            vertical: 1,
-        }),
-        &mut state,
-    );
+    if max_scroll > 0 {
+        let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(position)
+            .viewport_content_length(height);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(Style::default().fg(theme::BORDER))
+                .thumb_style(Style::default().fg(theme::AQUA)),
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut state,
+        );
+    }
 }
 
 fn same_result_content(summary: &str, message: &str) -> bool {
@@ -4298,11 +4387,87 @@ fn popup_section(title: &str) -> Line<'static> {
 
 fn help_section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
-        format!(" {title} "),
+        format!("  {title} "),
         Style::default()
             .fg(theme::ORANGE)
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+fn help_binding(key: &str, action: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("    {key:<14}"),
+            Style::default()
+                .fg(theme::AQUA)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(action.to_owned(), Style::default().fg(theme::TEXT)),
+    ])
+}
+
+fn help_lines(compact: bool) -> Vec<Line<'static>> {
+    if compact {
+        vec![
+            help_section("NAVIGATION"),
+            help_binding("1 / 2", "Team / tasks"),
+            help_binding("i", "Inspect tasks"),
+            help_binding("Tab", "Switch tabs"),
+            help_binding("t / h", "Focus / toggle pane"),
+            help_binding("j/k / click", "Browse / select"),
+            help_binding("o / +", "Open agent tab"),
+            help_binding("Ctrl+W / Ctrl+F4", "Close tab"),
+            help_section("TASKS & EVENTS"),
+            help_binding("e / v", "Events / details"),
+            help_binding("PgUp / Dn", "Scroll inspector"),
+            help_binding("r / x", "Retry / cancel"),
+            help_section("TEAM & PROMPT"),
+            help_binding("a / Del", "Add / remove agent"),
+            help_binding("c", "Configure / close tab"),
+            help_binding("w", "Workspace"),
+            help_binding("+/-/0/f", "Zoom / reset / fit"),
+            help_binding("Ctrl+arrows", "Move agent card"),
+            help_binding("Enter / Shift+Enter", "Message / new line"),
+            help_binding("Ctrl+Z / Y", "Undo / redo"),
+        ]
+    } else {
+        vec![
+            help_section("NAVIGATION"),
+            help_binding("1 / 2", "Team / tasks"),
+            help_binding("i", "Inspect tasks"),
+            help_binding("Tab", "Switch tabs"),
+            help_binding("t", "Focus tasks / team"),
+            help_binding("h", "Show / hide tasks"),
+            help_binding("j / k", "Browse agents"),
+            help_binding("Click", "Select agent"),
+            help_binding("o / +", "Open agent tab"),
+            help_binding("Ctrl+W / Ctrl+F4", "Close agent tab"),
+            help_section("TASKS & EVENTS"),
+            help_binding("e", "Events"),
+            help_binding("v", "Output details"),
+            help_binding("PgUp / Dn", "Scroll inspector"),
+            help_binding("r", "Retry task"),
+            help_binding("x", "Cancel task"),
+            help_section("TEAM & PROMPT"),
+            help_binding("a", "Add agent"),
+            help_binding("Del", "Remove agent"),
+            help_binding("c", "Configure / close tab"),
+            help_binding("w", "Workspace"),
+            help_binding("+ / - / 0 / f", "Zoom / reset / fit"),
+            help_binding("Ctrl+arrows", "Move agent card"),
+            help_binding("Enter", "Message agent"),
+            help_binding("Shift+Enter", "New line"),
+            help_binding("Ctrl+Z / Y", "Undo / redo"),
+        ]
+    }
+}
+
+fn help_lines_width(lines: &[Line<'_>]) -> u16 {
+    lines
+        .iter()
+        .map(|line| u16::try_from(line.width()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0)
 }
 
 fn popup_section_into(lines: &mut Vec<Line<'static>>, title: &str) {
@@ -4321,10 +4486,59 @@ fn centered_popup(area: Rect, requested_width: u16, requested_height: u16) -> Re
 }
 
 fn help_popup_area(area: Rect) -> Rect {
-    centered_popup(
-        area,
-        area.width.saturating_sub(2).min(74),
-        area.height.saturating_sub(2).min(30),
+    help_popup_layout(area).0
+}
+
+fn help_popup_layout(area: Rect) -> (Rect, bool, bool) {
+    let full_help = help_lines(false);
+    let compact_help = help_lines(true);
+    let logo = crate::onboarding::animated_logo_text_for(theme::SURFACE);
+    let logo_width = logo.as_ref().map_or(0, |image| {
+        image.lines.iter().map(Line::width).max().unwrap_or(0) as u16
+    });
+    let logo_height = logo.as_ref().map_or(0, |image| image.lines.len() as u16);
+    let max_width = area.width.saturating_sub(2).min(104);
+    let max_height = area.height.saturating_sub(2).min(34);
+    let full_width = help_lines_width(&full_help);
+    let compact_width = help_lines_width(&compact_help);
+    let full_height = u16::try_from(full_help.len()).unwrap_or(u16::MAX);
+    let use_compact = max_height.saturating_sub(2) < full_height;
+    let help_width = if use_compact {
+        compact_width
+    } else {
+        full_width
+    };
+    let can_show_logo = logo_width
+        .saturating_add(2)
+        .saturating_add(help_width)
+        .saturating_add(4)
+        <= max_width
+        && logo_height.saturating_add(2) <= max_height;
+    let width = if can_show_logo {
+        logo_width
+            .saturating_add(2)
+            .saturating_add(help_width)
+            .saturating_add(4)
+    } else {
+        help_width.saturating_add(4)
+    }
+    .min(max_width);
+    let content_height = if can_show_logo {
+        logo_height.max(if use_compact {
+            u16::try_from(compact_help.len()).unwrap_or(u16::MAX)
+        } else {
+            full_height
+        })
+    } else if use_compact {
+        u16::try_from(compact_help.len()).unwrap_or(u16::MAX)
+    } else {
+        full_height
+    };
+    let height = content_height.saturating_add(2).min(max_height);
+    (
+        centered_popup(area, width, height),
+        use_compact,
+        can_show_logo,
     )
 }
 
@@ -4410,15 +4624,25 @@ fn trim_response_buffer(response: &mut String) {
 
 fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
     let handoff = handoff_summary(&app.tasks, &app.approvals);
-    let title = if app.panel == Panel::Agents {
-        format!(" Team · {handoff} · [t] tab · [a] add agent · [c] config · +/- zoom · f fit ")
+    let task_pane_focused = app.task_pane_focused && !app.task_pane_hitbox.is_empty();
+    let focus_hint = if app.task_pane_hitbox.is_empty() {
+        if app.task_pane_visible {
+            "[h] hide tasks"
+        } else {
+            "[h] show tasks"
+        }
+    } else if task_pane_focused {
+        "[t] focus team"
     } else {
-        format!(" Team · {handoff} · [t] tab · [a] add agent · [c] config ")
+        "[t] focus tasks"
     };
+    let title = format!(
+        " Team · {handoff} · {focus_hint} · [o] open agent · [a] add · [c] config · +/- zoom · f fit "
+    );
     app.team_edit_hitbox = title_action_hitbox(area, &title, "[c]", 8, true);
-    app.team_add_hitbox = title_action_hitbox(area, &title, "[a]", 10, true);
+    app.team_add_hitbox = title_action_hitbox(area, &title, "[a]", 7, true);
     frame.render_widget(
-        panel(&title, app.panel == Panel::Agents).border_type(BorderType::Rounded),
+        panel(&title, !task_pane_focused).border_type(BorderType::Rounded),
         area,
     );
     let inner = area.inner(Margin {
@@ -4457,85 +4681,63 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
         );
         let text = event_viewer_lines(app);
         frame.render_widget(Clear, popup);
-        let title = if app.event_follow {
-            " Events · live · newest first "
+        let (state, scroll_hint) = if app.event_follow {
+            ("live · newest first", "↓/PgDn older")
         } else {
-            " Events · paused "
+            ("paused", "↑/PgUp newer")
         };
-        let footer = if app.event_follow {
-            " [v] expand/collapse · ↓/PgDn older · e/Esc close "
+        let output_hint = if app.expanded_output {
+            "[v] compact"
         } else {
-            " [v] expand/collapse · ↑/PgUp newer · e/Esc close "
+            "[v] details"
         };
-        frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((app.event_scroll, 0))
-                .block(
-                    Block::default()
-                        .title(title)
-                        .title_bottom(
-                            Line::from(footer)
-                                .style(Style::default().fg(theme::AQUA))
-                                .alignment(ratatui::layout::Alignment::Center),
-                        )
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .style(theme::surface())
-                        .border_style(Style::default().fg(theme::BORDER)),
-                ),
-            popup,
-        );
+        let title = format!(" Events · {state} · {output_hint} · {scroll_hint} · e/Esc close ");
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme::AQUA)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(theme::surface())
+            .border_style(Style::default().fg(theme::AQUA));
+        let inner = block.inner(popup);
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        let max_scroll = paragraph
+            .line_count(inner.width)
+            .saturating_sub(usize::from(inner.height))
+            .min(usize::from(u16::MAX));
+        let position = usize::from(app.event_scroll).min(max_scroll);
+        frame.render_widget(block, popup);
+        frame.render_widget(paragraph.scroll((position as u16, 0)), inner);
+        if max_scroll > 0 {
+            let mut scrollbar = ScrollbarState::new(max_scroll.saturating_add(1))
+                .position(position)
+                .viewport_content_length(usize::from(inner.height));
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_style(Style::default().fg(theme::BORDER))
+                    .thumb_style(Style::default().fg(theme::AQUA)),
+                popup.inner(Margin {
+                    horizontal: 0,
+                    vertical: 1,
+                }),
+                &mut scrollbar,
+            );
+        }
     }
     if app.help {
-        let popup = help_popup_area(frame.area());
+        let (popup, compact, show_logo) = help_popup_layout(frame.area());
         frame.render_widget(Clear, popup);
-        let mut help = vec![
-            help_section("NAVIGATION"),
-            Line::from("  1 / 2  Team / Tasks"),
-            Line::from("  Tab / ⇧Tab  Switch tabs"),
-            Line::from("  t  Show / hide task pane"),
-            Line::from("  j/k  Browse"),
-            Line::from("  Click  Select role"),
-            Line::from("  Double-click / +  Open agent tab"),
-            Line::from("  Ctrl+W  Close agent tab"),
-            Line::from(""),
-            help_section("TASKS & EVENTS"),
-            Line::from("  e  Session events"),
-            Line::from("  v  Expand output"),
-            Line::from("  PgUp/Dn  Scroll details"),
-            Line::from("  r  Re-run task"),
-            Line::from("  x  Cancel task"),
-            Line::from(""),
-            help_section("TEAM & PROMPT"),
-            Line::from("  a  Add agent"),
-            Line::from("  Del  Delete agent"),
-            Line::from("  c  Configure agent"),
-            Line::from("  w  Workspace"),
-            Line::from("  +/-/0/f  Zoom/fit"),
-            Line::from("  Enter  Talk to role"),
-            Line::from("  Shift+⏎  New line"),
-            Line::from("  Ctrl+Z/Y  Undo/redo"),
-        ];
-        if usize::from(popup.height) < help.len() + 4 {
-            help = vec![
-                help_section("NAVIGATION"),
-                Line::from("  1 Team · 2 Tasks · Tab/⇧Tab switch tabs"),
-                Line::from("  t show/hide task pane"),
-                Line::from("  j/k browse · Click select"),
-                Line::from("  Double-click / + agent tab · Ctrl+W close"),
-                Line::from(""),
-                help_section("TASKS & EVENTS"),
-                Line::from("  e events · v expand"),
-                Line::from("  PgUp/Dn scroll · r retry · x cancel"),
-                Line::from(""),
-                help_section("TEAM & PROMPT"),
-                Line::from("  a add · Del delete · c configure"),
-                Line::from("  w workspace · +/-/0/f zoom/fit"),
-                Line::from("  Enter talk · Shift+Enter new line"),
-                Line::from("  Ctrl+Z/Y undo/redo"),
-            ];
-        }
+        let help = help_lines(compact);
+        let content = popup.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
         let title = format!(" Help · voff v{} ", env!("CARGO_PKG_VERSION"));
         frame.render_widget(
             Block::default()
@@ -4561,16 +4763,10 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                 ),
             popup,
         );
-        let content = popup.inner(Margin::new(2, 2));
         let logo = crate::onboarding::animated_logo_text_for(theme::SURFACE);
-        let logo_width = logo.as_ref().map_or(0, |image| {
-            image.lines.iter().map(Line::width).max().unwrap_or(0) as u16
-        });
-        let logo_height = logo.as_ref().map_or(0, |image| image.lines.len() as u16);
-        if content.width >= logo_width.saturating_add(28)
-            && content.height >= logo_height
-            && let Some(logo) = logo
-        {
+        if show_logo && let Some(logo) = logo {
+            let logo_width = logo.lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+            let logo_height = logo.lines.len() as u16;
             let logo_area = Rect::new(content.x, content.y, logo_width, logo_height);
             let help_area = Rect::new(
                 content.x + logo_width + 2,
@@ -5854,9 +6050,13 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Tab), Action::NextTab);
         assert_eq!(action_for_key(KeyCode::BackTab), Action::PreviousTab);
         assert_eq!(action_for_key(KeyCode::Enter), Action::FocusComposer);
-        assert_eq!(action_for_key(KeyCode::Char('t')), Action::ToggleTaskPane);
+        assert_eq!(action_for_key(KeyCode::Char('t')), Action::ToggleTaskFocus);
+        assert_eq!(action_for_key(KeyCode::Char('h')), Action::ToggleTaskPane);
         assert_eq!(action_for_key(KeyCode::Char('b')), Action::None);
-        assert_eq!(action_for_key(KeyCode::Char('o')), Action::None);
+        assert_eq!(
+            action_for_key(KeyCode::Char('o')),
+            Action::OpenSelectedAgentTab
+        );
         assert_eq!(action_for_key(KeyCode::Char('/')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('c')), Action::AdjustTeam);
         assert_eq!(action_for_key(KeyCode::Char('g')), Action::ChangeWorkspace);
@@ -6585,7 +6785,7 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("Agent settings"));
+        assert!(!rendered.contains("Agent settings"));
         assert!(rendered.contains("🐶"), "{rendered}");
         assert!(rendered.contains("voff · ses_"), "{rendered}");
         assert!(rendered.contains("Enter save"));
@@ -6607,7 +6807,7 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("Agent settings"));
+        assert!(!rendered.contains("Agent settings"));
         assert!(rendered.contains("voff · ses_"), "{rendered}");
         assert!(rendered.contains("Team Lead"));
         assert!(!rendered.contains("[c] config"));
@@ -6628,7 +6828,10 @@ mod tests {
             "{rendered}"
         );
         let popup = help_popup_area(Rect::new(0, 0, 112, 32));
-        let content = popup.inner(Margin::new(2, 2));
+        let content = popup.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
         let colored_logo_cells = (content.y..content.bottom())
             .flat_map(|y| (content.x..content.x + 40).map(move |x| buffer[(x, y)].fg))
             .filter(|color| *color != theme::TEXT && *color != theme::SURFACE)
@@ -6638,8 +6841,9 @@ mod tests {
             "ANSI logo should retain its colors"
         );
         assert!(rendered.contains("Add agent"));
-        assert_eq!(popup.width, 74);
-        assert_eq!(popup.height, 30);
+        assert!(popup.width < 104, "popup should fit its content: {popup:?}");
+        assert!(popup.width > 60, "logo and help list should fit: {popup:?}");
+        assert_eq!(popup.height, 28);
         let title_row = (0..112)
             .map(|x| buffer[(x, popup.y)].symbol())
             .collect::<String>();
@@ -7322,14 +7526,14 @@ mod tests {
             .collect::<String>();
         assert!(composer.contains("Team Lead"), "{composer}");
         assert!(
-            composer.contains("🐶") && composer.contains("Ask Team Lead to do anything"),
+            composer.contains("🐶") && composer.contains("Ask Ada to do anything"),
             "{composer}"
         );
         assert!(!composer.contains("/task assign"), "{composer}");
         assert!(!composer.contains("/tasks browse"), "{composer}");
         // The wide emoji occupies a continuation cell; the next cell is the visible gap.
         assert!(
-            composer.contains("🐶  Ask Team Lead to do anything"),
+            composer.contains("🐶  Ask Ada to do anything"),
             "{composer}"
         );
         assert!(!composer.contains("[R]"), "{composer}");

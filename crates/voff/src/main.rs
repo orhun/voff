@@ -144,7 +144,8 @@ async fn application(cli: Cli) -> Result<()> {
                     config_root.join(path)
                 }
             });
-            let setup_prompts = parsed.setup_prompts.clone();
+            let mut setup_prompts = parsed.setup_prompts.clone();
+            setup_prompts.upgrade_legacy_defaults();
             (
                 setup_from_file(parsed)?,
                 configured_workspace,
@@ -310,7 +311,8 @@ fn load_workspace_setup_config(
         .with_context(|| format!("could not read config {}", path.display()))?;
     let parsed: FileConfig = toml::from_str(&source)
         .with_context(|| format!("invalid TOML config {}", path.display()))?;
-    let setup_prompts = parsed.setup_prompts.clone();
+    let mut setup_prompts = parsed.setup_prompts.clone();
+    setup_prompts.upgrade_legacy_defaults();
     Ok((setup_from_file(parsed)?, setup_prompts))
 }
 
@@ -318,10 +320,6 @@ fn setup_from_file(config: FileConfig) -> Result<Option<SetupDraft>> {
     if config.agent.is_empty() {
         return Ok(None);
     }
-    anyhow::ensure!(
-        config.agent.len() <= 32,
-        "a team supports at most 32 agents"
-    );
     let catalog = ModelCatalog::default();
     let fallback_provider = ProviderChoice::default_provider();
     let names = config
@@ -488,10 +486,6 @@ fn config_from_setup(setup: &SetupDraft) -> Result<RuntimeTeam> {
             .all(|developer| developer.role != DeveloperRole::Lead),
         "guided setup permits exactly one Team Lead"
     );
-    anyhow::ensure!(
-        setup.developers.len() <= 32,
-        "a team supports at most 32 agents"
-    );
     for (index, developer) in setup.developers.iter().enumerate() {
         anyhow::ensure!(
             !developer.name.trim().is_empty() && developer.name.len() <= 80,
@@ -586,16 +580,19 @@ fn config_from_setup(setup: &SetupDraft) -> Result<RuntimeTeam> {
             provider: Some(setup_provider_route(developer, index)),
             model: Some(developer.model.clone()),
             max_output_tokens: developer.max_output_tokens,
-            delegation: DelegationConfig {
-                allowed_targets: setup
+            delegation: {
+                let allowed_targets = setup
                     .developers
                     .iter()
                     .enumerate()
                     .filter(|(_, agent)| agent.reports_to == Some(index))
                     .map(|(child, _)| ids[child].clone())
-                    .collect(),
-                max_depth: 4,
-                max_children: 16,
+                    .collect::<Vec<_>>();
+                DelegationConfig {
+                    max_children: u16::try_from(allowed_targets.len()).unwrap_or(u16::MAX),
+                    allowed_targets,
+                    max_depth: 4,
+                }
             },
         })
         .collect();
@@ -791,20 +788,25 @@ async fn run(
                 draft = edited;
                 session = Some(session_id);
                 startup_notice = notice;
-                if startup.scan_pending {
-                    startup.scan_pending = false;
-                    let scan_notice = startup_notice
-                        .take()
-                        .unwrap_or_else(|| "Workspace scan completed.".into());
-                    startup_notice = Some(
-                        match save_workspace_team_config(&draft, &startup.setup_prompts) {
-                            Ok(path) => format!("{scan_notice} Team saved to {}.", path.display()),
-                            Err(error) => {
-                                format!("{scan_notice} Team file was not saved: {error}.")
-                            }
-                        },
-                    );
-                }
+                let default_notice = if startup.scan_pending {
+                    "Workspace scan completed."
+                } else {
+                    "Agent settings updated."
+                };
+                startup.scan_pending = false;
+                let update_notice = startup_notice
+                    .take()
+                    .unwrap_or_else(|| default_notice.into());
+                startup_notice = Some(
+                    match save_workspace_team_config(&draft, &startup.setup_prompts) {
+                        Ok(path) => {
+                            format!("{update_notice} Team config saved to {}.", path.display())
+                        }
+                        Err(error) => {
+                            format!("{update_notice} Team config was not saved: {error}.")
+                        }
+                    },
+                );
             }
             Some((tui::TuiExit::Workspace(workspace), _)) => return Ok(Some(workspace)),
             None => return Ok(None),

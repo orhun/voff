@@ -446,6 +446,25 @@ impl TeamFlow {
         }
     }
 
+    pub fn move_node(&mut self, index: usize, dx: i8, dy: i8) {
+        let Some(agent_id) = self.agent_ids.get(index) else {
+            return;
+        };
+        let id = node_id(*agent_id);
+        let Some(node) = self.flow.node(&id) else {
+            return;
+        };
+        let position = node.position;
+        let step = 2.0 / self.flow.viewport.zoom.max(f64::EPSILON);
+        self.flow.set_node_position(
+            &id,
+            Position::new(
+                position.x + f64::from(dx) * step,
+                position.y + f64::from(dy) * step,
+            ),
+        );
+    }
+
     pub fn fit_view(&mut self) {
         let _ = self.flow.apply_controls_action(ControlsAction::FitView);
     }
@@ -683,33 +702,13 @@ fn build_edges(
                 highlighted_agent.is_some_and(|id| id == source.id || id == target.id),
                 returning,
             );
-            let mut edge = routing_edge(
+            let edge = routing_edge(
                 format!("handoff:{}:{}", source.id, target.id),
                 if returning { target.id } else { source.id },
                 if returning { source.id } else { target.id },
                 style,
             )
             .with_animated(active);
-            let caption = if returning {
-                task.map(|task| {
-                    format!(
-                        "↶ Review · {}",
-                        truncate_label(&sanitize(&task.objective), 22)
-                    )
-                })
-            } else if let Some(task) = task.filter(|_| active) {
-                Some(format!(
-                    "▶ {}",
-                    truncate_label(&sanitize(&task.objective), 25)
-                ))
-            } else {
-                pending.as_ref().map(|proposal| {
-                    format!("◇ {}", truncate_label(&sanitize(&proposal.objective), 25))
-                })
-            };
-            if let Some(caption) = caption {
-                edge = edge.with_label(caption);
-            }
             if returning {
                 returning_edges.push(edge);
             } else {
