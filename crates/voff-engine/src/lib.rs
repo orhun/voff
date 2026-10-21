@@ -68,6 +68,7 @@ pub enum EngineEvent {
     TaskUpdated(Task),
     ApprovalUpdated(Approval),
     ArtifactUpdated(Artifact),
+    ProcessOutput { task_id: TaskId, text: String },
     ProviderHealth(ProviderHealth),
 }
 pub struct Engine<R: Repository> {
@@ -1907,12 +1908,44 @@ impl<R: Repository + 'static> Engine<R> {
                     command_spec(&args, &workspace.root().join(&approval.working_directory))?;
                 let command = format!("{} {}", spec.program, spec.args.join(" "));
                 let grant = ExecutionGrant::from_approval(approval)?;
-                let result = self
+                let executor = self
                     .executor
                     .as_ref()
                     .ok_or(EngineError::WorkflowNotConfigured)?
-                    .execute(&spec, grant)
-                    .await?;
+                    .clone();
+                let (output_tx, mut output_rx) = mpsc::channel(32);
+                let execution = executor.execute_streaming(&spec, grant, output_tx);
+                tokio::pin!(execution);
+                let mut execution_result = None;
+                let mut output_closed = false;
+                let result = loop {
+                    if let Some(result) = execution_result.take() {
+                        break result?;
+                    }
+                    tokio::select! {
+                        result = &mut execution, if execution_result.is_none() => {
+                            execution_result = Some(result);
+                        }
+                        output = output_rx.recv(), if !output_closed => {
+                            match output {
+                                Some(text) => self.events.send(EngineEvent::ProcessOutput {
+                                    task_id: approval.task_id,
+                                    text,
+                                }).await.map_err(|_| EngineError::ChannelClosed)?,
+                                None => output_closed = true,
+                            }
+                        }
+                    }
+                };
+                while let Some(text) = output_rx.recv().await {
+                    self.events
+                        .send(EngineEvent::ProcessOutput {
+                            task_id: approval.task_id,
+                            text,
+                        })
+                        .await
+                        .map_err(|_| EngineError::ChannelClosed)?;
+                }
                 self.record(
                     Some(approval.task_id),
                     CanonicalEventKind::ProcessFinished {

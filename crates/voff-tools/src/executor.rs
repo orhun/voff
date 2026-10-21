@@ -3,10 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    sync::{Mutex, mpsc},
+};
 use voff_core::{ApprovalDecision, ApprovalId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +63,88 @@ pub enum ExecutorError {
 #[derive(Clone)]
 pub struct ControlledExecutor {
     root: PathBuf,
+}
+
+#[derive(Default)]
+struct CapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+async fn send_output_text(sender: &mpsc::Sender<String>, text: &str) {
+    if !text.is_empty() {
+        let _ = sender.send(text.to_owned()).await;
+    }
+}
+
+async fn stream_utf8(sender: &mpsc::Sender<String>, pending: &mut Vec<u8>, bytes: &[u8]) {
+    pending.extend_from_slice(bytes);
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            send_output_text(sender, text).await;
+            pending.clear();
+        }
+        Err(error) => {
+            let valid = error.valid_up_to();
+            if valid > 0 {
+                let text = std::str::from_utf8(&pending[..valid])
+                    .expect("valid UTF-8 prefix")
+                    .to_owned();
+                pending.drain(..valid);
+                send_output_text(sender, &text).await;
+            }
+            if error.error_len().is_some() {
+                let text = String::from_utf8_lossy(pending).into_owned();
+                pending.clear();
+                send_output_text(sender, &text).await;
+            }
+        }
+    }
+}
+
+async fn capture_pipe<R>(
+    mut reader: R,
+    sender: Option<mpsc::Sender<String>>,
+    captured: Arc<Mutex<CapturedOutput>>,
+    limit: usize,
+    is_stdout: bool,
+) -> Result<(), std::io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0; 4096];
+    let mut pending = Vec::new();
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+
+        {
+            let mut output = captured.lock().await;
+            let bytes = if is_stdout {
+                &mut output.stdout
+            } else {
+                &mut output.stderr
+            };
+            let remaining = limit.saturating_sub(bytes.len());
+            let retained = count.min(remaining);
+            bytes.extend_from_slice(&buffer[..retained]);
+            output.truncated |= retained < count;
+        }
+
+        if let Some(sender) = &sender {
+            stream_utf8(sender, &mut pending, &buffer[..count]).await;
+        }
+    }
+    if let Some(sender) = &sender
+        && !pending.is_empty()
+    {
+        let text = String::from_utf8_lossy(&pending).into_owned();
+        send_output_text(sender, &text).await;
+    }
+    Ok(())
 }
 
 /// Check the direct-execution shape and resource bounds before a command is
@@ -127,6 +214,24 @@ impl ControlledExecutor {
         spec: &CommandSpec,
         grant: ExecutionGrant,
     ) -> Result<ProcessResult, ExecutorError> {
+        self.execute_inner(spec, grant, None).await
+    }
+
+    pub async fn execute_streaming(
+        &self,
+        spec: &CommandSpec,
+        grant: ExecutionGrant,
+        output: mpsc::Sender<String>,
+    ) -> Result<ProcessResult, ExecutorError> {
+        self.execute_inner(spec, grant, Some(output)).await
+    }
+
+    async fn execute_inner(
+        &self,
+        spec: &CommandSpec,
+        grant: ExecutionGrant,
+        output: Option<mpsc::Sender<String>>,
+    ) -> Result<ProcessResult, ExecutorError> {
         let _approval_id = grant.approval_id;
         let cwd = self.validate(spec)?;
         let safe_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -148,21 +253,29 @@ impl ControlledExecutor {
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
         let limit = spec.output_limit.clamp(1, 1_048_576);
+        let captured = Arc::new(Mutex::new(CapturedOutput::default()));
+        let stdout_capture = capture_pipe(
+            &mut stdout,
+            output.clone(),
+            Arc::clone(&captured),
+            limit,
+            true,
+        );
+        let stderr_capture = capture_pipe(&mut stderr, output, Arc::clone(&captured), limit, false);
         let capture = async move {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let (_, _, status) = tokio::join!(
-                stdout.read_to_end(&mut out),
-                stderr.read_to_end(&mut err),
-                child.wait()
-            );
+            let (stdout_result, stderr_result, status) =
+                tokio::join!(stdout_capture, stderr_capture, child.wait());
+            stdout_result?;
+            stderr_result?;
             let status = status?;
-            out.extend_from_slice(&err);
-            let truncated = out.len() > limit;
-            out.truncate(limit);
+            let mut output = captured.lock().await;
+            let mut bytes = std::mem::take(&mut output.stdout);
+            bytes.extend_from_slice(&output.stderr);
+            let truncated = output.truncated || bytes.len() > limit;
+            bytes.truncate(limit);
             Ok::<_, std::io::Error>(ProcessResult {
                 exit_code: status.code(),
-                output: String::from_utf8_lossy(&out).into_owned(),
+                output: String::from_utf8_lossy(&bytes).into_owned(),
                 truncated,
             })
         };

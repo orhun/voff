@@ -1484,6 +1484,9 @@ impl AppModel {
                     self.artifacts.push(artifact)
                 }
             }
+            EngineEvent::ProcessOutput { task_id, text } => {
+                self.push_process_output(task_id, &text);
+            }
             EngineEvent::ProviderHealth(_) => {}
         }
         if self.events.len() > 500 {
@@ -1638,6 +1641,44 @@ impl AppModel {
     #[cfg(test)]
     fn push_event(&mut self, kind: &CanonicalEventKind) {
         self.push_scoped_event(None, kind);
+    }
+
+    fn push_process_output(&mut self, task_id: voff_core::TaskId, text: &str) {
+        const MAX_LIVE_OUTPUT_BYTES: usize = 64 * 1024;
+        if text.is_empty() {
+            return;
+        }
+        let last_task_event = self
+            .scoped_events
+            .iter()
+            .rposition(|event| event.task_id == Some(task_id));
+        if let Some(index) = last_task_event.filter(|&index| {
+            self.scoped_events[index].is_output
+                && self.scoped_events[index].headline == Some("Test output")
+        }) {
+            let event = &mut self.scoped_events[index];
+            event.text.push_str(text);
+            trim_tail(&mut event.text, MAX_LIVE_OUTPUT_BYTES);
+        } else {
+            let mut output = text.to_owned();
+            trim_tail(&mut output, MAX_LIVE_OUTPUT_BYTES);
+            self.scoped_events.push(ScopedEvent {
+                task_id: Some(task_id),
+                text: output,
+                is_output: true,
+                headline: Some("Test output"),
+                related_task: None,
+                source_task: None,
+                accent: theme::TEXT,
+                approval_id: None,
+                tool_call_id: None,
+                review: None,
+                conversational: true,
+                speaker: None,
+                details_only: false,
+            });
+        }
+        self.on_events_changed();
     }
 
     fn push_scoped_event(&mut self, task_id: Option<voff_core::TaskId>, kind: &CanonicalEventKind) {
@@ -1935,6 +1976,20 @@ impl AppModel {
             .sum::<usize>()
             .min(usize::from(u16::MAX)) as u16
     }
+}
+
+fn trim_tail(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some(line_end) = value[start..].find('\n') {
+        start += line_end + 1;
+    }
+    value.drain(..start);
 }
 
 fn has_unsettled_tasks(tasks: &[Task]) -> bool {
@@ -4065,6 +4120,10 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         .iter()
         .filter(|artifact| artifact.producer == task.id)
         .collect::<Vec<_>>();
+    let has_live_test_output = app
+        .scoped_events
+        .iter()
+        .any(|event| event.task_id == Some(task.id) && event.headline == Some("Test output"));
     if !artifacts.is_empty() {
         lines.push(Line::from(""));
         push_section(&mut lines, "ARTIFACTS", theme::PURPLE);
@@ -4080,7 +4139,9 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
                     Style::default().fg(theme::TEXT),
                 ),
             ]));
-            if !artifact.preview.trim().is_empty() {
+            if !(artifact.preview.trim().is_empty()
+                || has_live_test_output && artifact.kind == "test_report")
+            {
                 push_text_lines(
                     &mut lines,
                     &compact_text(&sanitize(&artifact.preview), app.expanded_output, false),
@@ -4300,7 +4361,7 @@ fn conversation_lines(
             }
         }
         let mut title = event.headline.unwrap_or("Details").to_owned();
-        if event.is_output {
+        if event.is_output && event.headline != Some("Test output") {
             title.clear();
         } else if title == "✓ Result" {
             title = "✓".into();
@@ -4379,7 +4440,12 @@ fn conversation_lines(
         } else if let Some(related) = related {
             sanitize(&related.objective)
         } else if event.is_output {
-            event.text.clone()
+            let output = sanitize(&event.text);
+            if event.headline == Some("Test output") {
+                process_output_preview(&output, width, if app.expanded_output { 79 } else { 3 })
+            } else {
+                output
+            }
         } else {
             event
                 .text
@@ -4394,7 +4460,13 @@ fn conversation_lines(
             &detail,
             color,
             width,
-            if app.expanded_output { usize::MAX } else { 3 },
+            if app.expanded_output {
+                usize::MAX
+            } else if event.headline == Some("Test output") {
+                4
+            } else {
+                3
+            },
         );
         if let Some((label, owner_len, target_color)) = delegation_label {
             color_delegation_label(
@@ -4448,6 +4520,23 @@ fn conversation_action(action: &str) -> &str {
         "task.plan" | "task.delegate" => "delegating work",
         _ => "the next step",
     }
+}
+
+fn process_output_preview(output: &str, width: u16, visible_lines: usize) -> String {
+    let inner = usize::from(width.saturating_sub(6).max(1));
+    let tail_chars = inner.saturating_mul(visible_lines.max(1));
+    let start = output
+        .char_indices()
+        .rev()
+        .nth(tail_chars.saturating_sub(1))
+        .map_or(0, |(index, _)| index);
+    let wrapped = output[start..]
+        .lines()
+        .flat_map(|line| textwrap::wrap(line, inner))
+        .map(|line| line.into_owned())
+        .collect::<Vec<_>>();
+    let start = wrapped.len().saturating_sub(visible_lines);
+    wrapped[start..].join("\n")
 }
 
 fn push_activity_entry(
