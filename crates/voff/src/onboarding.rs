@@ -18,12 +18,16 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, FrameExt as _, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, FrameExt as _, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use ratatui_explorer::{FileExplorer, FileExplorerBuilder, Theme};
 use ratatui_textarea::TextArea;
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     fs,
     io::{self, IsTerminal, Read as _},
     panic,
@@ -411,22 +415,37 @@ pub(crate) struct Wizard {
     mode: WizardMode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StartupChoice {
     Scan {
         workspace: PathBuf,
+        popup_size: (u16, u16),
         provider: ProviderChoice,
         model: String,
         api_token: Option<String>,
+        terminal: Option<TerminalHandoff>,
     },
     Build {
         workspace: PathBuf,
+        popup_size: (u16, u16),
         provider: ProviderChoice,
         model: String,
         api_token: Option<String>,
         description: String,
+        terminal: Option<TerminalHandoff>,
     },
     Quit,
+}
+
+pub(crate) struct TerminalHandoff {
+    guard: TerminalGuard,
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalHandoff {
+    pub(crate) fn adopt(mut self) -> Terminal<CrosstermBackend<io::Stdout>> {
+        self.guard.handoff();
+        self.terminal
+    }
 }
 
 enum StartupPickerResult<T> {
@@ -442,6 +461,13 @@ fn is_ctrl_c(event: &Event) -> bool {
 }
 
 impl StartupChoice {
+    pub(crate) fn popup_size(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::Scan { popup_size, .. } | Self::Build { popup_size, .. } => Some(*popup_size),
+            Self::Quit => None,
+        }
+    }
+
     pub(crate) fn workspace(&self) -> Option<&Path> {
         match self {
             Self::Scan { workspace, .. } | Self::Build { workspace, .. } => Some(workspace),
@@ -455,6 +481,13 @@ impl StartupChoice {
                 *workspace = selected;
             }
             Self::Quit => {}
+        }
+    }
+
+    pub(crate) fn take_terminal_handoff(&mut self) -> Option<TerminalHandoff> {
+        match self {
+            Self::Scan { terminal, .. } | Self::Build { terminal, .. } => terminal.take(),
+            Self::Quit => None,
         }
     }
 }
@@ -1539,7 +1572,7 @@ fn unique_name(base: &str, developers: &[DeveloperDraft], exclude: Option<usize>
 
 /// Set up a project team from the workspace or a short user description.
 pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let choices = startup_provider_choices();
     let catalog = ModelCatalog::default();
@@ -1550,9 +1583,10 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
     let mut focused = StartupField::Workspace;
     let mut description = String::new();
     let mut error: Option<String> = None;
+    let popup_size = Cell::new(None);
     loop {
         terminal.draw(|frame| {
-            render_startup_splash(
+            if let Some(popup) = render_startup_splash_with_popup(
                 frame,
                 StartupView {
                     workspace: &workspace,
@@ -1565,14 +1599,16 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     description: &description,
                     error: error.as_deref(),
                 },
-            )
+            ) {
+                popup_size.set(Some((popup.width, popup.height)));
+            }
         })?;
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
         let event = event::read()?;
         if crate::tui::redraw_on_resize(&mut terminal, &event, |frame| {
-            render_startup_splash(
+            if let Some(popup) = render_startup_splash_with_popup(
                 frame,
                 StartupView {
                     workspace: &workspace,
@@ -1585,7 +1621,9 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     description: &description,
                     error: error.as_deref(),
                 },
-            )
+            ) {
+                popup_size.set(Some((popup.width, popup.height)));
+            }
         })? {
             continue;
         }
@@ -1628,17 +1666,21 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     } else if !description.trim().is_empty() {
                         return Ok(StartupChoice::Build {
                             workspace: workspace.clone(),
+                            popup_size: popup_size.get().unwrap_or((42, 8)),
                             provider,
                             model,
                             api_token: (!api_token.is_empty()).then_some(api_token),
                             description: description.trim().to_owned(),
+                            terminal: Some(TerminalHandoff { guard, terminal }),
                         });
                     } else {
                         return Ok(StartupChoice::Scan {
                             workspace: workspace.clone(),
+                            popup_size: popup_size.get().unwrap_or((42, 8)),
                             provider,
                             model,
                             api_token: (!api_token.is_empty()).then_some(api_token),
+                            terminal: Some(TerminalHandoff { guard, terminal }),
                         });
                     }
                 }
@@ -1987,6 +2029,13 @@ pub(crate) fn show_splash() -> io::Result<()> {
 }
 
 fn render_startup_splash(frame: &mut ratatui::Frame<'_>, view: StartupView<'_>) {
+    let _ = render_startup_splash_with_popup(frame, view);
+}
+
+fn render_startup_splash_with_popup(
+    frame: &mut ratatui::Frame<'_>,
+    view: StartupView<'_>,
+) -> Option<Rect> {
     let StartupView {
         workspace,
         show_setup,
@@ -2300,6 +2349,264 @@ fn render_startup_splash(frame: &mut ratatui::Frame<'_>, view: StartupView<'_>) 
         };
         render_logo_overlay(frame, &logo, content, transparent_row);
     }
+    setup_popup
+}
+
+pub(crate) struct TeamBuildingView<'a> {
+    pub(crate) popup_size: Option<(u16, u16)>,
+    pub(crate) setup_prompt: &'a str,
+    pub(crate) team: Option<&'a SetupDraft>,
+    pub(crate) summary: Option<&'a str>,
+    pub(crate) frame_index: usize,
+    pub(crate) scroll: u16,
+    pub(crate) error: Option<&'a str>,
+}
+
+pub(crate) fn render_team_building_screen(
+    frame: &mut ratatui::Frame<'_>,
+    view: TeamBuildingView<'_>,
+) {
+    let TeamBuildingView {
+        popup_size,
+        setup_prompt,
+        team,
+        summary,
+        frame_index,
+        scroll,
+        error,
+    } = view;
+    render_startup_background(frame);
+    let area = frame.area();
+    let logo = logo_text();
+    let (logo_width, logo_height) = logo.as_ref().map_or((0, 0), |image| {
+        (
+            image.lines.iter().map(Line::width).max().unwrap_or(0) as u16,
+            image.lines.len() as u16,
+        )
+    });
+    let requested_size = popup_size.unwrap_or((42, 8));
+    let width = requested_size.0.saturating_add(16).min(area.width).max(1);
+    let after_height = u16::from(team.is_some() || error.is_none());
+    let max_panel_height = area.height.saturating_sub(after_height).max(1);
+    let panel_height = requested_size
+        .1
+        .saturating_add(4)
+        .min(max_panel_height)
+        .max(1);
+    let group_height = logo_height
+        .saturating_sub(u16::from(logo_height > 0))
+        .saturating_add(panel_height)
+        .saturating_add(after_height);
+    let show_logo = logo.is_some() && logo_width <= area.width && group_height <= area.height;
+    let visible_logo_height = if show_logo { logo_height } else { 0 };
+    let overlap = u16::from(visible_logo_height > 0);
+    let mut lines = Vec::new();
+    if team.is_none() {
+        lines.push(Line::from(Span::styled(
+            "Setup prompt",
+            Style::default()
+                .fg(theme::AQUA)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(team) = team {
+        lines.push(Line::from(Span::styled(
+            "Project summary",
+            Style::default()
+                .fg(theme::AQUA)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let Some(summary) = summary {
+            lines.extend(
+                summary
+                    .lines()
+                    .map(|line| Line::from(line).style(Style::default().fg(theme::TEXT))),
+            );
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Team · {} agents", team.developers.len()),
+            Style::default()
+                .fg(theme::AQUA)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let members = team
+            .developers
+            .iter()
+            .enumerate()
+            .map(|(index, developer)| {
+                let name = crate::tui::sanitize(&developer.name).replace(['\n', '\r'], " ");
+                let parent = developer.reports_to.map(|parent| {
+                    team.developers.get(parent).map_or_else(
+                        || "team".to_owned(),
+                        |parent| crate::tui::sanitize(&parent.name).replace(['\n', '\r'], " "),
+                    )
+                });
+                let role = parent
+                    .map(|parent| format!("reports to {parent}"))
+                    .or_else(|| (index == 0).then(|| "lead".to_owned()));
+                (name, role)
+            })
+            .collect::<Vec<_>>();
+        let name_width = members
+            .iter()
+            .map(|(name, _)| Line::from(name.as_str()).width())
+            .max()
+            .unwrap_or_default();
+        for (name, role) in members {
+            let name_padding = name_width.saturating_sub(Line::from(name.as_str()).width()) + 1;
+            let mut member = vec![
+                Span::styled(name, Style::default().fg(theme::TEXT)),
+                Span::raw(" ".repeat(name_padding)),
+            ];
+            if let Some(role) = role {
+                member.push(Span::styled(
+                    format!("·  {role}"),
+                    Style::default().fg(theme::TEXT),
+                ));
+            }
+            lines.push(Line::from(member));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Setup prompt",
+            Style::default()
+                .fg(theme::AQUA)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.extend(
+        setup_prompt
+            .lines()
+            .map(|line| Line::from(line).style(Style::default().fg(theme::TEXT))),
+    );
+    if let Some(error) = error {
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from("Voff could not build this team.").style(Style::default().fg(theme::YELLOW)),
+        );
+        lines.push(Line::from(error).style(Style::default().fg(theme::MUTED)));
+    }
+    let content_width = width.saturating_sub(3).max(1);
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(theme::surface());
+    let content_height = paragraph.line_count(content_width);
+    let group_height = visible_logo_height
+        .saturating_sub(overlap)
+        .saturating_add(panel_height)
+        .saturating_add(after_height);
+    let group_y = area
+        .y
+        .saturating_add(area.height.saturating_sub(group_height) / 2)
+        .min(area.bottom().saturating_sub(group_height));
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        group_y + visible_logo_height.saturating_sub(overlap),
+        width,
+        panel_height,
+    );
+    let footer = if error.is_some() {
+        Some(Line::from(vec![
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" or Esc to close"),
+        ]))
+    } else {
+        None
+    }
+    .map(|footer| footer.alignment(Alignment::Center));
+    let after_lines = if team.is_some() {
+        vec![Line::from(vec![
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to open your team"),
+            Span::raw(" 🐶"),
+        ])]
+    } else if error.is_none() {
+        let icon = if (frame_index / 5) % 2 == 0 {
+            "🐶"
+        } else {
+            "🦴"
+        };
+        vec![Line::from(vec![
+            Span::styled(
+                "Building the team ",
+                Style::default()
+                    .fg(theme::TEXT)
+                    .bg(theme::BACKGROUND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                icon,
+                Style::default().fg(theme::ORANGE).bg(theme::BACKGROUND),
+            ),
+        ])]
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .map(|line| line.alignment(Alignment::Center))
+    .collect::<Vec<_>>();
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::surface())
+        .border_style(Style::default().fg(theme::BORDER));
+    if let Some(footer) = footer {
+        block = block.title_bottom(footer);
+    }
+    let inner = block.inner(popup);
+    let text_area = Rect {
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    let max_scroll = content_height.saturating_sub(text_area.height as usize);
+    let scroll = usize::from(scroll).min(max_scroll);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(paragraph.scroll((scroll as u16, 0)), text_area);
+    if content_height > text_area.height as usize && inner.width > 1 {
+        let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(scroll)
+            .viewport_content_length(text_area.height as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Rect {
+                x: inner.x + inner.width.saturating_sub(1),
+                width: 1,
+                ..inner
+            },
+            &mut state,
+        );
+    }
+    if !after_lines.is_empty() {
+        let after_area = Rect::new(popup.x, popup.bottom(), popup.width, after_height);
+        frame.render_widget(Block::default().style(theme::canvas()), after_area);
+        frame.render_widget(
+            Paragraph::new(after_lines)
+                .alignment(Alignment::Center)
+                .style(theme::canvas()),
+            after_area,
+        );
+    }
+    if show_logo && let Some(logo) = logo {
+        let logo_area = Rect::new(
+            area.x + area.width.saturating_sub(logo_width) / 2,
+            group_y,
+            logo_width,
+            visible_logo_height,
+        );
+        render_logo_overlay(frame, &logo, logo_area, Some(popup.y));
+    }
 }
 
 fn render_startup_background(frame: &mut ratatui::Frame<'_>) {
@@ -2573,12 +2880,8 @@ pub(crate) async fn build_workspace_team(
     let plan: WorkspaceTeamPlan = serde_json::from_str(&arguments)
         .map_err(|error| format!("the model returned an invalid team plan: {error}"))?;
     let summary = plan.summary.trim().to_owned();
-    let count = plan.agents.len();
     let developers = plan_to_draft(plan, provider_choice, &model, credential_reference)?;
-    let notice = format!(
-        "{summary} Created a project-specific lead prompt and {count} agents using {}.",
-        provider_choice.label()
-    );
+    let notice = summary;
     Ok((
         SetupDraft {
             developers,
@@ -3681,7 +3984,9 @@ fn setup_rows(shell: Rect, step: Step, mode: WizardMode) -> [Rect; 3] {
     [rows[0], rows[1], rows[2]]
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    handed_off: bool,
+}
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
@@ -3703,14 +4008,26 @@ impl TerminalGuard {
             );
             old(info);
         }));
-        Ok(Self)
+        Ok(Self { handed_off: false })
+    }
+
+    fn handoff(&mut self) {
+        self.handed_off = true;
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 

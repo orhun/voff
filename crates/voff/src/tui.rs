@@ -200,8 +200,9 @@ pub struct AppModel {
     setup_result: Option<crate::onboarding::SetupDraft>,
     setup_notice: Option<String>,
     startup_scan_pending: bool,
+    startup_scan_summary: bool,
     startup_setup_prompt: String,
-    startup_goal: Option<String>,
+    startup_popup_size: Option<(u16, u16)>,
     startup_scan_result: Option<Result<(crate::onboarding::SetupDraft, String), String>>,
     startup_scan_frame: usize,
     startup_prompt_scroll: u16,
@@ -284,8 +285,9 @@ impl AppModel {
             setup_result: None,
             setup_notice: None,
             startup_scan_pending: false,
+            startup_scan_summary: false,
             startup_setup_prompt: String::new(),
-            startup_goal: None,
+            startup_popup_size: None,
             startup_scan_result: None,
             startup_scan_frame: 0,
             startup_prompt_scroll: 0,
@@ -1978,7 +1980,7 @@ fn event_viewer_lines(app: &AppModel) -> Vec<Line<'static>> {
     lines
 }
 
-fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     let clean: String = value
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
@@ -2042,9 +2044,11 @@ pub(crate) struct ConfiguredRun {
     pub team_lead: AgentId,
     pub team_setup: Option<crate::onboarding::SetupDraft>,
     pub startup_notice: Option<String>,
+    pub startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
     pub startup_scan_pending: bool,
     pub setup_prompts: crate::onboarding::SetupPrompts,
     pub startup_goal: Option<String>,
+    pub startup_popup_size: Option<(u16, u16)>,
 }
 pub(crate) enum TuiExit {
     Team(crate::onboarding::SetupDraft, Option<String>),
@@ -2086,7 +2090,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
     app.team_setup = config.team_setup;
     app.startup_scan_pending = config.startup_scan_pending;
     app.startup_setup_prompt = startup_setup_prompt;
-    app.startup_goal = config.startup_goal.clone();
+    app.startup_popup_size = config.startup_popup_size;
     if let Some(notice) = config.startup_notice {
         let _ = app.notify("Team updated", &notice, Level::Info, theme::GREEN, false);
     }
@@ -2107,6 +2111,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
             startup_scan_provider,
             startup_goal: config.startup_goal,
             setup_prompts: config.setup_prompts,
+            startup_terminal_handoff: config.startup_terminal_handoff,
         },
         input_tx,
         input_rx,
@@ -2152,6 +2157,7 @@ struct LoopConfig {
     startup_scan_provider: Option<Arc<dyn voff_provider::ModelProvider>>,
     startup_goal: Option<String>,
     setup_prompts: crate::onboarding::SetupPrompts,
+    startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
 }
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2208,9 +2214,14 @@ async fn terminal_loop<R: Repository + 'static>(
         startup_scan_provider,
         startup_goal,
         setup_prompts,
+        startup_terminal_handoff,
     } = config;
-    let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let (_guard, startup_terminal) = TerminalGuard::enter_with_handoff(startup_terminal_handoff)?;
+    let mut terminal = if let Some(terminal) = startup_terminal {
+        terminal
+    } else {
+        Terminal::new(CrosstermBackend::new(io::stdout()))?
+    };
     let input = tokio::task::spawn_blocking(move || {
         forward_terminal_events(input_tx, event::poll, event::read);
     });
@@ -2277,11 +2288,16 @@ async fn terminal_loop<R: Repository + 'static>(
                         && key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
+                    if model.startup_scan_summary {
+                        model.setup_result = None;
+                        model.setup_notice = None;
+                    }
                     model.quit = true;
                     continue;
                 }
                 if model.startup_scan_pending
                     || model.startup_scan_error.is_some()
+                    || model.startup_scan_summary
                 {
                     if let Event::Key(key) = &event
                         && key.kind == KeyEventKind::Press
@@ -2299,9 +2315,18 @@ async fn terminal_loop<R: Repository + 'static>(
                             KeyCode::PageDown => {
                                 model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_add(8);
                             }
+                            KeyCode::Enter if model.startup_scan_summary => {
+                                model.startup_scan_summary = false;
+                                model.quit = true;
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') if model.startup_scan_summary => {
+                                model.setup_result = None;
+                                model.setup_notice = None;
+                                model.startup_scan_summary = false;
+                                model.quit = true;
+                            }
                             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')
-                                if !model.startup_scan_pending =>
-                            {
+                                if !model.startup_scan_pending && !model.startup_scan_summary => {
                                 model.startup_scan_error = None;
                             }
                             _ => {}
@@ -2594,7 +2619,8 @@ async fn terminal_loop<R: Repository + 'static>(
                         Ok((draft, notice)) => {
                             model.setup_result = Some(draft);
                             model.setup_notice = Some(notice);
-                            model.quit = true;
+                            model.startup_prompt_scroll = 0;
+                            model.startup_scan_summary = true;
                         }
                         Err(error) => model.startup_scan_error = Some(sanitize(&error)),
                     }
@@ -2640,6 +2666,24 @@ fn composer_height(app: &AppModel, area: Rect) -> u16 {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
+    if app.startup_scan_pending || app.startup_scan_error.is_some() || app.startup_scan_summary {
+        let setup_prompt = sanitize(&app.startup_setup_prompt);
+        let error = app.startup_scan_error.as_deref().map(sanitize);
+        let summary = app.setup_notice.as_deref().map(sanitize);
+        crate::onboarding::render_team_building_screen(
+            frame,
+            crate::onboarding::TeamBuildingView {
+                popup_size: app.startup_popup_size,
+                setup_prompt: &setup_prompt,
+                team: app.setup_result.as_ref(),
+                summary: summary.as_deref(),
+                frame_index: app.startup_scan_frame,
+                scroll: app.startup_prompt_scroll,
+                error: error.as_deref(),
+            },
+        );
+        return;
+    }
     frame.render_widget(Block::default().style(theme::canvas()), frame.area());
     let composer_height = composer_height(app, frame.area());
     let rows = Layout::default()
@@ -2768,117 +2812,6 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         return;
     }
     render_overlays(frame, app);
-    render_team_builder_popup(frame, app);
-}
-
-fn render_team_builder_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
-    if !app.startup_scan_pending && app.startup_scan_error.is_none() {
-        return;
-    }
-    let title = " Build your team ";
-    let mut lines = Vec::new();
-    if let Some(error) = &app.startup_scan_error {
-        lines.push(
-            Line::from("Voff could not scan this workspace.")
-                .style(Style::default().fg(theme::TEXT)),
-        );
-        lines.push(Line::from(error.as_str()).style(Style::default().fg(theme::MUTED)));
-    } else {
-        lines.push(
-            Line::from(sanitize(&app.workspace_root.display().to_string()))
-                .style(Style::default().fg(theme::MUTED)),
-        );
-    }
-    if let Some(goal) = &app.startup_goal {
-        lines.push(Line::from(""));
-        lines.push(
-            Line::from(format!("Requested outcome: {}", sanitize(goal)))
-                .style(Style::default().fg(theme::TEXT)),
-        );
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Setup prompt",
-        Style::default()
-            .fg(theme::AQUA)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(
-        Line::from(app.startup_setup_prompt.as_str()).style(Style::default().fg(theme::TEXT)),
-    );
-    let area = frame.area();
-    let popup = centered_popup(
-        area,
-        area.width.saturating_sub(4).min(72),
-        16.min(area.height),
-    );
-    frame.render_widget(Clear, popup);
-    let mut block = Block::default()
-        .title(
-            Line::from(title).style(
-                Style::default()
-                    .fg(theme::ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .style(theme::surface())
-        .border_style(Style::default().fg(theme::BORDER));
-    let footer_line = if app.startup_scan_pending {
-        let spinner = ['|', '/', '-', '\\'][app.startup_scan_frame % 4];
-        Line::from(vec![
-            Span::styled(
-                format!("{spinner}  Building your team..."),
-                Style::default()
-                    .fg(theme::ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ·  ↑/↓ scroll", Style::default().fg(theme::MUTED)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(
-                "Scan failed",
-                Style::default()
-                    .fg(theme::YELLOW)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  ·  Enter or Esc to close",
-                Style::default().fg(theme::TEXT),
-            ),
-        ])
-    };
-    block = block.title_bottom(footer_line.alignment(Alignment::Center));
-    let inner = block.inner(popup);
-    let text_area = Rect {
-        width: inner.width.saturating_sub(1),
-        ..inner
-    };
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .style(theme::surface());
-    let content_height = paragraph.line_count(text_area.width);
-    let max_scroll = content_height.saturating_sub(text_area.height as usize);
-    let scroll = usize::from(app.startup_prompt_scroll).min(max_scroll);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-    frame.render_widget(paragraph.scroll((scroll as u16, 0)), text_area);
-    if content_height > text_area.height as usize && inner.width > 1 {
-        let mut state = ScrollbarState::new(content_height)
-            .position(scroll)
-            .viewport_content_length(text_area.height as usize);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            Rect {
-                x: inner.x + inner.width.saturating_sub(1),
-                width: 1,
-                ..inner
-            },
-            &mut state,
-        );
-    }
 }
 
 fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
@@ -4743,18 +4676,26 @@ fn panel(title: &str, active: bool) -> Block<'_> {
 }
 struct TerminalGuard;
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            )
-        )?;
+    fn enter_with_handoff(
+        startup_handoff: Option<crate::onboarding::TerminalHandoff>,
+    ) -> io::Result<(Self, Option<Terminal<CrosstermBackend<io::Stdout>>>)> {
+        let key_flags = PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        );
+        if startup_handoff.is_some() {
+            execute!(io::stdout(), key_flags)?;
+        } else {
+            enable_raw_mode()?;
+            execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste,
+                key_flags
+            )?;
+        }
+        let startup_terminal = startup_handoff.map(crate::onboarding::TerminalHandoff::adopt);
         let old = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
@@ -4767,7 +4708,7 @@ impl TerminalGuard {
             );
             old(info);
         }));
-        Ok(Self)
+        Ok((Self, startup_terminal))
     }
 }
 impl Drop for TerminalGuard {
