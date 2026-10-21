@@ -35,6 +35,7 @@ llm-kernel = { version = "0.31.6", default-features = false, features = ["provid
 textwrap = { version = "0.16.4", default-features = false, features = ["unicode-width"] }
 unicode-width = "0.2.2"
 tokio-util.workspace = true
+tui-piechart = "1.1.0"
 [lints]
 workspace = true
 [dev-dependencies]

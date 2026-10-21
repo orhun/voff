@@ -106,17 +106,8 @@ impl AgentCard {
                 format!("  {}", self.provider),
                 Style::default().fg(theme::MUTED),
             )));
-            if self.display_level < 2
-                && let Some(usage) = usage_summary(self.usage)
-            {
-                lines.extend(wrapped_card_detail(
-                    "  ",
-                    &usage,
-                    inner_width,
-                    1,
-                    false,
-                    theme::MUTED,
-                ));
+            if self.display_level < 2 && usage_summary(self.usage).is_some() {
+                lines.push(token_usage_line("  ", self.usage, None));
             }
         }
         if self.display_level >= 2 {
@@ -165,16 +156,8 @@ impl AgentCard {
                 },
                 |cost| format!(" · est. {}", format_usd(cost)),
             );
-            if let Some(usage) = usage_summary(self.usage) {
-                let usage_text = format!("Tokens · {usage}{cost}");
-                lines.extend(wrapped_card_detail(
-                    "  ",
-                    &usage_text,
-                    inner_width,
-                    2,
-                    false,
-                    theme::MUTED,
-                ));
+            if usage_summary(self.usage).is_some() {
+                lines.push(token_usage_line("  Tokens · ", self.usage, Some(&cost)));
             }
         }
         lines
@@ -746,7 +729,7 @@ fn prompt_summary(prompt: &str) -> Option<String> {
     (!summary.is_empty()).then_some(summary)
 }
 
-fn estimate_cost(provider: &str, model_id: &str, usage: TokenUsage) -> Option<f64> {
+pub(super) fn estimate_cost(provider: &str, model_id: &str, usage: TokenUsage) -> Option<f64> {
     let model = ProviderIndex::embedded()
         .models_for(provider)
         .iter()
@@ -820,7 +803,7 @@ fn repeats_task(response: &str, task: &str) -> bool {
         && (response == task || response.starts_with(&task) || task.starts_with(&response))
 }
 
-fn compact_count(value: u64) -> String {
+pub(super) fn compact_count(value: u64) -> String {
     if value < 1_000 {
         value.to_string()
     } else if value < 10_000 {
@@ -842,7 +825,29 @@ fn usage_summary(usage: TokenUsage) -> Option<String> {
     })
 }
 
-fn format_usd(value: f64) -> String {
+fn token_usage_line(prefix: &str, usage: TokenUsage, suffix: Option<&str>) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(prefix.to_owned(), Style::default().fg(theme::ORANGE)),
+        Span::styled(
+            format!("{} in", compact_count(usage.input_tokens)),
+            Style::default().fg(theme::AQUA),
+        ),
+        Span::styled(" / ", Style::default().fg(theme::MUTED)),
+        Span::styled(
+            format!("{} out", compact_count(usage.output_tokens)),
+            Style::default().fg(theme::PURPLE),
+        ),
+    ];
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(
+            suffix.to_owned(),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+pub(super) fn format_usd(value: f64) -> String {
     if value == 0.0 {
         "$0.00".into()
     } else if value < 0.0001 {
@@ -1494,7 +1499,7 @@ mod geometry_tests {
 
     #[test]
     fn normal_zoom_cards_show_reported_token_usage() {
-        let card = AgentCard {
+        let mut card = AgentCard {
             max_width: 36.0,
             identity: "⬢ Backend Agent".into(),
             provider: "Codex CLI".into(),
@@ -1521,6 +1526,26 @@ mod geometry_tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(rendered.contains("1.2k in / 318 out"), "{rendered}");
+        let spans = card
+            .lines(0, 34)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .collect::<Vec<_>>();
+        assert!(spans.iter().any(|span| {
+            span.content.contains("1.2k in") && span.style.fg == Some(theme::AQUA)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content.contains("318 out") && span.style.fg == Some(theme::PURPLE)
+        }));
+
+        card.display_level = 2;
+        let details = card
+            .lines(0, 34)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(details.contains("Tokens · 1.2k in / 318 out · cost unreported"));
     }
 
     #[test]

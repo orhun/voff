@@ -37,6 +37,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
     CanonicalEventKind, SessionId, Task, TaskStatus,
@@ -46,7 +47,11 @@ use voff_engine::{
 };
 use voff_storage::{Repository, SqliteRepository};
 
-use self::team_flow::{TeamFlow, TeamSnapshot, TokenUsage, handoff_summary, role_color, role_icon};
+use self::team_flow::{
+    TeamFlow, TeamSnapshot, TokenUsage, compact_count, estimate_cost, format_usd, handoff_summary,
+    role_color, role_icon,
+};
+use tui_piechart::{PieChart, PieSlice};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Panel {
@@ -76,6 +81,7 @@ pub enum Action {
     ToggleTaskFocus,
     ToggleTaskPane,
     ToggleHelp,
+    ToggleUsage,
     FocusComposer,
     RetryTask,
     AddCredential,
@@ -151,6 +157,8 @@ pub struct AppModel {
     pub selected: usize,
     pub panel: Panel,
     pub help: bool,
+    usage_viewer: bool,
+    usage_scroll: u16,
     pub quit: bool,
     pub agents: Vec<AgentProfile>,
     known_agents: HashMap<AgentId, AgentProfile>,
@@ -239,6 +247,8 @@ impl AppModel {
             selected: 0,
             panel: Panel::Agents,
             help: false,
+            usage_viewer: false,
+            usage_scroll: 0,
             quit: false,
             agents: vec![],
             known_agents: HashMap::new(),
@@ -461,7 +471,9 @@ impl AppModel {
                 }
             }
             Action::Up => {
-                if self.event_viewer {
+                if self.usage_viewer {
+                    self.usage_scroll = self.usage_scroll.saturating_sub(1);
+                } else if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
                     self.event_follow = self.event_scroll == 0;
                 } else if self.task_pane_focused {
@@ -479,7 +491,9 @@ impl AppModel {
                 }
             }
             Action::Down => {
-                if self.event_viewer {
+                if self.usage_viewer {
+                    self.usage_scroll = self.usage_scroll.saturating_add(1);
+                } else if self.event_viewer {
                     self.event_scroll = self
                         .event_scroll
                         .saturating_add(1)
@@ -506,7 +520,9 @@ impl AppModel {
             Action::NextTab => self.cycle_tab(1),
             Action::PreviousTab => self.cycle_tab(-1),
             Action::PageUp => {
-                if self.event_viewer {
+                if self.usage_viewer {
+                    self.usage_scroll = self.usage_scroll.saturating_sub(8);
+                } else if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(10);
                     self.event_follow = self.event_scroll == 0;
                 } else if self.task_pane_focused {
@@ -519,7 +535,9 @@ impl AppModel {
                 }
             }
             Action::PageDown => {
-                if self.event_viewer {
+                if self.usage_viewer {
+                    self.usage_scroll = self.usage_scroll.saturating_add(8);
+                } else if self.event_viewer {
                     self.event_scroll = self
                         .event_scroll
                         .saturating_add(10)
@@ -547,6 +565,7 @@ impl AppModel {
                     && !self.task_pane_focused
                     && !self.help
                     && !self.event_viewer
+                    && !self.usage_viewer
                     && !self.composer_active
                     && self.pending_approval().is_none()
                     && self.credential_input.is_none()
@@ -606,7 +625,12 @@ impl AppModel {
                 self.role_scroll = 0;
                 self.event_scroll = 0;
             }
-            Action::ToggleHelp => self.help = !self.help,
+            Action::ToggleHelp => {
+                self.help = !self.help;
+                if self.help {
+                    self.usage_viewer = false;
+                }
+            }
             Action::FocusComposer => {
                 self.composer_active = true;
             }
@@ -622,11 +646,24 @@ impl AppModel {
             Action::ToggleEvents => {
                 self.event_viewer = !self.event_viewer;
                 if self.event_viewer {
+                    self.usage_viewer = false;
                     self.follow_newest_event();
                 }
             }
+            Action::ToggleUsage => {
+                if self.usage_viewer {
+                    self.usage_viewer = false;
+                } else if self.pending_approval().is_none() {
+                    self.usage_viewer = true;
+                    self.help = false;
+                    self.event_viewer = false;
+                    self.usage_scroll = 0;
+                }
+            }
             Action::Escape => {
-                if self.event_viewer {
+                if self.usage_viewer {
+                    self.usage_viewer = false;
+                } else if self.event_viewer {
                     self.event_viewer = false;
                 } else if self.help {
                     self.help = false;
@@ -1125,6 +1162,16 @@ impl AppModel {
 
     fn action_for_mouse(&self, mouse: MouseEvent, area: Rect) -> Action {
         if self.pending_approval().is_none() {
+            if self.usage_viewer {
+                let popup = usage_popup_area(area);
+                return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !popup.contains((mouse.column, mouse.row).into())
+                {
+                    Action::ToggleUsage
+                } else {
+                    Action::None
+                };
+            }
             if self.help || self.event_viewer {
                 let popup = if self.help {
                     help_popup_area(area)
@@ -1793,6 +1840,7 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Tab => Action::NextTab,
         KeyCode::BackTab => Action::PreviousTab,
         KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Char('u') => Action::ToggleUsage,
         KeyCode::Enter => Action::FocusComposer,
         KeyCode::Char('r') => Action::RetryTask,
         KeyCode::Char('A') => Action::AddCredential,
@@ -2524,6 +2572,27 @@ async fn terminal_loop<R: Repository + 'static>(
                     }
                     continue;
                 }
+                if model.usage_viewer {
+                    match &event {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                            KeyCode::Esc | KeyCode::Char('u') => {
+                                model.reduce(Action::ToggleUsage);
+                            }
+                            KeyCode::Char('q') => model.quit = true,
+                            KeyCode::Up | KeyCode::Char('k') => model.reduce(Action::Up),
+                            KeyCode::Down | KeyCode::Char('j') => model.reduce(Action::Down),
+                            KeyCode::PageUp => model.reduce(Action::PageUp),
+                            KeyCode::PageDown => model.reduce(Action::PageDown),
+                            _ => {}
+                        },
+                        Event::Mouse(mouse) => {
+                            let action = model.action_for_mouse(*mouse, terminal.size()?.into());
+                            model.reduce(action);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if let Some(wizard) = model.workspace_editor.as_mut() {
                     wizard.handle_event(&event, terminal.size()?.into());
                     if wizard.cancelled() {
@@ -2926,7 +2995,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
     }
 
     let workspace = sanitize(&app.workspace_root.display().to_string());
-    let right_title = format!(" [?] help · [w] {workspace} ");
+    let right_title = format!(" [?] help · [u] usage · [w] {workspace} ");
     app.help_hitbox = Rect::new(
         rows[2]
             .right()
@@ -4441,6 +4510,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Ctrl+W", "Close tab"),
             help_section("TASKS & EVENTS"),
             help_binding("e / v", "Events / details"),
+            help_binding("u", "Usage & cost"),
             help_binding("PgUp / Dn", "Scroll inspector"),
             help_binding("r / x", "Retry / cancel"),
             help_section("TEAM & PROMPT"),
@@ -4466,6 +4536,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Ctrl+W", "Close agent tab"),
             help_section("TASKS & EVENTS"),
             help_binding("e", "Events"),
+            help_binding("u", "Usage & cost"),
             help_binding("v", "Output details"),
             help_binding("PgUp / Dn", "Scroll inspector"),
             help_binding("r", "Retry task"),
@@ -4694,7 +4765,565 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
     );
     app.team_flow.render(frame, inner);
 }
+
+#[derive(Clone)]
+struct AgentUsageRow {
+    name: String,
+    provider: String,
+    model: Option<String>,
+    usage: TokenUsage,
+    estimated_cost: Option<f64>,
+    task_count: usize,
+    completed_count: usize,
+    color: Color,
+}
+
+impl AgentUsageRow {
+    fn token_count(&self) -> u64 {
+        self.usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens)
+    }
+}
+
+fn agent_usage_rows(app: &AppModel) -> Vec<AgentUsageRow> {
+    let mut profiles = app.agents.iter().collect::<Vec<_>>();
+    profiles.extend(app.known_agents.values().filter(|agent| {
+        app.agent_usage.contains_key(&agent.id)
+            && !app.agents.iter().any(|current| current.id == agent.id)
+    }));
+
+    let mut rows = profiles
+        .into_iter()
+        .map(|agent| {
+            let provider = app
+                .agent_provider_kinds
+                .get(&agent.id)
+                .map_or(agent.provider.as_str(), String::as_str);
+            let usage = app.agent_usage.get(&agent.id).copied().unwrap_or_default();
+            let has_usage = usage.input_tokens > 0 || usage.output_tokens > 0;
+            let task_count = app
+                .tasks
+                .iter()
+                .filter(|task| task.owner == agent.id)
+                .count();
+            let completed_count = app
+                .tasks
+                .iter()
+                .filter(|task| task.owner == agent.id && task.status == TaskStatus::Completed)
+                .count();
+
+            AgentUsageRow {
+                name: sanitize(&agent.name),
+                provider: match provider {
+                    "codex_cli" => "Codex CLI",
+                    "claude_cli" => "Claude CLI",
+                    "ollama" => "Ollama",
+                    "openai" => "OpenAI API",
+                    other => other,
+                }
+                .to_owned(),
+                model: (!agent.model.trim().is_empty() && agent.model != "default")
+                    .then(|| sanitize(&agent.model)),
+                usage,
+                estimated_cost: has_usage
+                    .then(|| estimate_cost(provider, &agent.model, usage))
+                    .flatten(),
+                task_count,
+                completed_count,
+                color: app.agent_color(agent),
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .token_count()
+            .cmp(&left.token_count())
+            .then_with(|| right.task_count.cmp(&left.task_count))
+            .then_with(|| {
+                right
+                    .estimated_cost
+                    .unwrap_or_default()
+                    .total_cmp(&left.estimated_cost.unwrap_or_default())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows
+}
+
+fn usage_popup_area(area: Rect) -> Rect {
+    centered_popup(
+        area,
+        area.width.saturating_sub(4).min(104),
+        area.height.saturating_sub(2).min(30),
+    )
+}
+
+fn usage_overview(rows: &[AgentUsageRow], tasks: &[Task], width: u16) -> Vec<Line<'static>> {
+    let input_tokens = rows
+        .iter()
+        .map(|row| row.usage.input_tokens)
+        .fold(0, u64::saturating_add);
+    let output_tokens = rows
+        .iter()
+        .map(|row| row.usage.output_tokens)
+        .fold(0, u64::saturating_add);
+    let used_agents = rows.iter().filter(|row| row.token_count() > 0).count();
+    let priced_agents = rows
+        .iter()
+        .filter(|row| row.token_count() > 0 && row.estimated_cost.is_some())
+        .count();
+    let total_cost = rows
+        .iter()
+        .filter_map(|row| row.estimated_cost)
+        .sum::<f64>();
+    let total_cost = (priced_agents > 0).then_some(total_cost);
+    let pricing_coverage = format!("{priced_agents}/{used_agents}");
+    let completed_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .count();
+    let cost_text = total_cost.map_or_else(|| "unavailable".to_owned(), format_usd);
+
+    if width < 68 {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                "Estimated cost: ",
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(cost_text, Style::default().fg(theme::TEXT)),
+            Span::styled(" | ", Style::default().fg(theme::MUTED)),
+            Span::styled("Priced agents: ", Style::default().fg(theme::MUTED)),
+            Span::styled(pricing_coverage, Style::default().fg(theme::TEXT)),
+        ])];
+        lines.push(Line::from(vec![
+            Span::styled("Tokens in: ", Style::default().fg(theme::AQUA)),
+            Span::styled(
+                compact_count(input_tokens),
+                Style::default().fg(theme::AQUA),
+            ),
+            Span::styled(" | ", Style::default().fg(theme::MUTED)),
+            Span::styled("Tokens out: ", Style::default().fg(theme::PURPLE)),
+            Span::styled(
+                compact_count(output_tokens),
+                Style::default().fg(theme::PURPLE),
+            ),
+            Span::styled(" | ", Style::default().fg(theme::MUTED)),
+            Span::styled("Tasks: ", Style::default().fg(theme::ORANGE)),
+            Span::styled(
+                format!("{completed_tasks}/{}", tasks.len()),
+                Style::default().fg(theme::TEXT),
+            ),
+        ]));
+        return lines;
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Estimated cost: ",
+            Style::default()
+                .fg(theme::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            cost_text,
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" | ", Style::default().fg(theme::MUTED)),
+        Span::styled("Priced agents: ", Style::default().fg(theme::MUTED)),
+        Span::styled(pricing_coverage, Style::default().fg(theme::TEXT)),
+    ])];
+    lines.push(Line::from(vec![
+        Span::styled("Tokens in: ", Style::default().fg(theme::AQUA)),
+        Span::styled(
+            compact_count(input_tokens),
+            Style::default().fg(theme::AQUA),
+        ),
+        Span::styled(" | ", Style::default().fg(theme::MUTED)),
+        Span::styled("Tokens out: ", Style::default().fg(theme::PURPLE)),
+        Span::styled(
+            compact_count(output_tokens),
+            Style::default().fg(theme::PURPLE),
+        ),
+        Span::styled(" | ", Style::default().fg(theme::MUTED)),
+        Span::styled("Tasks: ", Style::default().fg(theme::ORANGE)),
+        Span::styled(
+            format!("{completed_tasks}/{}", tasks.len()),
+            Style::default().fg(theme::TEXT),
+        ),
+    ]));
+    lines
+}
+
+fn usage_column(value: &str, width: usize, style: Style) -> Span<'static> {
+    let value = truncate_text(value, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    Span::styled(format!("{value}{}", " ".repeat(padding)), style)
+}
+
+fn usage_agent_lines(rows: &[AgentUsageRow], total_cost: f64, width: u16) -> Vec<Line<'static>> {
+    let inner_width = usize::from(width);
+    if inner_width < 52 {
+        let mut lines = Vec::with_capacity(rows.len().saturating_mul(3));
+        for row in rows {
+            let cost = row.estimated_cost.map_or_else(
+                || {
+                    if row.token_count() > 0 {
+                        "unpriced".to_owned()
+                    } else {
+                        "no usage".to_owned()
+                    }
+                },
+                format_usd,
+            );
+            let share = if total_cost > 0.0 {
+                row.estimated_cost
+                    .map(|cost| format!(" · {:.0}%", cost / total_cost * 100.0))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(row.color)),
+                Span::styled(
+                    row.name.clone(),
+                    Style::default().fg(row.color).add_modifier(Modifier::BOLD),
+                ),
+                row.model.as_ref().map_or_else(
+                    || Span::raw(""),
+                    |model| Span::styled(format!(" · {model}"), Style::default().fg(theme::MUTED)),
+                ),
+                Span::styled(
+                    format!(" · {cost}{share}"),
+                    Style::default().fg(if row.estimated_cost.is_none() && row.token_count() > 0 {
+                        theme::MUTED
+                    } else {
+                        theme::TEXT
+                    }),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme::MUTED)),
+                Span::styled(row.provider.clone(), Style::default().fg(theme::MUTED)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  In {}", compact_count(row.usage.input_tokens)),
+                    Style::default().fg(theme::AQUA),
+                ),
+                Span::styled(
+                    format!(" / Out {}", compact_count(row.usage.output_tokens)),
+                    Style::default().fg(theme::PURPLE),
+                ),
+                Span::styled(
+                    format!(" · Tasks {}/{}", row.completed_count, row.task_count),
+                    Style::default().fg(theme::MUTED),
+                ),
+            ]));
+        }
+        if rows.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No agents configured",
+                Style::default().fg(theme::MUTED),
+            )));
+        }
+        return lines;
+    }
+
+    let cost_width = 10;
+    let input_width = 8;
+    let output_width = 8;
+    let tasks_width = 10;
+    let separators = 4;
+    let agent_width = inner_width
+        .saturating_sub(cost_width + input_width + output_width + tasks_width + separators)
+        .max(12);
+    let mut lines = vec![Line::from(vec![
+        usage_column("Agent", agent_width, Style::default().fg(theme::MUTED)),
+        Span::raw(" "),
+        usage_column("Est. cost", cost_width, Style::default().fg(theme::ORANGE)),
+        Span::raw(" "),
+        usage_column("In", input_width, Style::default().fg(theme::AQUA)),
+        Span::raw(" "),
+        usage_column("Out", output_width, Style::default().fg(theme::PURPLE)),
+        Span::raw(" "),
+        usage_column("Tasks", tasks_width, Style::default().fg(theme::MUTED)),
+    ])];
+
+    for row in rows {
+        let cost = row.estimated_cost.map_or_else(
+            || {
+                if row.token_count() > 0 {
+                    "unpriced".to_owned()
+                } else {
+                    "—".to_owned()
+                }
+            },
+            format_usd,
+        );
+        let cost_share = if total_cost > 0.0 {
+            row.estimated_cost
+                .map(|cost| format!("{:.0}% share", cost / total_cost * 100.0))
+                .unwrap_or_else(|| "not priced".to_owned())
+        } else {
+            String::new()
+        };
+        let task_count = format!("{}/{} done", row.completed_count, row.task_count);
+        let cost_style = if row.estimated_cost.is_none() && row.token_count() > 0 {
+            Style::default().fg(theme::MUTED)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        let agent_label = row.model.as_ref().map_or_else(
+            || row.name.clone(),
+            |model| format!("{} · {model}", row.name),
+        );
+        lines.push(Line::from(vec![
+            usage_column(
+                &agent_label,
+                agent_width,
+                Style::default().fg(row.color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            usage_column(&cost, cost_width, cost_style),
+            Span::raw(" "),
+            usage_column(
+                &compact_count(row.usage.input_tokens),
+                input_width,
+                Style::default().fg(theme::AQUA),
+            ),
+            Span::raw(" "),
+            usage_column(
+                &compact_count(row.usage.output_tokens),
+                output_width,
+                Style::default().fg(theme::PURPLE),
+            ),
+            Span::raw(" "),
+            usage_column(&task_count, tasks_width, Style::default().fg(theme::TEXT)),
+        ]));
+        lines.push(Line::from(vec![
+            usage_column(
+                &row.provider,
+                agent_width,
+                Style::default().fg(theme::MUTED),
+            ),
+            Span::raw(" "),
+            usage_column(&cost_share, cost_width, Style::default().fg(theme::MUTED)),
+        ]));
+    }
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No agents configured",
+            Style::default().fg(theme::MUTED),
+        )));
+    }
+    lines
+}
+
+#[derive(Clone, Copy)]
+enum UsageChartMetric {
+    Cost,
+    Tokens,
+    Tasks,
+}
+
+impl UsageChartMetric {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Cost => "COST SHARE",
+            Self::Tokens => "TOKEN SHARE",
+            Self::Tasks => "TASK SHARE",
+        }
+    }
+}
+
+fn usage_chart_slices(rows: &[AgentUsageRow]) -> (Option<UsageChartMetric>, Vec<PieSlice<'_>>) {
+    let cost_slices = rows
+        .iter()
+        .filter_map(|row| {
+            row.estimated_cost
+                .filter(|cost| *cost > 0.0)
+                .map(|cost| PieSlice::new(row.name.as_str(), cost, row.color))
+        })
+        .collect::<Vec<_>>();
+    if !cost_slices.is_empty() {
+        return (Some(UsageChartMetric::Cost), cost_slices);
+    }
+
+    let token_slices = rows
+        .iter()
+        .filter(|row| row.token_count() > 0)
+        .map(|row| PieSlice::new(row.name.as_str(), row.token_count() as f64, row.color))
+        .collect::<Vec<_>>();
+    if !token_slices.is_empty() {
+        return (Some(UsageChartMetric::Tokens), token_slices);
+    }
+
+    let task_slices = rows
+        .iter()
+        .filter(|row| row.task_count > 0)
+        .map(|row| PieSlice::new(row.name.as_str(), row.task_count as f64, row.color))
+        .collect::<Vec<_>>();
+    if !task_slices.is_empty() {
+        return (Some(UsageChartMetric::Tasks), task_slices);
+    }
+
+    (None, Vec::new())
+}
+
+fn render_usage_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
+    let popup = usage_popup_area(frame.area());
+    frame.render_widget(Clear, popup);
+    let rows = agent_usage_rows(app);
+    let total_cost = rows
+        .iter()
+        .filter_map(|row| row.estimated_cost)
+        .sum::<f64>();
+    let total_cost = if rows.iter().any(|row| row.estimated_cost.is_some()) {
+        total_cost
+    } else {
+        0.0
+    };
+    let block = Block::default()
+        .title_bottom(
+            Line::from(" ↑/↓ scroll · catalog prices are estimates · [u] / Esc close ")
+                .style(Style::default().fg(theme::AQUA))
+                .alignment(Alignment::Center),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::surface())
+        .border_style(Style::default().fg(theme::BORDER));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return;
+    }
+    let overview = Paragraph::new(usage_overview(&rows, &app.tasks, inner.width))
+        .wrap(Wrap { trim: true })
+        .style(theme::surface());
+    let overview_height = u16::try_from(overview.line_count(inner.width))
+        .unwrap_or(inner.height)
+        .min(inner.height);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(overview_height), Constraint::Min(0)])
+        .split(inner);
+    frame.render_widget(overview, sections[0]);
+    let body = sections[1];
+    let (metric, slices) = usage_chart_slices(&rows);
+    let (chart_area, list_area) = if body.width >= 78 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(body);
+        (columns[0], columns[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(body.height.min(if body.height >= 10 { 7 } else { 5 })),
+                Constraint::Min(0),
+            ])
+            .split(body);
+        (rows[0], rows[1])
+    };
+
+    let chart_title = metric.map_or("ACTIVITY", UsageChartMetric::title);
+    let chart_block = Block::default()
+        .title(
+            Line::from(format!(" {chart_title} ")).style(
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::surface())
+        .border_style(Style::default().fg(theme::BORDER));
+    let chart_inner = chart_block.inner(chart_area);
+    frame.render_widget(chart_block, chart_area);
+    if slices.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Run tasks to build a breakdown")
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(theme::surface()),
+            chart_inner,
+        );
+    } else if !chart_inner.is_empty() {
+        frame.render_widget(
+            PieChart::new(slices)
+                .show_legend(false)
+                .show_percentages(false)
+                .high_resolution(chart_inner.width >= 8 && chart_inner.height >= 4)
+                .pie_char('●')
+                .style(theme::surface()),
+            chart_inner,
+        );
+    }
+
+    let list_block = Block::default()
+        .title(
+            Line::from(" AGENTS ").style(
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::surface())
+        .border_style(Style::default().fg(theme::BORDER));
+    let list_inner = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+    if list_inner.is_empty() {
+        return;
+    }
+    let list_width = list_inner.width.saturating_sub(1).max(1);
+    let lines = usage_agent_lines(&rows, total_cost, list_width);
+    let list = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .style(theme::surface());
+    let list_viewport = Rect::new(list_inner.x, list_inner.y, list_width, list_inner.height);
+    let max_scroll = list
+        .line_count(list_viewport.width)
+        .saturating_sub(usize::from(list_inner.height))
+        .min(usize::from(u16::MAX));
+    let position = usize::from(app.usage_scroll).min(max_scroll);
+    frame.render_widget(list.scroll((position as u16, 0)), list_viewport);
+    if max_scroll > 0 && list_inner.width > 1 {
+        let mut scrollbar = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(position)
+            .viewport_content_length(usize::from(list_inner.height));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(Style::default().fg(theme::BORDER))
+                .thumb_style(Style::default().fg(theme::AQUA)),
+            Rect::new(
+                list_inner.right().saturating_sub(1),
+                list_inner.y,
+                1,
+                list_inner.height,
+            ),
+            &mut scrollbar,
+        );
+    }
+}
+
 fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
+    if app.usage_viewer {
+        render_usage_popup(frame, app);
+        return;
+    }
     if app.event_viewer {
         let area = frame.area();
         let popup = centered_popup(
@@ -6075,6 +6704,7 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Enter), Action::FocusComposer);
         assert_eq!(action_for_key(KeyCode::Char('t')), Action::ToggleTaskFocus);
         assert_eq!(action_for_key(KeyCode::Char('h')), Action::ToggleTaskPane);
+        assert_eq!(action_for_key(KeyCode::Char('u')), Action::ToggleUsage);
         assert_eq!(action_for_key(KeyCode::Char('b')), Action::None);
         assert_eq!(
             action_for_key(KeyCode::Char('o')),
@@ -6123,6 +6753,160 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!help.contains("Ctrl+F4"));
+    }
+
+    #[test]
+    fn usage_chart_uses_cost_then_token_then_task_data() {
+        let mut row = AgentUsageRow {
+            name: "Worker".into(),
+            provider: "Codex CLI".into(),
+            model: None,
+            usage: TokenUsage {
+                input_tokens: 2_000,
+                output_tokens: 400,
+            },
+            estimated_cost: None,
+            task_count: 2,
+            completed_count: 1,
+            color: theme::AQUA,
+        };
+
+        let (metric, slices) = usage_chart_slices(std::slice::from_ref(&row));
+        assert!(matches!(metric, Some(UsageChartMetric::Tokens)));
+        assert_eq!(slices.len(), 1);
+
+        row.estimated_cost = Some(0.01);
+        let (metric, slices) = usage_chart_slices(std::slice::from_ref(&row));
+        assert!(matches!(metric, Some(UsageChartMetric::Cost)));
+        assert_eq!(slices.len(), 1);
+
+        row.estimated_cost = None;
+        row.usage = TokenUsage::default();
+        let (metric, slices) = usage_chart_slices(std::slice::from_ref(&row));
+        assert!(matches!(metric, Some(UsageChartMetric::Tasks)));
+        assert_eq!(slices.len(), 1);
+
+        row.task_count = 0;
+        let (metric, slices) = usage_chart_slices(std::slice::from_ref(&row));
+        assert!(metric.is_none());
+        assert!(slices.is_empty());
+    }
+
+    #[test]
+    fn usage_agents_sort_by_token_volume_before_priced_cost() {
+        let mut app = AppModel::new(SessionId::new());
+        let mut priced = agent("Priced", "priced_agent", vec![]);
+        priced.provider = "openai".into();
+        priced.model = "gpt-4o-mini".into();
+        let mut high_usage = agent("High usage", "high_usage_agent", vec![]);
+        high_usage.provider = "codex_cli".into();
+        app.agents = vec![priced.clone(), high_usage.clone()];
+        app.agent_provider_kinds.insert(priced.id, "openai".into());
+        app.agent_provider_kinds
+            .insert(high_usage.id, "codex_cli".into());
+        app.agent_usage.insert(
+            priced.id,
+            TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 1_000,
+            },
+        );
+        app.agent_usage.insert(
+            high_usage.id,
+            TokenUsage {
+                input_tokens: 28_000,
+                output_tokens: 118,
+            },
+        );
+
+        let rows = agent_usage_rows(&app);
+        assert_eq!(rows[0].name, "High usage");
+        assert_eq!(rows[1].name, "Priced");
+    }
+
+    #[test]
+    fn usage_popup_shows_agent_cost_tokens_and_task_activity() {
+        let mut app = AppModel::new(SessionId::new());
+        let mut backend = agent("Backend", "backend_agent", vec![]);
+        backend.provider = "openai".into();
+        backend.model = "gpt-4o-mini".into();
+        let mut cli = agent("Local CLI", "custom_agent", vec![]);
+        cli.provider = "codex_cli".into();
+        cli.model = "default".into();
+        app.agents = vec![backend.clone(), cli.clone()];
+        app.agent_provider_kinds.insert(backend.id, "openai".into());
+        app.agent_provider_kinds.insert(cli.id, "codex_cli".into());
+        app.agent_usage.insert(
+            backend.id,
+            TokenUsage {
+                input_tokens: 1_240,
+                output_tokens: 318,
+            },
+        );
+        app.agent_usage.insert(
+            cli.id,
+            TokenUsage {
+                input_tokens: 400,
+                output_tokens: 100,
+            },
+        );
+        let mut task = Task::root(backend.id, "Implement endpoint", vec![], Default::default());
+        task.status = TaskStatus::Completed;
+        app.tasks.push(task);
+        app.reduce(Action::ToggleUsage);
+        assert!(app.usage_viewer);
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Estimated cost"), "{rendered}");
+        assert!(rendered.contains("$0.0004"), "{rendered}");
+        assert!(rendered.contains("Priced agents"), "{rendered}");
+        assert!(rendered.contains("1/2"), "{rendered}");
+        assert!(
+            rendered.contains("Estimated cost: $0.0004 | Priced agents: 1/2"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("gpt-4o-mini"), "{rendered}");
+        assert!(rendered.contains("Backend · gpt-4o-mini"), "{rendered}");
+        assert!(!rendered.contains("OpenAI API · gpt-4o-mini"), "{rendered}");
+        assert!(
+            rendered.contains("Tokens in: 1.6k | Tokens out: 418 | Tasks: 1/1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Most active"), "{rendered}");
+        assert!(!rendered.contains("Cost & usage"), "{rendered}");
+        assert!(rendered.contains("1.2k"), "{rendered}");
+        assert!(rendered.contains("318"), "{rendered}");
+        assert!(rendered.contains("1/1 done"), "{rendered}");
+        assert!(rendered.contains("[u] usage"), "{rendered}");
+        let overview = usage_overview(&agent_usage_rows(&app), &app.tasks, 100);
+        assert!(
+            overview[1].spans.iter().any(|span| {
+                span.content.contains("1.6k") && span.style.fg == Some(theme::AQUA)
+            })
+        );
+        assert!(
+            overview[1].spans.iter().any(|span| {
+                span.content.contains("418") && span.style.fg == Some(theme::PURPLE)
+            })
+        );
+        assert!(
+            rendered
+                .chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+            "the cost pie chart should be rendered"
+        );
+
+        let mut narrow = Terminal::new(TestBackend::new(44, 16)).unwrap();
+        narrow.draw(|frame| render(frame, &mut app)).unwrap();
+
+        app.reduce(Action::Escape);
+        assert!(!app.usage_viewer);
+        assert!(!app.quit);
     }
 
     #[test]
@@ -6885,7 +7669,7 @@ mod tests {
         assert!(rendered.contains("Add agent"));
         assert!(popup.width < 104, "popup should fit its content: {popup:?}");
         assert!(popup.width > 60, "logo and help list should fit: {popup:?}");
-        assert_eq!(popup.height, 28);
+        assert_eq!(popup.height, 29);
         let title_row = (0..112)
             .map(|x| buffer[(x, popup.y)].symbol())
             .collect::<String>();

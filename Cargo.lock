@@ -3372,6 +3372,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tui-piechart"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cb782dbfc50939173957a794a70ad58e445d6494c96d9231fc3e3c0812f290c"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3523,6 +3532,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tui-piechart",
  "unicode-width",
  "voff-core",
  "voff-engine",

@@ -213,6 +213,74 @@ async fn lead_reviews_nested_patch_without_human_prompt() {
 }
 
 #[tokio::test]
+async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
+    let blocker = call(
+        "task.blocked",
+        serde_json::json!({
+            "reason":"The provider's native sandbox has no workspace access or editing tools."
+        }),
+    );
+    let (engine, repo, provider, _dir, session, lead) =
+        setup(vec![blocker, verdict(true)], false).await;
+    let mut task = engine
+        .create_task(
+            lead,
+            "Implement a small example",
+            vec!["Add the example".into()],
+        )
+        .await
+        .unwrap();
+    task.work = Some(WorkProgress {
+        contract: String::new(),
+        integration: false,
+        turns: 0,
+    });
+    repo.save_task(task.clone()).await.unwrap();
+    engine.mark_ready(task.id).await.unwrap();
+
+    engine.run_task(task.id).await.unwrap();
+    assert_eq!(
+        repo.task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert!(repo.events(session).await.unwrap().iter().any(|event| {
+        matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested {
+            reason,
+            retry_allowed: true,
+        } if reason.starts_with("worker-reported blocker"))
+    }));
+
+    engine.coordinate_pending().await.unwrap();
+    let retry = repo
+        .tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.retry_of == Some(task.id))
+        .expect("approved recovery should create a new attempt");
+    assert_eq!(retry.status, TaskStatus::Queued);
+    assert_eq!(retry.owner, task.owner);
+    assert_eq!(retry.parent, task.parent);
+    assert_eq!(retry.acceptance_criteria, task.acceptance_criteria);
+
+    let requests = provider.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    let review_context = requests[1]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(review_context.contains("task.blocked report is the worker's claim"));
+    assert!(review_context.contains("Voff-mediated actions"));
+    assert!(review_context.contains("Runtime permits an automatic corrective attempt: true"));
+    assert!(review_context.contains("Runtime capability evidence (authoritative)"));
+    assert!(review_context.contains("task owner Lead (enabled: true)"));
+    assert!(review_context.contains("configured Voff tools [file.patch]"));
+    assert!(review_context.contains("Recorded proposals/approval decisions: none"));
+}
+
+#[tokio::test]
 async fn failed_or_malformed_review_stays_pending_without_execution() {
     for review in [
         error(ProviderErrorKind::Authentication),

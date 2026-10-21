@@ -1414,10 +1414,13 @@ impl<R: Repository + 'static> Engine<R> {
                                 Some(id),
                                 CanonicalEventKind::WorkRecoveryRequested {
                                     reason: format!(
-                                        "worker reported an in-scope blocker: {}",
+                                        "worker-reported blocker (no runtime action was denied): {}",
                                         reason.chars().take(2_000).collect::<String>()
                                     ),
-                                    retry_allowed: false,
+                                    // A task.blocked response is the worker's assertion, not an
+                                    // enforced runtime denial. Let the reporting lead decide
+                                    // whether a same-scope retry can use existing Voff actions.
+                                    retry_allowed: true,
                                 },
                             )
                             .await?;
@@ -3730,7 +3733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_worker_reports_a_blocker_without_fake_completion_or_approval() {
+    async fn verified_worker_reports_a_blocker_for_review_without_fake_completion() {
         let repo = Arc::new(InMemoryRepository::default());
         let (tx, _rx) = mpsc::channel(64);
         let session = SessionId::new();
@@ -3767,7 +3770,7 @@ mod tests {
                 if message.contains("No in-scope discoverable tests exist"))
         }));
         assert!(repo.events(session).await.unwrap().iter().any(|event| {
-            matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason, retry_allowed: false }
+            matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason, retry_allowed: true }
                 if reason.contains("No in-scope discoverable tests exist"))
         }));
     }

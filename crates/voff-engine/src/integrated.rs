@@ -12,6 +12,7 @@ pub(super) const WORK_INSTRUCTIONS: &str = concat!(
     "Run verification appropriate to the user's request: use a test command for an explicit test request, a build/check command for a build or compile request, and do not run tests for read-only questions. After an approved workspace patch, run the appropriate verification before completion. ",
     "Do not invent test harnesses or test files just to satisfy a generic verification requirement. ",
     "Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. ",
+    "The provider may run with its native filesystem, shell, network, and subagent tools disabled in an isolated sandbox. That restriction applies only to the provider's native tools. Voff actions listed in your response schema are a separate, mediated interface: use available file.read/search.text actions to inspect the configured workspace and propose available file.patch/process.test/task.delegate actions through Voff. Voff applies them only within existing scope and approval checks; a proposal does not execute directly. The provider's temporary working directory is not the configured workspace. Do not call task.blocked only because native provider tools are disabled or the thread is read-only. ",
     "For a verification-only request, use a single task.delegate assignment to an enabled direct report with process.test when you do not have that tool yourself. ",
     "For implementation work, include an enabled qualified report in the contract-first plan to run the appropriate verification. ",
     "The process.test tool is approval-gated; lack of arbitrary shell access does not mean verification is forbidden. ",
@@ -181,6 +182,11 @@ mod tests {
     fn plan_requires_request_appropriate_verification_and_an_explicit_blocker_path() {
         assert!(WORK_INSTRUCTIONS.contains("verification-only request"));
         assert!(WORK_INSTRUCTIONS.contains("task.blocked"));
+        assert!(WORK_INSTRUCTIONS.contains("separate, mediated interface"));
+        assert!(
+            WORK_INSTRUCTIONS
+                .contains("temporary working directory is not the configured workspace")
+        );
         let mut tools = Vec::new();
         configure_tools(&mut tools, &[], 0);
         assert!(tools.iter().any(|tool| tool.name == "task.blocked"));
