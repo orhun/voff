@@ -2305,6 +2305,10 @@ fn render_startup_splash(frame: &mut ratatui::Frame<'_>, view: StartupView<'_>) 
 fn render_startup_background(frame: &mut ratatui::Frame<'_>) {
     let area = frame.area();
     frame.render_widget(Block::default().style(theme::canvas()), area);
+    render_starfield(frame, area, theme::BACKGROUND);
+}
+
+fn render_starfield(frame: &mut ratatui::Frame<'_>, area: Rect, background: Color) {
     if area.width < 24 || area.height < 10 {
         return;
     }
@@ -2325,7 +2329,7 @@ fn render_startup_background(frame: &mut ratatui::Frame<'_>) {
                 _ => continue,
             };
             frame.render_widget(
-                Paragraph::new(symbol).style(Style::default().fg(color).bg(theme::BACKGROUND)),
+                Paragraph::new(symbol).style(Style::default().fg(color).bg(background)),
                 Rect::new(x, y, 1, 1),
             );
         }
