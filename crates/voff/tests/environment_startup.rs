@@ -1,46 +1,56 @@
-use std::process::{Command, Output};
-
-fn help(directory: &std::path::Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_voff"))
-        .arg("--help")
-        .current_dir(directory)
-        .env_clear()
-        .output()
-        .unwrap()
-}
+use std::process::Command;
 
 #[test]
-fn optional_file_and_no_parent_discovery() {
-    let parent = tempfile::tempdir().unwrap();
-    std::fs::write(parent.path().join(".env"), "malformed fake-parent-secret").unwrap();
-    let child = parent.path().join("child");
-    std::fs::create_dir(&child).unwrap();
-    assert!(help(&child).status.success());
-}
-
-#[test]
-fn malformed_file_fails_without_leaking_source() {
-    let directory = tempfile::tempdir().unwrap();
-    let secret = "fake-malformed-secret";
+fn first_launch_requests_interactive_setup_and_writes_a_safe_log() {
+    let workspace = tempfile::tempdir().unwrap();
+    let secret = "fake-secret-must-not-be-logged";
     std::fs::write(
-        directory.path().join(".env"),
+        workspace.path().join(".env"),
         format!("OPENAI_API_KEY='{secret}"),
     )
     .unwrap();
-    let output = help(directory.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_voff"))
+        .current_dir(workspace.path())
+        .env("OPENAI_API_KEY", secret)
+        .env("RUST_LOG", "trace")
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("could not load .env"));
+    assert!(stderr.contains("team setup needs an interactive terminal"));
     assert!(!stderr.contains(secret));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    let log = std::fs::read_to_string(workspace.path().join(".voff/logs/voff.log")).unwrap();
+    assert!(log.contains("application started"));
+    assert!(!log.contains(secret));
+    assert!(!log.contains('\u{1b}'));
 }
 
 #[test]
-fn unreadable_file_is_a_safe_startup_error() {
-    let directory = tempfile::tempdir().unwrap();
-    // A directory cannot be read as dotenv input, even under privileged CI.
-    std::fs::create_dir(directory.path().join(".env")).unwrap();
-    let output = help(directory.path());
+fn positional_workspace_owns_its_database_and_log() {
+    let launch_directory = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_voff"))
+        .arg(workspace.path())
+        .current_dir(launch_directory.path())
+        .output()
+        .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("could not load .env"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("team setup needs"));
+    assert!(workspace.path().join(".voff/voff.db").exists());
+    assert!(workspace.path().join(".voff/logs/voff.log").exists());
+    assert!(!launch_directory.path().join(".voff").exists());
+}
+
+#[test]
+fn extra_arguments_are_rejected_without_opening_a_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_voff"))
+        .arg(workspace.path())
+        .arg("extra")
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage: voff"));
+    assert!(!workspace.path().join(".voff").exists());
 }

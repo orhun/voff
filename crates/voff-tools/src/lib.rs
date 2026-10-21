@@ -21,6 +21,13 @@ pub enum ToolError {
     TooLarge(u64),
     #[error("tool I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// Filesystem operation with the workspace-relative target retained.
+    #[error("could not access workspace file {path}")]
+    PathIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("search result limit must be between 1 and 1000")]
     InvalidLimit,
     #[error("patch base digest conflicts with the current file")]
@@ -49,6 +56,11 @@ pub struct SearchMatch {
     pub text: String,
 }
 impl ScopedWorkspace {
+    /// Canonical authorized root used to scope both files and commands.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
     pub fn new(root: &Path, max_file_bytes: u64) -> Result<Self, ToolError> {
         Ok(Self {
             root: root.canonicalize()?,
@@ -65,7 +77,7 @@ impl ScopedWorkspace {
         }
         if relative
             .components()
-            .any(|c| matches!(c,std::path::Component::Normal(v) if v==".git"||v==".env"))
+            .any(|c| matches!(c,std::path::Component::Normal(v) if sensitive_component(v)))
         {
             return Err(ToolError::SensitivePath);
         }
@@ -73,22 +85,58 @@ impl ScopedWorkspace {
     }
     fn resolve(&self, relative: &Path) -> Result<PathBuf, ToolError> {
         Self::validate_relative(relative)?;
-        let path = self.root.join(relative).canonicalize()?;
+        let path = self
+            .root
+            .join(relative)
+            .canonicalize()
+            .map_err(|source| ToolError::PathIo {
+                path: relative.into(),
+                source,
+            })?;
         if !path.starts_with(&self.root) {
             return Err(ToolError::OutsideWorkspace);
         }
+        Self::validate_relative(
+            path.strip_prefix(&self.root)
+                .map_err(|_| ToolError::OutsideWorkspace)?,
+        )?;
         Ok(path)
     }
     fn resolve_for_write(&self, relative: &Path) -> Result<PathBuf, ToolError> {
         Self::validate_relative(relative)?;
-        let path = self.root.join(relative);
-        if path.exists() {
-            return self.resolve(relative);
+        if relative.components().any(|component| matches!(component,
+            std::path::Component::Normal(value) if value == ".voff" || value == ".ssh" || value == ".aws" || value == ".codex" || value == ".claude")) {
+            return Err(ToolError::SensitivePath);
         }
-        let parent = path.parent().ok_or(ToolError::OutsideWorkspace)?;
-        let parent = parent.canonicalize()?;
-        if !parent.starts_with(&self.root) {
-            return Err(ToolError::OutsideWorkspace);
+        // Inspect every existing component. In particular, do not mistake a
+        // dangling symlink for an absent directory and follow it on creation.
+        let mut path = self.root.clone();
+        for component in relative.components() {
+            path.push(component);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(ToolError::OutsideWorkspace);
+                    }
+                    if !path
+                        .canonicalize()
+                        .map_err(|source| ToolError::PathIo {
+                            path: relative.into(),
+                            source,
+                        })?
+                        .starts_with(&self.root)
+                    {
+                        return Err(ToolError::OutsideWorkspace);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ToolError::PathIo {
+                        path: relative.into(),
+                        source,
+                    });
+                }
+            }
         }
         Ok(path)
     }
@@ -99,6 +147,19 @@ impl ScopedWorkspace {
             return Err(ToolError::TooLarge(self.max_file_bytes));
         }
         Ok(fs::read_to_string(path)?)
+    }
+    /// A missing file is useful inspection evidence, not a failed write.
+    pub fn read_page(&self, relative: &Path, offset: usize) -> Result<String, ToolError> {
+        match self.read_text(relative) {
+            Ok(text) => {
+                let total = text.chars().count();
+                let page: String = text.chars().skip(offset).take(1200).collect();
+                Ok(format!("Characters {offset}..{} of {total}.\n{page}", offset.saturating_add(page.chars().count())))
+            }
+            Err(ToolError::PathIo { source, .. } | ToolError::Io(source)) if source.kind() == std::io::ErrorKind::NotFound =>
+                Ok("File does not exist. No changes made; creating it requires an approved file.patch.".into()),
+            Err(error) => Err(error),
+        }
     }
     pub fn propose_replacement(
         &self,
@@ -139,10 +200,26 @@ impl ScopedWorkspace {
         if current_digest != proposal.base_digest {
             return Err(ToolError::PatchConflict);
         }
+        // Proposal/review is read-only. Create directories only after the
+        // exact patch was approved and its original base was checked.
+        let parent = path.parent().ok_or(ToolError::OutsideWorkspace)?;
+        fs::create_dir_all(parent).map_err(|source| ToolError::PathIo {
+            path: proposal.path.clone(),
+            source,
+        })?;
+        self.resolve_for_write(&proposal.path)?;
         let mut temporary = path.clone();
         temporary.set_extension(format!("voff-{}.tmp", proposal.artifact_id));
-        fs::write(&temporary, proposal.replacement.as_bytes())?;
-        fs::rename(temporary, path)?;
+        fs::write(&temporary, proposal.replacement.as_bytes()).map_err(|source| {
+            ToolError::PathIo {
+                path: proposal.path.clone(),
+                source,
+            }
+        })?;
+        fs::rename(temporary, path).map_err(|source| ToolError::PathIo {
+            path: proposal.path.clone(),
+            source,
+        })?;
         Ok(())
     }
     pub fn search_text(&self, query: &str, limit: usize) -> Result<Vec<SearchMatch>, ToolError> {
@@ -197,7 +274,22 @@ impl ScopedWorkspace {
             let important = matches!(
                 relative.file_name().and_then(|v| v.to_str()),
                 Some("Cargo.toml" | "README.md" | "AGENTS.md")
-            ) || matches!(extension, "rs" | "toml" | "md");
+            ) || matches!(
+                extension,
+                "rs" | "toml"
+                    | "md"
+                    | "js"
+                    | "mjs"
+                    | "cjs"
+                    | "jsx"
+                    | "ts"
+                    | "tsx"
+                    | "json"
+                    | "html"
+                    | "css"
+                    | "py"
+                    | "sql"
+            );
             if !important {
                 continue;
             }
@@ -206,13 +298,17 @@ impl ScopedWorkspace {
             };
             let header = format!("\n--- {} ---\n", relative.display());
             if output.len() + header.len() + content.len() > max_bytes {
-                break;
+                continue;
             }
             output.push_str(&header);
             output.push_str(&content);
         }
         if output.len() > max_bytes {
-            output.truncate(max_bytes);
+            let mut end = max_bytes;
+            while !output.is_char_boundary(end) {
+                end -= 1;
+            }
+            output.truncate(end);
         }
         Ok(output)
     }
@@ -244,19 +340,34 @@ fn diff_preview(before: &str, after: &str) -> String {
     }
     value
 }
+fn sensitive_component(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    matches!(
+        name.as_ref(),
+        ".git" | ".env" | ".voff" | ".ssh" | ".aws" | ".codex" | ".claude"
+    ) || name.starts_with(".env.")
+}
+
 fn collect(dir: &Path, out: &mut Vec<PathBuf>, remaining: usize) -> Result<(), ToolError> {
     if remaining == 0 {
         return Ok(());
     }
     for entry in fs::read_dir(dir)?.take(remaining) {
         let path = entry?.path();
-        if path
-            .file_name()
-            .is_some_and(|n| n == ".git" || n == "target" || n == ".env")
-        {
+        if path.file_name().is_some_and(|n| {
+            sensitive_component(n)
+                || n == "target"
+                || n == "node_modules"
+                || n == "dist"
+                || n == ".venv"
+        }) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if metadata.file_type().is_symlink() {
             continue;
         }
@@ -271,6 +382,103 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, remaining: usize) -> Result<(), T
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inspection_handles_missing_files_and_preserves_creation_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = ScopedWorkspace::new(dir.path(), 4096).unwrap();
+        let path = Path::new("frontend/src/main.tsx");
+        assert!(
+            workspace
+                .read_page(path, 0)
+                .unwrap()
+                .contains("does not exist")
+        );
+        assert!(!dir.path().join("frontend").exists());
+        let patch = workspace
+            .propose_replacement(TaskId::new(), path, "é".repeat(1500))
+            .unwrap();
+        assert!(workspace.apply_patch(&patch, false).is_err());
+        workspace.apply_patch(&patch, true).unwrap();
+        assert!(
+            workspace
+                .read_page(path, 1200)
+                .unwrap()
+                .contains("1200..1500 of 1500")
+        );
+        assert!(workspace.read_page(Path::new(".env.local"), 0).is_err());
+        assert!(workspace.read_page(Path::new("../missing"), 0).is_err());
+    }
+
+    #[test]
+    fn context_includes_frontend_files_but_excludes_secrets_and_large_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            ("frontend/src/api.ts", "export const api = 1;"),
+            ("frontend/package.json", "{}"),
+            (".voff/private.json", "PRIVATE"),
+            (".env.local", "PRIVATE"),
+            ("node_modules/pkg/main.js", "DEPENDENCY"),
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let workspace = ScopedWorkspace::new(dir.path(), 4096).unwrap();
+        let context = workspace.context_bundle(100, 4096).unwrap();
+        assert!(context.contains("export const api = 1;") && context.contains("{}"));
+        assert!(!context.contains("PRIVATE") && !context.contains("DEPENDENCY"));
+        fs::write(dir.path().join("éééé.ts"), "hello").unwrap();
+        for limit in 0..100 {
+            assert!(workspace.context_bundle(100, limit).unwrap().len() <= limit);
+        }
+    }
+
+    #[test]
+    fn nested_patch_creates_directories_only_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = ScopedWorkspace::new(dir.path(), 1024).unwrap();
+        let proposal = workspace
+            .propose_replacement(
+                TaskId::new(),
+                Path::new("backend/src/main.js"),
+                "hello".into(),
+            )
+            .unwrap();
+        assert!(!dir.path().join("backend").exists());
+        assert!(workspace.apply_patch(&proposal, false).is_err());
+        assert!(!dir.path().join("backend").exists());
+        workspace.apply_patch(&proposal, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("backend/src/main.js")).unwrap(),
+            "hello"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nested_patch_rejects_symlinks_including_swaps_and_dangling_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = ScopedWorkspace::new(dir.path(), 1024).unwrap();
+        let proposal = workspace
+            .propose_replacement(
+                TaskId::new(),
+                Path::new("backend/src/main.js"),
+                "hello".into(),
+            )
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("missing"), dir.path().join("backend"))
+            .unwrap();
+        assert!(matches!(
+            workspace.apply_patch(&proposal, true),
+            Err(ToolError::OutsideWorkspace)
+        ));
+        assert!(
+            workspace
+                .propose_replacement(TaskId::new(), Path::new("backend/a"), "x".into())
+                .is_err()
+        );
+        assert!(!outside.path().join("missing").exists());
+    }
     #[test]
     fn reads_and_searches_inside_root() {
         let d = tempfile::tempdir().unwrap();

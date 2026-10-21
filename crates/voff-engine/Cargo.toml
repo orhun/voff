@@ -15,6 +15,7 @@ serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 voff-provider = { workspace = true, features = ["test-support"] }

@@ -48,8 +48,8 @@ typed_id!(ApprovalId, "apr");
 typed_id!(ArtifactId, "art");
 typed_id!(EventId, "evt");
 
-/// Backward-compatible per-response generation limit for agent profiles.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4096;
+/// Default per-response generation limit for agent profiles.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 16_384;
 /// Hard safety ceiling for one provider response.
 pub const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
 
@@ -70,16 +70,10 @@ pub struct AgentProfile {
     pub system_prompt: String,
     pub tools: Vec<String>,
     /// Maximum tokens the model may generate for one provider response.
-    #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u64,
     pub enabled: bool,
-    #[serde(default)]
     pub allowed_targets: Vec<String>,
-    #[serde(default)]
     pub delegation_limits: Option<TaskLimits>,
-}
-const fn default_max_output_tokens() -> u64 {
-    DEFAULT_MAX_OUTPUT_TOKENS
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
@@ -155,15 +149,26 @@ impl TaskStatus {
         self.is_terminal() || matches!(self, Self::Blocked)
     }
 }
+/// Durable contract and turn budget for evidence-gated implementation work.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkProgress {
+    /// Shared interface contract supplied to every implementation and integrator.
+    pub contract: String,
+    /// Integration work must wait for its implementation prerequisites.
+    pub integration: bool,
+    /// Persisted model-turn count, bounded across restarts.
+    pub turns: u16,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
-    /// One-based execution attempt number. Older persisted tasks deserialize as attempt one.
-    #[serde(default = "first_task_attempt")]
+    /// One-based execution attempt number.
     pub attempt: u16,
     /// The immediately preceding attempt when this task was explicitly re-run.
-    #[serde(default)]
     pub retry_of: Option<TaskId>,
+    /// Verified multi-step workflow.
+    pub work: Option<WorkProgress>,
     pub parent: Option<TaskId>,
     pub owner: AgentId,
     pub objective: String,
@@ -186,8 +191,9 @@ impl Task {
         let now = Utc::now();
         Self {
             id: TaskId::new(),
-            attempt: first_task_attempt(),
+            attempt: 1,
             retry_of: None,
+            work: None,
             parent: None,
             owner,
             objective: objective.into(),
@@ -218,7 +224,11 @@ impl Task {
                     | TaskStatus::Cancelled
             ) | (
                 TaskStatus::WaitingApproval,
-                TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Failed
+                TaskStatus::Running
+                    | TaskStatus::Ready
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Blocked
+                    | TaskStatus::Failed
             ) | (TaskStatus::Blocked, TaskStatus::Ready)
         );
         if !valid {
@@ -238,10 +248,6 @@ impl Task {
     }
 }
 
-const fn first_task_attempt() -> u16 {
-    1
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CanonicalEventKind {
     TaskCreated,
@@ -256,12 +262,47 @@ pub enum CanonicalEventKind {
     },
     ProviderStarted,
     TextDelta(String),
+    /// Live structured-output preview, not an approved action or task result.
+    GenerationDelta(String),
+    /// A failed request attempt was discarded before any actionable output.
+    ProviderRetrying {
+        attempt: u16,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
     },
     ProviderCompleted,
     ProviderFailed(String),
+    /// Nonfatal provider diagnostic; does not imply task failure.
+    ProviderWarning(String),
+    /// An application/account problem requiring user intervention, not model repair.
+    ApplicationIssue(String),
+    /// Recoverable work failure awaiting a bounded coordinator decision.
+    WorkRecoveryRequested {
+        reason: String,
+        /// False permits diagnosis only; the coordinator cannot override a denial.
+        retry_allowed: bool,
+    },
+    /// A validated Lead rejection returned to the same owner for new work.
+    RevisionRequested {
+        approval_id: ApprovalId,
+        feedback: String,
+    },
+    /// Automatic revision stopped without applying the rejected proposal.
+    RevisionStopped(String),
+    /// Persisted start of a tool-free coordinator review. None means failure review.
+    LeadReviewStarted {
+        lead: AgentId,
+        approval_id: Option<ApprovalId>,
+    },
+    /// Auditable coordinator verdict; this alone never authorizes execution.
+    LeadReviewFinished {
+        lead: AgentId,
+        approval_id: Option<ApprovalId>,
+        approved: bool,
+        reason: String,
+    },
     TaskCancelled,
     ToolProposed {
         tool_call_id: ToolCallId,
@@ -371,8 +412,13 @@ impl TaskGraph {
         let now = Utc::now();
         let task = Task {
             id: TaskId::new(),
-            attempt: first_task_attempt(),
+            attempt: 1,
             retry_of: None,
+            work: p.work.as_ref().map(|work| WorkProgress {
+                contract: work.contract.clone(),
+                integration: false,
+                turns: 0,
+            }),
             parent: Some(parent),
             owner,
             objective: objective.into(),
@@ -424,7 +470,7 @@ impl TaskGraph {
         self.tasks
             .values()
             .filter(|t| {
-                t.status == TaskStatus::Queued
+                matches!(t.status, TaskStatus::Queued | TaskStatus::Ready)
                     && self
                         .dependencies
                         .iter()
@@ -448,42 +494,6 @@ impl TaskGraph {
 mod tests {
     use super::*;
 
-    #[test]
-    fn older_agent_profiles_default_the_output_token_limit() {
-        let profile = AgentProfile {
-            id: AgentId::new(),
-            name: "Legacy".into(),
-            role: "developer".into(),
-            provider: "mock".into(),
-            model: "mock-v1".into(),
-            system_prompt: "work".into(),
-            tools: vec![],
-            max_output_tokens: 4096,
-            enabled: true,
-            allowed_targets: vec![],
-            delegation_limits: None,
-        };
-        let mut encoded = serde_json::to_value(profile).unwrap();
-        encoded.as_object_mut().unwrap().remove("max_output_tokens");
-
-        let restored: AgentProfile = serde_json::from_value(encoded).unwrap();
-
-        assert_eq!(restored.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
-    }
-
-    #[test]
-    fn older_tasks_default_to_the_first_attempt() {
-        let task = Task::root(AgentId::new(), "legacy", vec![], TaskLimits::default());
-        let mut encoded = serde_json::to_value(task).unwrap();
-        let object = encoded.as_object_mut().unwrap();
-        object.remove("attempt");
-        object.remove("retry_of");
-
-        let restored: Task = serde_json::from_value(encoded).unwrap();
-
-        assert_eq!(restored.attempt, 1);
-        assert_eq!(restored.retry_of, None);
-    }
     #[test]
     fn transitions_validate() {
         let mut t = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());

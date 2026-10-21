@@ -1,245 +1,41 @@
 # voff
 
-**AI agent orchestration, done right.**
+voff is a terminal workflow builder for coding agents. On launch, it can inspect a workspace and create a starter team, or continue a saved team. Tasks, delegation, approvals, and activity are visible and saved locally.
 
-voff is a provider-neutral, terminal-first AI agent workspace written in
-Rust. It runs local and cloud models as a supervised software team with
-persisted tasks, explicit delegation, approvals, dependency-aware scheduling,
-and a keyboard-driven Ratatui interface.
+## Install
 
-## Requirements
+Requires Rust 1.92+ and a supported provider: an installed Codex or Claude CLI, Ollama, or an OpenAI API token.
 
-- macOS or Linux
-- Rust 1.91 or newer
-- Ollama when using local models
-- An OpenAI API key only when running OpenAI tasks (not to launch voff)
-
-## Quick start: build your team
-
-```bash
-git clone https://github.com/voffsh/voff.git
-cd voff
-ollama pull qwen3:4b
-cargo run -p voff
-cargo run -p voff -- doctor
+```sh
+cargo install --path crates/voff
+voff
+voff ~/gh/my-project
+voff --config .voff/config.toml
 ```
 
-Voff starts without an implicit task. Press Enter, then submit `/task
-<objective>` to create explicit work for the Team Lead, or press capital `R`
-for Quick Run. Nothing runs merely because the workspace opened or resumed.
+Run `voff` in a workspace, pass its directory as the first argument, or load a team from TOML with `--config`. Voff automatically loads `.voff/config.toml` when present. The setup page lets you choose a client and model, then either press Enter to build a team from the workspace or press `d` and describe what you want to build. Voff generates the team lead prompt and the project-specific agents from that context. OpenAI cloud is selectable without an environment key; select it and press `c` to enter a key. The generated team is saved in `.voff/config.toml`, while runtime state and credentials stay in `.voff/voff.db`.
 
-On first launch, or when a bare launch points at a workspace without its local
-`.voff/voff.db`, voff opens a quick team builder instead of silently creating
-an unrecognized workspace. With `--workspace`, setup stores that workspace's
-configuration at `<DIR>/.voff/config.toml` and preselects `<DIR>` as the working
-directory. One defaults page sets the developer count, working directory (`.`
-by default), and default output-token limit. Names and roles are
-suggested automatically; provider and model are selected only on each
-developer. The first developer is always the required Team Lead, and later
-developers can select specialist roles but cannot create a competing lead.
-Press Enter to accept a developer or adjust the available role, provider, or
-model choices. OpenAI models come from a
-bundled models.dev catalog with context and price metadata; installed Ollama
-models are discovered locally when Ollama is running.
+The TOML format is intentionally small. Each `[[agent]]` entry supports `name`, `provider`, `model`, `prompt`, and `reports_to` (the name of another agent). Voff uses a sensible default output-token limit. The first agent is the team lead. Relative `workspace` paths resolve from the TOML file; a positional workspace argument overrides it. The generated `[setup_prompts]` section contains the two built-in team-generation prompts and can be edited to customize how Voff plans a team.
 
-The workspace field opens a directory-only `ratatui-explorer` picker. Navigate
-with the arrow keys or `hjkl`, press `/` and type to filter directory names,
-and press Enter to choose the highlighted folder. Right/`l` opens the
-highlighted directory; Left/`h` returns to its parent, and Space chooses the
-currently displayed directory. Press Esc to finish or clear a filter, then
-again to return without changing the workspace.
+```toml
+workspace = "."
 
-If the selected team uses OpenAI and no credential is configured, the builder
-offers an optional masked token field. Press Enter to skip it: a missing API
-token never blocks launch. In the workspace, press `A` to add it later without
-restarting. Values entered either way are stored in the workspace-local
-`.voff/voff.db`, never in `.voff/config.toml`, logs, prompts, or exports.
+[[agent]]
+name = "Lead"
+provider = "codex_cli"
+model = "default"
+prompt = "Coordinate the work, delegate bounded tasks, and report verified results."
 
-The workspace includes a `ratatui-textarea` composer at the bottom, with the
-resolved working directory pinned to the bottom-right border. Press Enter or
-click the composer to start talking to the Team Lead. Enter sends once the
-composer is active, Shift+Enter inserts a newline and grows the composer, and
-Esc safely quits. Voff enables modifier-aware terminal input for Shift+Enter;
-Ctrl+J or Alt+Enter provides a fallback on terminals without that protocol.
-The editor soft-wraps long text and supports selection, word-wise navigation
-and deletion, scrolling, and Ctrl+Z/Ctrl+Y undo/redo.
-Plain text asks the Team Lead for a direct, tool-free response. `/task
-<objective>` gives executable work that the lead may delegate, while `/tasks`
-focuses the current task list. Both conversations and assignments become
-explicit, persisted root tasks, so their status and results remain inspectable.
-
-Capital `R` is the explicit Quick Run shortcut. It sends a predefined root task
-to the Team Lead to reconcile relevant Markdown requirements and TODOs with the
-current source, create a prioritized bounded plan, delegate independent work to
-enabled specialists, execute it, validate it, and integrate the evidence. Quick
-Run switches directly to Tasks and remains subject to normal approval prompts.
-In Tasks, lowercase `r` re-runs the selected completed, failed, cancelled, or
-blocked task as a new persisted attempt. The prior attempt remains unchanged
-and inspectable.
-
-Risky requests appear in one centered approval popup. When several requests are
-pending, use Up/Down to inspect them one at a time; `y` approves only the visible
-request once and `n` denies only that request. The action (for example,
-`file.patch`) is highlighted in yellow, while the approve/deny keys stay pinned
-to the popup's bottom border so long previews cannot hide them.
-
-The workspace uses `rataflow` to render every developer as a live status card.
-Every root-work and delegation decision is enforced through the Team Lead;
-specialists cannot dispatch work directly to one another. Every specialist has
-one relationship connector to the Lead, representing assignments out and
-requests/results back through the same coordination hub. Cross-role
-collaboration is therefore specialist → Lead → specialist, never a direct peer
-edge. Once a persisted child task crosses a route, its connector becomes bright
-and animates while work is running. Connectors
-intentionally carry no text so parallel routes
-remain scannable; the task objective and status stay inside the owning developer
-card. Running roles use a pulsing border, activity glyph, and `LIVE` status, so
-ownership becomes visible as explicit tasks run. Each card shows its role once inside the border, paired
-with the role icon; a distinct custom agent name appears alongside it without
-repeating the role as a title. Cards can be selected or repositioned with the mouse;
-clicking a role highlights its Team Lead-mediated connector in yellow. Drag
-empty graph space to pan, use `+`/`-` to zoom, `0` to reset zoom, and `f`
-to fit the team. Press `S` after setup to open the team popup. `n` adds another
-Backend, Frontend, Full-stack, Reviewer, Tester, or DevOps specialist using the
-Team Lead's provider/model defaults; Enter enables or disables the selected idle
-specialist. The Team Lead cannot be disabled, and a specialist with queued,
-running, or pending-approved work must finish or cancel it before availability
-changes. New specialists have no peer-delegation authority. The same status information remains available through text
-and symbols, so keyboard-only use and terminals without color remain supported.
-Token usage is costed per task owner and model from the same catalog. Explicit
-`[cost]` rates override catalog prices; unknown local prices stay visibly
-unconfigured rather than being treated as free.
-
-The Rataflow team view owns the full workspace center by default. Press `1` for
-Team or `2` for the task workspace; `Tab` toggles between them while the header
-and Team Lead composer remain visible. Tasks use a two-pane browser and
-inspector: `↑`/`↓` or `j`/`k` selects work, `s` shows its structured summary,
-and `a` shows task-scoped activity for the owning role. `PgUp`/`PgDn` scrolls long
-results and role activity. Press `e` for the session-wide event viewer without
-adding another permanent workspace tab. Tasks are ordered newest first. Event
-rows use `◆` for root tasks and indented `└─` connectors for delegated work so
-each task's activity remains visually connected to its hierarchy.
-
-Existing configurations skip the builder and open normally; there is no config
-migration. For scripts and repeatable setup, `voff init` remains available with
-`--provider`, `--model`, and `--output`:
-
-```bash
-cargo run -p voff -- init \
-  --template team \
-  --provider ollama \
-  --model qwen3:4b \
-  --max-output-tokens 8192 \
-  --output .voff/config.toml
+[[agent]]
+name = "Agent 2"
+provider = "codex_cli"
+model = "default"
+prompt = "Take bounded tasks from the team lead, follow repository conventions, and report changes and checks."
+reports_to = "Lead"
 ```
 
-Launching `voff` without a subcommand reopens the newest task-bearing session
-when one exists. A bare launch recognizes a workspace only when it has usable
-configuration and its local `.voff/voff.db`; otherwise it opens setup. Use
-`--workspace` to select another working directory and its local state:
+Cloud credentials are read from environment variables and are never stored in the TOML file. In the app, press `w` or click the workspace path to choose another workspace; voff then reopens that workspace and its database.
 
-```bash
-cargo run -p voff -- --workspace /path/to/project
-```
+In the Team map, press `a` to add a generic agent. Generated prompts are shown in agent settings; agent names, reporting, provider, model, and token settings can be adjusted there. A new agent reports to the selected agent by default. Press Delete to remove an agent after confirmation; the team lead and agents with direct reports cannot be removed. Use Tab or the arrow keys to move between fields. Enter saves the settings.
 
-An explicit `run` creates a clean session. Add `--resume` to reopen the newest
-task-bearing session, or select a stored session by ID. Global arguments work
-before or after the subcommand:
-
-```bash
-cargo run -p voff -- run --workspace /path/to/project --resume
-```
-
-List stored sessions and resume a specific one:
-
-```bash
-cargo run -p voff -- sessions
-cargo run -p voff -- run --session ses_...
-```
-
-Export the newest session as a redacted diagnostic bundle:
-
-```bash
-cargo run -p voff -- export \
-  --config .voff/heterogeneous.example.toml \
-  --output .voff/diagnostic.json
-```
-
-The exporter removes configured credential values and common API-key, token,
-password, and bearer-token forms. It refuses to overwrite an existing file so
-that an earlier diagnostic is not destroyed accidentally. Preview the JSON
-before sharing it because repository/model content is untrusted input.
-
-## Heterogeneous OpenAI + Ollama team
-
-Interactive setup and the workspace's `A` shortcut store the OpenAI API token
-in the local `.voff/voff.db`. For CI, scripts, or an explicit override, create an
-optional `.env` in the directory
-where you invoke voff (no parent directories are searched):
-
-```dotenv
-OPENAI_API_KEY=YOUR_API_KEY
-```
-
-Existing process variables override `.env`, which overrides the local database.
-OpenAI defaults to `OPENAI_API_KEY`; a custom `api_key_env` name works
-identically. Ollama needs no token. Never commit `.env`; it is ignored by Git.
-Malformed or unreadable files stop startup with a redacted error. Existing TOML
-configurations need no migration.
-
-Then validate and run the example formation:
-
-```bash
-cargo run -p voff -- doctor --config .voff/heterogeneous.example.toml
-cargo run -p voff -- run --config .voff/heterogeneous.example.toml
-```
-
-Once the workspace opens, use `/task <objective>` to submit the work you want
-the configured formation to perform.
-
-Delegations, patches, and test commands remain subject to explicit approval.
-Drag a developer card to arrange the team, click a card to select it, press `y`
-to approve once, `n` to deny, `S` to add or adjust specialists, `1`/`2` to
-switch workspace views, `s`/`a` to switch task summary and owner-role activity,
-`r` to re-run the selected terminal task, `R` for Quick Run, `f` to fit the team graph, `e` to inspect session events,
-`?` for help, and `q` to quit. All core actions remain keyboard-accessible.
-
-## Development checks
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/ARCHITECTURE.md),
-[security model](docs/SECURITY.md), and [roadmap](docs/ROADMAP.md) for project
-rules and current milestone evidence.
-
-Security vulnerabilities must follow the private process in
-[SECURITY.md](SECURITY.md). Community participation is governed by
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-
-Maintainers can find the tagged binary workflow and checksum procedure in
-[docs/RELEASING.md](docs/RELEASING.md).
-Provider contributors should start with
-[docs/PROVIDER_ADAPTERS.md](docs/PROVIDER_ADAPTERS.md).
-
-## Security
-
-Never commit API keys or place them in `.voff/*.toml`. Provider credentials
-are resolved from environment variables or the workspace-local SQLite database
-at runtime. The database stores the token as plaintext with workspace-local
-file permissions; treat `.voff/voff.db` as sensitive and do not share it.
-voff does not grant
-models unrestricted shell or filesystem access.
-
-## License
-
-voff is dual-licensed under either of the following, at your option:
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-Unless explicitly stated otherwise, contributions are submitted under the same
-dual-license terms.
+In the app, press Enter to write a task, `1` for Team, `2` for Tasks, and `c` to configure the selected agent. Click an agent card to select it, or double-click or press `t` to open its tab; Ctrl+W closes a tab. Delegation follows each agent's direct reports, and results return to the reporting agent for review. You can click tabs and task controls, or drag cards to rearrange the team view.

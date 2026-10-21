@@ -66,12 +66,18 @@ impl ControlledExecutor {
         })
     }
     fn validate(&self, spec: &CommandSpec) -> Result<PathBuf, ExecutorError> {
-        if spec.program != "cargo"
-            || !matches!(
-                spec.args.first().map(String::as_str),
-                Some("test" | "check" | "clippy" | "fmt")
-            )
-        {
+        let args = spec.args.iter().map(String::as_str).collect::<Vec<_>>();
+        let allowed = match spec.program.as_str() {
+            "cargo" => matches!(
+                args.as_slice(),
+                ["test"] | ["check"] | ["clippy"] | ["fmt", "--check"]
+            ),
+            "python3" => args == ["-m", "unittest", "discover"],
+            "node" => args == ["--test"],
+            "npm" => matches!(args.as_slice(), ["test"] | ["run", "build"]),
+            _ => false,
+        };
+        if !allowed {
             return Err(ExecutorError::Denied);
         }
         if spec
@@ -104,6 +110,7 @@ impl ControlledExecutor {
             .current_dir(cwd)
             .env_clear()
             .env("PATH", safe_path)
+            .env("CI", "true")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -213,5 +220,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn verification_allowlist_is_exact_and_does_not_allow_install_or_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ControlledExecutor::new(dir.path()).unwrap();
+        for (program, args, allowed) in [
+            ("python3", vec!["-m", "unittest", "discover"], true),
+            ("node", vec!["--test"], true),
+            ("npm", vec!["test"], true),
+            ("npm", vec!["run", "build"], true),
+            ("npm", vec!["install"], false),
+            ("npm", vec!["exec", "anything"], false),
+            ("node", vec!["-e", "arbitrary code"], false),
+            ("python3", vec!["-c", "arbitrary code"], false),
+            ("sh", vec!["-c", "npm test"], false),
+            (
+                "cargo",
+                vec!["test", "--manifest-path", "/tmp/other/Cargo.toml"],
+                false,
+            ),
+        ] {
+            let spec = CommandSpec {
+                program: program.into(),
+                args: args.iter().map(|s| (*s).into()).collect(),
+                cwd: dir.path().into(),
+                timeout_seconds: 30,
+                output_limit: 1024,
+            };
+            assert_eq!(executor.validate(&spec).is_ok(), allowed, "{spec:?}");
+        }
     }
 }

@@ -1,22 +1,10 @@
 //! Repository ports plus in-memory and SQLite adapters.
 use async_trait::async_trait;
-use rusqlite_migration::{M, Migrations};
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio_rusqlite::rusqlite::{self, OptionalExtension};
 use voff_core::*;
-
-fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![
-        M::up(include_str!("../migrations/0001_base.sql")),
-        M::up(include_str!(
-            "../migrations/0002_approvals_and_artifacts.sql"
-        )),
-        M::up(include_str!("../migrations/0003_task_dependencies.sql")),
-        M::up(include_str!("../migrations/0004_credentials.sql")),
-    ])
-}
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -192,6 +180,43 @@ pub struct SqliteRepository {
 }
 
 impl SqliteRepository {
+    /// Persist a secret-free workspace/team preference.
+    pub async fn save_setting(&self, key: &str, value: &str) -> Result<(), RepositoryError> {
+        if key.trim().is_empty() {
+            return Err(RepositoryError::Invariant(
+                "setting key must not be empty".into(),
+            ));
+        }
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO team_settings(key,value) VALUES(?1,?2)",
+                    rusqlite::params![key, value],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Read a persisted workspace/team preference.
+    pub async fn setting(&self, key: &str) -> Result<Option<String>, RepositoryError> {
+        let key = key.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM team_settings WHERE key=?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)
+        })
+        .await
+    }
+
     pub async fn open(path: &std::path::Path) -> Result<Self, RepositoryError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -264,7 +289,9 @@ impl SqliteRepository {
             connection
                 .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
                 .map_err(db)?;
-            migrations().to_latest(connection).map_err(migration)?;
+            connection
+                .execute_batch(include_str!("../schema.sql"))
+                .map_err(db)?;
             Ok(())
         })
         .await
@@ -293,10 +320,6 @@ fn invariant(error: voff_core::DomainError) -> RepositoryError {
 
 fn db(error: rusqlite::Error) -> RepositoryError {
     RepositoryError::Invariant(format!("sqlite: {error}"))
-}
-
-fn migration(error: rusqlite_migration::Error) -> RepositoryError {
-    RepositoryError::Invariant(format!("sqlite migration: {error}"))
 }
 
 fn worker(error: tokio_rusqlite::Error<RepositoryError>) -> RepositoryError {
@@ -661,13 +684,6 @@ fn insert_event(tx: &rusqlite::Transaction<'_>, v: &CanonicalEvent) -> Result<()
         ],
     )
     .map_err(db)?;
-    if let CanonicalEventKind::Usage {
-        input_tokens,
-        output_tokens,
-    } = v.kind
-    {
-        tx.execute("INSERT INTO usage_records(event_id,session_id,input_tokens,output_tokens) VALUES(?1,?2,?3,?4)",rusqlite::params![v.id.to_string(),v.session_id.to_string(),input_tokens,output_tokens]).map_err(db)?;
-    }
     Ok(())
 }
 
@@ -714,63 +730,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_applies_all_embedded_migrations() {
-        let r = SqliteRepository::open_in_memory().await.unwrap();
-        let version = r
-            .connection
-            .call(|connection| {
-                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            })
-            .await
-            .unwrap();
-        assert_eq!(version, 4);
+    async fn team_setting_survives_reopen() {
+        let path = std::env::temp_dir().join(format!("voff-team-{}.db", uuid::Uuid::new_v4()));
+        {
+            let repository = SqliteRepository::open(&path).await.unwrap();
+            repository
+                .save_setting("team", r#"{"developers":2}"#)
+                .await
+                .unwrap();
+        }
+        let repository = SqliteRepository::open(&path).await.unwrap();
+        assert_eq!(
+            repository.setting("team").await.unwrap().as_deref(),
+            Some(r#"{"developers":2}"#)
+        );
+        drop(repository);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
-    async fn sqlite_adopts_the_legacy_unversioned_schema() {
-        let path = std::env::temp_dir().join(format!("voff-legacy-{}.db", uuid::Uuid::new_v4()));
-        let session = Session {
-            id: SessionId::new(),
-            formation_id: FormationId::new(),
-            workspace: ".".into(),
-            created_at: chrono::Utc::now(),
-        };
-        let id = session.id;
-        let data = serde_json::to_string(&session).unwrap();
-        let legacy = tokio_rusqlite::Connection::open(&path).await.unwrap();
-        legacy
-            .call(move |connection| {
-                connection.execute_batch(
-                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);\
-                     CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
-                )?;
-                connection.execute(
-                    "INSERT INTO sessions(id, data) VALUES (?1, ?2)",
-                    rusqlite::params![id.to_string(), data],
-                )?;
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
-        legacy.close().await.unwrap();
-
-        let r = SqliteRepository::open(&path).await.unwrap();
-        let restored = r.session(id).await.unwrap().unwrap();
-        assert_eq!(restored.id, session.id);
-        assert_eq!(restored.formation_id, session.formation_id);
-        assert_eq!(restored.workspace, session.workspace);
-        assert_eq!(restored.created_at, session.created_at);
-        assert_eq!(r.dependencies().await.unwrap(), Vec::new());
-        let version = r
+    async fn sqlite_creates_only_current_tables() {
+        let r = SqliteRepository::open_in_memory().await.unwrap();
+        let tables = r
             .connection
             .call(|connection| {
-                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                let mut statement = connection
+                    .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
             })
             .await
             .unwrap();
-        assert_eq!(version, 4);
-        drop(r);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            tables,
+            [
+                "agents",
+                "approvals",
+                "artifacts",
+                "credentials",
+                "events",
+                "sessions",
+                "task_dependencies",
+                "tasks",
+                "team_settings",
+            ]
+        );
     }
 
     #[tokio::test]

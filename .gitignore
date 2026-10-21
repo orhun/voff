@@ -4,6 +4,4 @@
 .voff/*.db
 .voff/*.db-shm
 .voff/*.db-wal
-.voff/diagnostic*.json
-.voff/backups/
-.voff/config.toml
+.voff/logs/
