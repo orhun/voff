@@ -134,7 +134,6 @@ enum ComposerEvent {
 
 pub struct AppModel {
     notifications: Notifications,
-    team_hint_id: Option<u64>,
     transient_notification_ids: VecDeque<u64>,
     automatic_review: bool,
     lead_reviews: HashMap<voff_core::TaskId, String>,
@@ -200,6 +199,13 @@ pub struct AppModel {
     setup_editor: Option<crate::onboarding::Wizard>,
     setup_result: Option<crate::onboarding::SetupDraft>,
     setup_notice: Option<String>,
+    startup_scan_pending: bool,
+    startup_setup_prompt: String,
+    startup_goal: Option<String>,
+    startup_scan_result: Option<Result<(crate::onboarding::SetupDraft, String), String>>,
+    startup_scan_frame: usize,
+    startup_prompt_scroll: u16,
+    startup_scan_error: Option<String>,
     workspace_editor: Option<crate::onboarding::Wizard>,
     workspace_result: Option<PathBuf>,
     team_flow: TeamFlow,
@@ -212,7 +218,6 @@ impl AppModel {
         let composer = new_composer();
         Self {
             notifications: Notifications::new(),
-            team_hint_id: None,
             transient_notification_ids: VecDeque::new(),
             session,
             tasks: vec![],
@@ -278,6 +283,13 @@ impl AppModel {
             setup_editor: None,
             setup_result: None,
             setup_notice: None,
+            startup_scan_pending: false,
+            startup_setup_prompt: String::new(),
+            startup_goal: None,
+            startup_scan_result: None,
+            startup_scan_frame: 0,
+            startup_prompt_scroll: 0,
+            startup_scan_error: None,
             workspace_editor: None,
             workspace_result: None,
             team_flow: TeamFlow::default(),
@@ -306,7 +318,6 @@ impl AppModel {
             self.task_inspector_scroll = 0;
             self.notifications.clear();
             self.transient_notification_ids.clear();
-            self.team_hint_id = None;
             let next = self
                 .composer_drafts
                 .remove(&tab)
@@ -1258,26 +1269,6 @@ impl AppModel {
         );
     }
 
-    fn sync_team_hint(&mut self) {
-        let visible = self.agents.len() == 1
-            && self.team_lead == self.agents.first().map(|agent| agent.id)
-            && self.panel == Panel::Agents
-            && self.active_role_tab.is_none()
-            && self.setup_editor.is_none()
-            && self.workspace_editor.is_none();
-        if visible && self.team_hint_id.is_none() {
-            self.team_hint_id = self.notify(
-                "Your team is ready",
-                "Press [a] to add an agent\nEnter to assign a task",
-                Level::Info,
-                theme::AQUA,
-                true,
-            );
-        } else if !visible && let Some(id) = self.team_hint_id.take() {
-            self.notifications.remove(id);
-        }
-    }
-
     fn notify_task_status(&mut self, task: &Task) {
         let (title, level, accent, action) = match task.status {
             TaskStatus::Completed => ("Task completed", Level::Info, theme::GREEN, "Review"),
@@ -1677,6 +1668,13 @@ pub const fn action_for_key(code: KeyCode) -> Action {
 fn action_for_event(value: Event) -> Action {
     match value {
         Event::Key(key)
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.kind != KeyEventKind::Release =>
+        {
+            Action::Quit
+        }
+        Event::Key(key)
             if key.modifiers == KeyModifiers::ALT && key.kind != KeyEventKind::Release =>
         {
             match key.code {
@@ -2044,6 +2042,9 @@ pub(crate) struct ConfiguredRun {
     pub team_lead: AgentId,
     pub team_setup: Option<crate::onboarding::SetupDraft>,
     pub startup_notice: Option<String>,
+    pub startup_scan_pending: bool,
+    pub setup_prompts: crate::onboarding::SetupPrompts,
+    pub startup_goal: Option<String>,
 }
 pub(crate) enum TuiExit {
     Team(crate::onboarding::SetupDraft, Option<String>),
@@ -2054,6 +2055,12 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
     let credential_repository = Arc::clone(&config.repo);
     let agent_profiles = config.agent_profiles.clone();
+    let startup_scan_provider = config.providers.get(&config.default_provider).cloned();
+    let startup_setup_prompt = if config.startup_goal.is_some() {
+        config.setup_prompts.build_from_description.clone()
+    } else {
+        config.setup_prompts.scan_workspace.clone()
+    };
     let engine = Arc::new(
         Engine::new(config.repo, config.provider, config.session, event_tx)
             .with_provider_registry(config.providers, config.default_provider)
@@ -2077,6 +2084,9 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
     app.credential_target = config.credential_target;
     app.team_lead = Some(config.team_lead);
     app.team_setup = config.team_setup;
+    app.startup_scan_pending = config.startup_scan_pending;
+    app.startup_setup_prompt = startup_setup_prompt;
+    app.startup_goal = config.startup_goal.clone();
     if let Some(notice) = config.startup_notice {
         let _ = app.notify("Team updated", &notice, Level::Info, theme::GREEN, false);
     }
@@ -2094,6 +2104,9 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
             owner: config.owner,
             max_parallel_tasks: config.max_parallel_tasks,
             credential_repository,
+            startup_scan_provider,
+            startup_goal: config.startup_goal,
+            setup_prompts: config.setup_prompts,
         },
         input_tx,
         input_rx,
@@ -2136,6 +2149,9 @@ struct LoopConfig {
     owner: AgentId,
     max_parallel_tasks: usize,
     credential_repository: Arc<SqliteRepository>,
+    startup_scan_provider: Option<Arc<dyn voff_provider::ModelProvider>>,
+    startup_goal: Option<String>,
+    setup_prompts: crate::onboarding::SetupPrompts,
 }
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2189,6 +2205,9 @@ async fn terminal_loop<R: Repository + 'static>(
         owner,
         max_parallel_tasks,
         credential_repository,
+        startup_scan_provider,
+        startup_goal,
+        setup_prompts,
     } = config;
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -2199,6 +2218,34 @@ async fn terminal_loop<R: Repository + 'static>(
     let (lead_submission_tx, mut lead_submission_rx) =
         mpsc::channel::<Result<&'static str, String>>(8);
     let (retry_tx, mut retry_rx) = mpsc::channel::<Result<(voff_core::TaskId, u16), String>>(1);
+    let (team_scan_tx, mut team_scan_rx) =
+        mpsc::channel::<Result<(crate::onboarding::SetupDraft, String), String>>(1);
+    if model.startup_scan_pending {
+        let workspace = model.workspace_root.clone();
+        let previous = model.team_setup.clone();
+        tokio::spawn(async move {
+            let result = match (
+                startup_scan_provider,
+                previous.and_then(|setup| setup.developers.first().cloned()),
+            ) {
+                (Some(provider), Some(lead)) => {
+                    crate::onboarding::build_workspace_team(
+                        workspace,
+                        lead.provider,
+                        lead.model,
+                        lead.credential_reference,
+                        startup_goal,
+                        setup_prompts,
+                        provider,
+                    )
+                    .await
+                }
+                (None, _) => Err("The selected provider is unavailable.".into()),
+                (_, None) => Err("The setup has no selected provider.".into()),
+            };
+            let _ = team_scan_tx.send(result).await;
+        });
+    }
     if model.automatic_review && has_unsettled_tasks(&model.tasks) {
         model.pending_submissions += 1;
         let engine = Arc::clone(&engine);
@@ -2224,6 +2271,53 @@ async fn terminal_loop<R: Repository + 'static>(
                         loop_result = Err(TuiError::Io(error));
                         break 'terminal;
                     }
+                }
+                if matches!(&event, Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    model.quit = true;
+                    continue;
+                }
+                if model.startup_scan_pending
+                    || model.startup_scan_error.is_some()
+                {
+                    if let Event::Key(key) = &event
+                        && key.kind == KeyEventKind::Press
+                    {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_sub(8);
+                            }
+                            KeyCode::PageDown => {
+                                model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_add(8);
+                            }
+                            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')
+                                if !model.startup_scan_pending =>
+                            {
+                                model.startup_scan_error = None;
+                            }
+                            _ => {}
+                        }
+                    } else if let Event::Mouse(mouse) = &event {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                model.startup_prompt_scroll = model.startup_prompt_scroll.saturating_add(3);
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
                 }
                 if let Some(wizard) = model.workspace_editor.as_mut() {
                     wizard.handle_event(&event, terminal.size()?.into());
@@ -2486,8 +2580,25 @@ async fn terminal_loop<R: Repository + 'static>(
                     }
                 }
             }
+            Some(result)=team_scan_rx.recv()=>{
+                model.startup_scan_result = Some(result);
+            }
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
+                model.startup_scan_frame = model.startup_scan_frame.wrapping_add(1);
+                if model.startup_scan_pending
+                    && let Some(result) = model.startup_scan_result.take()
+                {
+                    model.startup_scan_pending = false;
+                    match result {
+                        Ok((draft, notice)) => {
+                            model.setup_result = Some(draft);
+                            model.setup_notice = Some(notice);
+                            model.quit = true;
+                        }
+                        Err(error) => model.startup_scan_error = Some(sanitize(&error)),
+                    }
+                }
                 model.team_flow.tick(Duration::from_millis(100));
                 model.notifications.tick(Duration::from_millis(100));
                 if let Err(error) = terminal.draw(|frame|render(frame,model)) {
@@ -2529,7 +2640,6 @@ fn composer_height(app: &AppModel, area: Rect) -> u16 {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
-    app.sync_team_hint();
     frame.render_widget(Block::default().style(theme::canvas()), frame.area());
     let composer_height = composer_height(app, frame.area());
     let rows = Layout::default()
@@ -2658,6 +2768,117 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         return;
     }
     render_overlays(frame, app);
+    render_team_builder_popup(frame, app);
+}
+
+fn render_team_builder_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
+    if !app.startup_scan_pending && app.startup_scan_error.is_none() {
+        return;
+    }
+    let title = " Build your team ";
+    let mut lines = Vec::new();
+    if let Some(error) = &app.startup_scan_error {
+        lines.push(
+            Line::from("Voff could not scan this workspace.")
+                .style(Style::default().fg(theme::TEXT)),
+        );
+        lines.push(Line::from(error.as_str()).style(Style::default().fg(theme::MUTED)));
+    } else {
+        lines.push(
+            Line::from(sanitize(&app.workspace_root.display().to_string()))
+                .style(Style::default().fg(theme::MUTED)),
+        );
+    }
+    if let Some(goal) = &app.startup_goal {
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(format!("Requested outcome: {}", sanitize(goal)))
+                .style(Style::default().fg(theme::TEXT)),
+        );
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Setup prompt",
+        Style::default()
+            .fg(theme::AQUA)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(
+        Line::from(app.startup_setup_prompt.as_str()).style(Style::default().fg(theme::TEXT)),
+    );
+    let area = frame.area();
+    let popup = centered_popup(
+        area,
+        area.width.saturating_sub(4).min(72),
+        16.min(area.height),
+    );
+    frame.render_widget(Clear, popup);
+    let mut block = Block::default()
+        .title(
+            Line::from(title).style(
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::surface())
+        .border_style(Style::default().fg(theme::BORDER));
+    let footer_line = if app.startup_scan_pending {
+        let spinner = ['|', '/', '-', '\\'][app.startup_scan_frame % 4];
+        Line::from(vec![
+            Span::styled(
+                format!("{spinner}  Building your team..."),
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ·  ↑/↓ scroll", Style::default().fg(theme::MUTED)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "Scan failed",
+                Style::default()
+                    .fg(theme::YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  Enter or Esc to close",
+                Style::default().fg(theme::TEXT),
+            ),
+        ])
+    };
+    block = block.title_bottom(footer_line.alignment(Alignment::Center));
+    let inner = block.inner(popup);
+    let text_area = Rect {
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .style(theme::surface());
+    let content_height = paragraph.line_count(text_area.width);
+    let max_scroll = content_height.saturating_sub(text_area.height as usize);
+    let scroll = usize::from(app.startup_prompt_scroll).min(max_scroll);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(paragraph.scroll((scroll as u16, 0)), text_area);
+    if content_height > text_area.height as usize && inner.width > 1 {
+        let mut state = ScrollbarState::new(content_height)
+            .position(scroll)
+            .viewport_content_length(text_area.height as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Rect {
+                x: inner.x + inner.width.saturating_sub(1),
+                width: 1,
+                ..inner
+            },
+            &mut state,
+        );
+    }
 }
 
 fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
@@ -4074,7 +4295,7 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             popup,
         );
         let content = popup.inner(Margin::new(2, 2));
-        let logo = crate::onboarding::logo_text_for(theme::SURFACE);
+        let logo = crate::onboarding::animated_logo_text_for(theme::SURFACE);
         let logo_width = logo.as_ref().map_or(0, |image| {
             image.lines.iter().map(Line::width).max().unwrap_or(0) as u16
         });
@@ -5476,59 +5697,6 @@ mod tests {
             .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
             .collect::<String>();
         assert!(!border.contains("approved"), "{border}");
-    }
-
-    #[test]
-    fn lone_lead_hint_returns_on_team_view_and_hides_on_other_tabs() {
-        let mut app = AppModel::new(SessionId::new());
-        let lead = agent("Team Lead", "team_lead", vec![]);
-        app.team_lead = Some(lead.id);
-        app.agents.push(lead);
-        app.sync_team_hint();
-        assert!(app.team_hint_id.is_some());
-        app.notifications.tick(Duration::from_secs(20));
-        assert!(
-            app.notifications.has_notification(),
-            "the hint must persist"
-        );
-        for _ in 0..3 {
-            let _ = app.notify(
-                "Task completed",
-                "[2] Tasks",
-                Level::Info,
-                theme::GREEN,
-                false,
-            );
-        }
-        assert!(
-            app.notifications.remove(app.team_hint_id.unwrap()),
-            "task toasts must not evict the team hint"
-        );
-        app.team_hint_id = None;
-        app.sync_team_hint();
-        app.reduce(Action::ShowTasks);
-        app.sync_team_hint();
-        assert!(app.team_hint_id.is_none());
-        app.reduce(Action::ShowTeam);
-        app.sync_team_hint();
-        assert!(app.team_hint_id.is_some());
-        app.notifications.tick(Duration::from_millis(500));
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let lines = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        let add_row = lines
-            .iter()
-            .position(|line| line.contains("Press [a] to add an agent"))
-            .unwrap();
-        assert!(lines[add_row + 1].contains("Enter to assign a task"));
-        assert!(!lines[add_row].contains('·'));
     }
 
     #[test]

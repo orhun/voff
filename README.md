@@ -1,6 +1,6 @@
 # voff
 
-voff is a terminal workspace for coordinating a team of AI agents. Tasks, delegation, approvals, and activity are visible and saved locally.
+voff is a terminal workflow builder for coding agents. On launch, it can inspect a workspace and create a starter team, or continue a saved team. Tasks, delegation, approvals, and activity are visible and saved locally.
 
 ## Install
 
@@ -10,10 +10,32 @@ Requires Rust 1.92+ and a supported provider: an installed Codex or Claude CLI, 
 cargo install --path crates/voff
 voff
 voff ~/gh/my-project
+voff --config .voff/config.toml
 ```
 
-Run `voff` in a workspace, or pass its directory as the first argument. First launch asks only for Team Lead settings; press Enter through the defaults to start. Cloud tokens are requested only for cloud providers. Team choices and tasks live in that workspace's `.voff/voff.db`. In the app, press `w` or click the workspace path to choose another workspace; voff then reopens that workspace and its database.
+Run `voff` in a workspace, pass its directory as the first argument, or load a team from TOML with `--config`. Voff automatically loads `.voff/config.toml` when present. The setup page lets you choose a client and model, then either press Enter to build a team from the workspace or press `d` and describe what you want to build. Voff generates the team lead prompt and the project-specific agents from that context. OpenAI cloud is selectable without an environment key; select it and press `c` to enter a key. The generated team is saved in `.voff/config.toml`, while runtime state and credentials stay in `.voff/voff.db`.
 
-In the Team map, press `a` to add a Backend, Frontend, Reviewer, or Custom Agent. A new agent reports to the selected agent by default; change **Reports to** in its settings to build a different reporting tree. Press Delete to remove a selected agent after confirmation; the Team Lead and agents with direct reports cannot be removed. Built-in roles have editable prompts; Custom Agent starts with an empty prompt. In agent settings, select Prompt and press `e` to edit it; Ctrl+S saves and Esc discards. Type directly to edit a name, model, or token; use Tab or the arrow keys to move between fields. Enter continues or saves the agent settings.
+The TOML format is intentionally small. Each `[[agent]]` entry supports `name`, `provider`, `model`, `prompt`, and `reports_to` (the name of another agent). Voff uses a sensible default output-token limit. The first agent is the team lead. Relative `workspace` paths resolve from the TOML file; a positional workspace argument overrides it. The generated `[setup_prompts]` section contains the two built-in team-generation prompts and can be edited to customize how Voff plans a team.
 
-In the app, press Enter to write a task, `1` for Team, `2` for Tasks, and `c` to configure the selected agent. Click a role card to select it, or double-click or press `t` to open its tab; Ctrl+W closes a role tab. Delegation follows each agent's direct reports, and results return to the reporting agent for review. You can click tabs and task controls, or drag cards to rearrange the team view.
+```toml
+workspace = "."
+
+[[agent]]
+name = "Lead"
+provider = "codex_cli"
+model = "default"
+prompt = "Coordinate the work, delegate bounded tasks, and report verified results."
+
+[[agent]]
+name = "Agent 2"
+provider = "codex_cli"
+model = "default"
+prompt = "Take bounded tasks from the team lead, follow repository conventions, and report changes and checks."
+reports_to = "Lead"
+```
+
+Cloud credentials are read from environment variables and are never stored in the TOML file. In the app, press `w` or click the workspace path to choose another workspace; voff then reopens that workspace and its database.
+
+In the Team map, press `a` to add a generic agent. Generated prompts are shown in agent settings; agent names, reporting, provider, model, and token settings can be adjusted there. A new agent reports to the selected agent by default. Press Delete to remove an agent after confirmation; the team lead and agents with direct reports cannot be removed. Use Tab or the arrow keys to move between fields. Enter saves the settings.
+
+In the app, press Enter to write a task, `1` for Team, `2` for Tasks, and `c` to configure the selected agent. Click an agent card to select it, or double-click or press `t` to open its tab; Ctrl+W closes a tab. Delegation follows each agent's direct reports, and results return to the reporting agent for review. You can click tabs and task controls, or drag cards to rearrange the team view.
