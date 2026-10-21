@@ -69,7 +69,9 @@ struct TabHitbox {
 pub enum Action {
     Up,
     Down,
-    NextPanel,
+    NextTab,
+    PreviousTab,
+    ToggleTaskPane,
     ToggleHelp,
     FocusComposer,
     RetryTask,
@@ -92,8 +94,7 @@ pub enum Action {
     DeleteAgent,
     ShowTeam,
     ShowTasks,
-    OpenRoleTab,
-    CloseRoleTab,
+    CloseTab,
     ToggleExpanded,
     ToggleApprovalDetails,
     Escape,
@@ -162,6 +163,11 @@ pub struct AppModel {
     task_list_hitbox: Rect,
     task_layout: task_layout::TaskLayout,
     task_inspector_hitbox: Rect,
+    task_pane_hitbox: Rect,
+    task_pane_visible: bool,
+    task_pane_focused: bool,
+    task_pane_visible_before_tasks_tab: bool,
+    task_pane_focused_before_tasks_tab: bool,
     team_tab_hitbox: Rect,
     tasks_tab_hitbox: Rect,
     tab_hitboxes: Vec<TabHitbox>,
@@ -247,6 +253,11 @@ impl AppModel {
             task_list_hitbox: Rect::default(),
             task_layout: task_layout::TaskLayout::default(),
             task_inspector_hitbox: Rect::default(),
+            task_pane_hitbox: Rect::default(),
+            task_pane_visible: true,
+            task_pane_focused: false,
+            task_pane_visible_before_tasks_tab: true,
+            task_pane_focused_before_tasks_tab: false,
             team_tab_hitbox: Rect::default(),
             tasks_tab_hitbox: Rect::default(),
             tab_hitboxes: Vec::new(),
@@ -315,6 +326,16 @@ impl AppModel {
             return;
         }
         let current = self.active_tab();
+        if tab == TabId::Tasks {
+            if current != TabId::Tasks {
+                self.task_pane_visible_before_tasks_tab = self.task_pane_visible;
+                self.task_pane_focused_before_tasks_tab = self.task_pane_focused;
+            }
+            self.task_pane_visible = false;
+        } else if current == TabId::Tasks {
+            self.task_pane_visible = self.task_pane_visible_before_tasks_tab;
+            self.task_pane_focused = self.task_pane_focused_before_tasks_tab;
+        }
         if current != tab {
             self.task_layout.cancel_drag();
             self.task_inspector_scroll = 0;
@@ -328,6 +349,9 @@ impl AppModel {
             self.composer_drafts.insert(current, previous);
         }
         self.composer_active = false;
+        if current != TabId::Tasks || tab == TabId::Tasks {
+            self.task_pane_focused = false;
+        }
         match tab {
             TabId::Team => {
                 self.panel = Panel::Agents;
@@ -342,6 +366,23 @@ impl AppModel {
                 self.role_scroll = 0;
             }
         }
+    }
+
+    fn cycle_tab(&mut self, offset: isize) {
+        let mut tabs = vec![TabId::Team, TabId::Tasks];
+        tabs.extend(
+            self.role_tabs
+                .iter()
+                .copied()
+                .filter(|id| self.agents.iter().any(|agent| agent.id == *id))
+                .map(TabId::Role),
+        );
+        let current = tabs
+            .iter()
+            .position(|tab| *tab == self.active_tab())
+            .unwrap_or(0);
+        let next = (current as isize + offset).rem_euclid(tabs.len() as isize) as usize;
+        self.select_tab(tabs[next]);
     }
 
     fn open_role_tab(&mut self, id: AgentId) {
@@ -393,6 +434,7 @@ impl AppModel {
         match action {
             Action::ResizeTasks(_) | Action::ResetTaskLayout => {
                 if self.active_tab() == TabId::Tasks
+                    && !self.task_pane_visible
                     && !self.help
                     && !self.event_viewer
                     && !self.composer_active
@@ -409,8 +451,13 @@ impl AppModel {
                 if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
                     self.event_follow = self.event_scroll == 0;
+                } else if self.task_pane_focused {
+                    self.selected = self.selected.saturating_sub(1);
+                    self.task_inspector_scroll = 0;
                 } else if self.active_role_tab.is_some() {
                     self.role_scroll = self.role_scroll.saturating_add(1);
+                } else if self.panel == Panel::Tasks && self.task_pane_visible {
+                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_add(1);
                 } else if self.panel == Panel::Agents {
                     self.selected_agent = self.selected_agent.saturating_sub(1);
                 } else {
@@ -425,8 +472,15 @@ impl AppModel {
                         .saturating_add(1)
                         .min(self.event_scroll_limit());
                     self.event_follow = self.event_scroll == 0;
+                } else if self.task_pane_focused {
+                    if self.selected + 1 < self.tasks.len() {
+                        self.selected += 1;
+                    }
+                    self.task_inspector_scroll = 0;
                 } else if self.active_role_tab.is_some() {
                     self.role_scroll = self.role_scroll.saturating_sub(1);
+                } else if self.panel == Panel::Tasks && self.task_pane_visible {
+                    self.task_inspector_scroll = self.task_inspector_scroll.saturating_sub(1);
                 } else if self.panel == Panel::Agents {
                     if self.selected_agent + 1 < self.agents.len() {
                         self.selected_agent += 1;
@@ -436,10 +490,15 @@ impl AppModel {
                     self.task_inspector_scroll = 0;
                 }
             }
+            Action::NextTab => self.cycle_tab(1),
+            Action::PreviousTab => self.cycle_tab(-1),
             Action::PageUp => {
                 if self.event_viewer {
                     self.event_scroll = self.event_scroll.saturating_sub(10);
                     self.event_follow = self.event_scroll == 0;
+                } else if self.task_pane_focused {
+                    self.selected = self.selected.saturating_sub(10);
+                    self.task_inspector_scroll = 0;
                 } else if self.active_role_tab.is_some() {
                     self.role_scroll = self.role_scroll.saturating_add(10);
                 } else if self.panel == Panel::Tasks {
@@ -453,6 +512,12 @@ impl AppModel {
                         .saturating_add(10)
                         .min(self.event_scroll_limit());
                     self.event_follow = self.event_scroll == 0;
+                } else if self.task_pane_focused {
+                    self.selected = self
+                        .selected
+                        .saturating_add(10)
+                        .min(self.tasks.len().saturating_sub(1));
+                    self.task_inspector_scroll = 0;
                 } else if self.active_role_tab.is_some() {
                     self.role_scroll = self.role_scroll.saturating_sub(10);
                 } else if self.panel == Panel::Tasks {
@@ -473,17 +538,14 @@ impl AppModel {
             Action::DeleteAgent => self.open_delete_confirmation(),
             Action::ShowTeam => self.select_tab(TabId::Team),
             Action::ShowTasks => self.select_tab(TabId::Tasks),
-            Action::OpenRoleTab => {
-                let id = if self.panel == Panel::Tasks && self.active_role_tab.is_none() {
-                    self.selected_task().map(|task| task.owner)
-                } else {
-                    self.agents.get(self.selected_agent).map(|agent| agent.id)
-                };
-                if let Some(id) = id {
-                    self.open_role_tab(id);
+            Action::ToggleTaskPane => {
+                self.task_pane_visible = !self.task_pane_visible;
+                self.task_pane_focused = self.task_pane_visible;
+                if self.task_pane_visible {
+                    self.task_layout.cancel_drag();
                 }
             }
-            Action::CloseRoleTab => {
+            Action::CloseTab => {
                 if let Some(id) = self.active_role_tab {
                     self.close_role_tab(id);
                 }
@@ -493,15 +555,6 @@ impl AppModel {
                 self.task_inspector_scroll = 0;
                 self.role_scroll = 0;
                 self.event_scroll = 0;
-            }
-            Action::NextPanel => {
-                let mut tabs = vec![TabId::Team, TabId::Tasks];
-                tabs.extend(self.role_tabs.iter().copied().map(TabId::Role));
-                let current = tabs
-                    .iter()
-                    .position(|tab| *tab == self.active_tab())
-                    .unwrap_or(0);
-                self.select_tab(tabs[(current + 1) % tabs.len()]);
             }
             Action::ToggleHelp => self.help = !self.help,
             Action::FocusComposer => {
@@ -562,6 +615,8 @@ impl AppModel {
                     if let TabId::Role(id) = hitbox.id {
                         self.close_role_tab(id);
                     }
+                } else if hitbox.id == TabId::Team {
+                    self.reduce(Action::ShowTeam);
                 } else {
                     self.select_tab(hitbox.id);
                 }
@@ -586,6 +641,45 @@ impl AppModel {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.composer_active = false;
         }
+        let point = (mouse.column, mouse.row).into();
+        if self.task_pane_visible && self.task_pane_hitbox.contains(point) {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.task_list_hitbox.contains(point) =>
+                {
+                    self.task_pane_focused = true;
+                    let row = usize::from(
+                        mouse
+                            .row
+                            .saturating_sub(self.task_list_hitbox.y.saturating_add(1)),
+                    );
+                    let index = self.task_window_start.saturating_add(row / 2);
+                    if index < self.tasks.len() {
+                        self.selected = index;
+                        self.task_inspector_scroll = 0;
+                    }
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.task_pane_focused = true;
+                    self.selected = self.selected.saturating_sub(1);
+                    self.task_inspector_scroll = 0;
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.task_pane_focused = true;
+                    if self.selected + 1 < self.tasks.len() {
+                        self.selected += 1;
+                    }
+                    self.task_inspector_scroll = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.task_pane_visible && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.task_pane_focused = false;
+        }
         if self.active_role_tab.is_some() {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.role_scroll = self.role_scroll.saturating_add(3),
@@ -595,7 +689,7 @@ impl AppModel {
             return;
         }
         if self.panel == Panel::Tasks {
-            if self.task_layout.handle_mouse(mouse) {
+            if !self.task_pane_visible && self.task_layout.handle_mouse(mouse) {
                 self.composer_active = false;
                 return;
             }
@@ -952,6 +1046,10 @@ impl AppModel {
                     self.composer.redo();
                     ComposerEvent::Consumed
                 }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ComposerEvent::Ignored
+                }
+                KeyCode::Tab | KeyCode::BackTab => ComposerEvent::Ignored,
                 _ => {
                     self.composer.input(*key);
                     ComposerEvent::Consumed
@@ -1228,7 +1326,7 @@ impl AppModel {
         let content = Text::from(lines);
         let notification = Notification::new(content)
             .level(level)
-            .anchor(Anchor::TopLeft)
+            .anchor(Anchor::TopRight)
             .margin(3)
             .animation(Animation::Fade)
             .auto_dismiss(if persistent {
@@ -1285,11 +1383,7 @@ impl AppModel {
         let role = sanitize(role).replace(['\n', '\t'], " ");
         let _ = self.notify(
             title,
-            &format!(
-                "{} · {} · {action} in [2] Tasks",
-                role,
-                short_task_id(task.id)
-            ),
+            &format!("{} · {} · {action} in Tasks", role, short_task_id(task.id)),
             level,
             accent,
             false,
@@ -1592,6 +1686,12 @@ impl AppModel {
             .find(|agent| agent.id == owner)
             .or_else(|| self.known_agents.get(&owner))
     }
+    fn agent_color(&self, agent: &AgentProfile) -> Color {
+        self.agents
+            .iter()
+            .position(|member| member.id == agent.id)
+            .map_or_else(|| role_color(&agent.role), theme::agent_color)
+    }
     fn event_scroll_limit(&self) -> u16 {
         self.events
             .iter()
@@ -1636,7 +1736,8 @@ pub const fn action_for_key(code: KeyCode) -> Action {
     match code {
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
-        KeyCode::Tab => Action::NextPanel,
+        KeyCode::Tab => Action::NextTab,
+        KeyCode::BackTab => Action::PreviousTab,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Enter => Action::FocusComposer,
         KeyCode::Char('r') => Action::RetryTask,
@@ -1654,10 +1755,10 @@ pub const fn action_for_key(code: KeyCode) -> Action {
         KeyCode::Char('c') => Action::AdjustTeam,
         KeyCode::Char('g') => Action::ChangeWorkspace,
         KeyCode::Char('a') => Action::AddAgent,
-        KeyCode::Delete => Action::DeleteAgent,
         KeyCode::Char('1') => Action::ShowTeam,
         KeyCode::Char('2') => Action::ShowTasks,
-        KeyCode::Char('t') => Action::OpenRoleTab,
+        KeyCode::Char('t') => Action::ToggleTaskPane,
+        KeyCode::Delete => Action::DeleteAgent,
         KeyCode::Char('w') => Action::ChangeWorkspace,
         KeyCode::Char('v') => Action::ToggleExpanded,
         KeyCode::Char('d') => Action::ToggleApprovalDetails,
@@ -1669,6 +1770,7 @@ pub const fn action_for_key(code: KeyCode) -> Action {
 
 fn action_for_event(value: Event) -> Action {
     match value {
+        Event::Key(key) if key.kind == KeyEventKind::Release => Action::None,
         Event::Key(key)
             if key.code == KeyCode::Char('c')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1689,7 +1791,12 @@ fn action_for_event(value: Event) -> Action {
         Event::Key(key)
             if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
-            Action::CloseRoleTab
+            Action::CloseTab
+        }
+        Event::Key(key)
+            if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            Action::PreviousTab
         }
         Event::Key(key) => action_for_key(key.code),
         Event::Mouse(mouse) => Action::Mouse(mouse),
@@ -2454,7 +2561,9 @@ async fn terminal_loop<R: Repository + 'static>(
                                 other => action_for_event(other),
                             };
                             match action {
-                                Action::RetryTask if model.panel == Panel::Tasks => {
+                                Action::RetryTask
+                                    if model.panel == Panel::Tasks || model.task_pane_focused =>
+                                {
                                     if model.retry_starting {
                                         model.warn("A task re-run is already being prepared.");
                                     } else if let Some(task) = model.selected_task().cloned() {
@@ -2696,12 +2805,31 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         .split(frame.area());
     render_tab_bar(frame, app, rows[0]);
 
-    if let Some(id) = app.active_role_tab {
-        render_role_workspace(frame, app, id, rows[1]);
+    app.task_inspector_hitbox = Rect::default();
+    app.task_expand_hitbox = Rect::default();
+    app.task_retry_hitbox = Rect::default();
+    let sidebar_visible = app.task_pane_visible && rows[1].width >= 40;
+    if sidebar_visible {
+        let [sidebar, gutter, workspace] = task_sidebar_panes(rows[1]);
+        app.task_pane_hitbox = sidebar;
+        frame.render_widget(Block::default().style(theme::canvas()), gutter);
+        render_task_sidebar(frame, app, sidebar);
+        match app.active_role_tab {
+            Some(id) => render_role_workspace(frame, app, id, workspace),
+            None if app.panel == Panel::Tasks => {
+                render_task_inspector(frame, app, workspace);
+            }
+            None => render_team(frame, app, workspace),
+        }
     } else {
-        match app.panel {
-            Panel::Agents => render_team(frame, app, rows[1]),
-            Panel::Tasks => render_tasks_workspace(frame, app, rows[1]),
+        app.task_pane_hitbox = Rect::default();
+        if let Some(id) = app.active_role_tab {
+            render_role_workspace(frame, app, id, rows[1]);
+        } else {
+            match app.panel {
+                Panel::Agents => render_team(frame, app, rows[1]),
+                Panel::Tasks => render_tasks_workspace(frame, app, rows[1]),
+            }
         }
     }
 
@@ -2848,9 +2976,15 @@ fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect
     let row = area.y;
     app.tab_hitboxes.clear();
     app.add_role_tab_hitbox = Rect::default();
+    app.team_tab_hitbox = Rect::default();
+    app.tasks_tab_hitbox = Rect::default();
     let active = app.active_tab();
-    for (id, label) in [(TabId::Team, "[1] Team"), (TabId::Tasks, "[2] Tasks")] {
-        let tab = menu_tab(label, active == id);
+    let fixed_tabs = [
+        (TabId::Team, " [1] Team ".to_owned()),
+        (TabId::Tasks, " [2] Tasks ".to_owned()),
+    ];
+    for (id, label) in fixed_tabs {
+        let tab = menu_tab(&label, active == id);
         let width = u16::try_from(Line::from(tab.content.as_ref()).width()).unwrap_or(u16::MAX);
         if x.saturating_add(width) > right {
             break;
@@ -2894,12 +3028,12 @@ fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect
             label,
             if active == TabId::Role(id) {
                 Style::default()
-                    .fg(theme::TEXT)
+                    .fg(app.agent_color(agent))
                     .bg(theme::BORDER)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(role_color(&agent.role))
+                    .fg(app.agent_color(agent))
                     .bg(theme::ELEVATED)
             },
         ));
@@ -2973,6 +3107,122 @@ fn render_role_workspace(
         ),
         area,
         &mut app.role_scroll,
+    );
+}
+
+fn task_sidebar_panes(area: Rect) -> [Rect; 3] {
+    let preferred = (area.width / 4).clamp(18, 32);
+    let sidebar = preferred.min(area.width.saturating_sub(25));
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(sidebar),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    [panes[0], panes[1], panes[2]]
+}
+
+fn render_task_sidebar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
+    app.task_list_hitbox = area;
+    app.task_inspector_hitbox = Rect::default();
+    app.task_expand_hitbox = Rect::default();
+    app.task_retry_hitbox = Rect::default();
+
+    let title = if app.task_pane_focused {
+        format!(" > Tasks · {} ", app.tasks.len())
+    } else {
+        format!(" Tasks · {} ", app.tasks.len())
+    };
+    let border_color = if app.task_pane_focused {
+        theme::AQUA
+    } else {
+        theme::BORDER
+    };
+    let block = panel(&title, app.task_pane_focused)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    if app.tasks.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No tasks yet",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from("Enter to start work"),
+            ])
+            .style(Style::default().fg(theme::TEXT))
+            .wrap(Wrap { trim: true })
+            .block(block),
+            area,
+        );
+        app.task_window_start = 0;
+        return;
+    }
+
+    app.selected = app.selected.min(app.tasks.len().saturating_sub(1));
+    let visible = usize::from(area.height.saturating_sub(2) / 2).max(1);
+    let start = app
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(app.tasks.len().saturating_sub(visible));
+    app.task_window_start = start;
+    let owner_width = usize::from(area.width.saturating_sub(6)).max(3);
+    let objective_width = usize::from(area.width.saturating_sub(4)).max(3);
+    let items = app
+        .tasks
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, task)| {
+            let (icon, _, color) = task_status_visual(task.status);
+            let (owner, owner_color) = app.agent_for_owner(task.owner).map_or_else(
+                || (short_agent_id(task.owner), theme::AQUA),
+                |agent| (sanitize(&agent.name), app.agent_color(agent)),
+            );
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{icon} "), Style::default().fg(color)),
+                    Span::styled(
+                        truncate_text(&owner, owner_width),
+                        Style::default()
+                            .fg(owner_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    truncate_text(&one_line(&sanitize(&task.objective)), objective_width),
+                    Style::default().fg(theme::MUTED),
+                )),
+            ];
+            ListItem::new(lines).style(if index == app.selected {
+                Style::default()
+                    .bg(theme::ELEVATED)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items).block(block), area);
+    let mut scrollbar = ScrollbarState::new(app.tasks.len().saturating_sub(visible) + 1)
+        .position(start)
+        .viewport_content_length(visible);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_style(Style::default().fg(theme::BORDER))
+            .thumb_style(Style::default().fg(theme::AQUA)),
+        area.inner(Margin {
+            horizontal: 0,
+            vertical: 1,
+        }),
+        &mut scrollbar,
     );
 }
 
@@ -3060,7 +3310,7 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                         (
                             sanitize(&agent.name),
                             role_icon(&agent.role),
-                            role_color(&agent.role),
+                            app.agent_color(agent),
                         )
                     },
                 );
@@ -3079,7 +3329,12 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
                             .fg(owner_color)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        owner,
+                        Style::default()
+                            .fg(owner_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(format!("  {icon} {status}"), Style::default().fg(color)),
                     Span::styled(
                         if task.attempt > 1 {
@@ -3124,6 +3379,11 @@ fn render_tasks_workspace(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, ar
         );
     }
 
+    render_task_inspector(frame, app, inspector);
+}
+
+fn render_task_inspector(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, inspector: Rect) {
+    app.task_inspector_hitbox = inspector;
     let Some(task) = app.selected_task().cloned() else {
         frame.render_widget(
             Paragraph::new("Select or create a task to inspect its work.")
@@ -3207,17 +3467,61 @@ fn render_chat(
     );
 }
 
+fn same_result_content(summary: &str, message: &str) -> bool {
+    let summary = one_line(&sanitize(summary)).to_lowercase();
+    let message = one_line(&sanitize(message)).to_lowercase();
+    !summary.is_empty()
+        && (summary == message || (summary.chars().count() >= 40 && message.contains(&summary)))
+}
+
+fn task_result_is_in_conversation(app: &AppModel, task: &Task) -> bool {
+    let Some(result) = &task.result else {
+        return false;
+    };
+    app.scoped_events.iter().any(|event| {
+        event.task_id == Some(task.id)
+            && event.conversational
+            && !event.details_only
+            && event.tool_call_id.is_none()
+            && (event.is_output || event.headline == Some("✓ Result"))
+            && same_result_content(
+                &result.summary,
+                event.text.strip_prefix("result: ").unwrap_or(&event.text),
+            )
+    })
+}
+
+fn task_output_is_in_conversation(event: &ScopedEvent) -> bool {
+    event.conversational && !event.details_only && event.tool_call_id.is_none()
+}
+
+fn conversation_result_repeats_output(app: &AppModel, event: &ScopedEvent) -> bool {
+    let result_message = event.text.strip_prefix("result: ").unwrap_or(&event.text);
+    app.scoped_events.iter().any(|output| {
+        output.task_id == event.task_id
+            && output.is_output
+            && task_output_is_in_conversation(output)
+            && same_result_content(result_message, &output.text)
+    })
+}
+
 fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let (icon, status, color) = task_status_visual(task.status);
     let agent = app.agent_for_owner(task.owner);
     let owner = agent.map_or_else(|| short_agent_id(task.owner), |agent| sanitize(&agent.name));
+    let owner_color = agent.map_or(theme::AQUA, |agent| app.agent_color(agent));
     lines.push(Line::from(vec![
         Span::styled(
             format!(" {icon} {status} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(owner, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            owner,
+            Style::default()
+                .fg(owner_color)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
     if !app.expanded_output {
         push_text_lines(
@@ -3226,12 +3530,14 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             " ",
         );
         if let Some(result) = &task.result {
-            push_section(&mut lines, "OUTCOME", theme::GREEN);
-            push_text_lines(
-                &mut lines,
-                &compact_text(&sanitize(&result.summary), false, false),
-                " ",
-            );
+            if !task_result_is_in_conversation(app, task) {
+                push_section(&mut lines, "OUTCOME", theme::GREEN);
+                push_text_lines(
+                    &mut lines,
+                    &compact_text(&sanitize(&result.summary), false, false),
+                    " ",
+                );
+            }
         } else if app.lead_reviews.contains_key(&task.id) {
             lines.push(Line::from(Span::styled(
                 " ↶ Awaiting reporting agent review",
@@ -3254,20 +3560,38 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
                     || short_agent_id(child.owner),
                     |agent| sanitize(&agent.name),
                 );
-                let parent = child
+                let parent_agent = child
                     .parent
                     .and_then(|id| app.tasks.iter().find(|task| task.id == id))
-                    .and_then(|task| app.agent_for_owner(task.owner))
-                    .map_or("Team Lead", |agent| agent.name.as_str());
+                    .and_then(|task| app.agent_for_owner(task.owner));
+                let parent = parent_agent.map_or("Team Lead", |agent| agent.name.as_str());
+                let parent_color = parent_agent.map_or(theme::TEXT, |agent| app.agent_color(agent));
+                let child_color = app
+                    .agent_for_owner(child.owner)
+                    .map_or(theme::AQUA, |agent| app.agent_color(agent));
                 let stage = if child.work.as_ref().is_some_and(|work| work.integration) {
                     " · integration"
                 } else {
                     ""
                 };
-                lines.push(Line::from(Span::styled(
-                    format!(" {icon} {} → {name}{stage} · {status}", sanitize(parent)),
-                    Style::default().fg(color),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                    Span::styled(
+                        sanitize(parent),
+                        Style::default()
+                            .fg(parent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" → "),
+                    Span::styled(
+                        name,
+                        Style::default()
+                            .fg(child_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(stage, Style::default().fg(theme::MUTED)),
+                    Span::styled(format!(" · {status}"), Style::default().fg(color)),
+                ]));
                 lines.push(Line::from(format!(
                     "   {}",
                     truncate_text(&one_line(&sanitize(&child.objective)), 90)
@@ -3328,6 +3652,7 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         .iter()
         .rev()
         .find(|e| e.task_id == Some(task.id) && e.is_output)
+        .filter(|output| !task_output_is_in_conversation(output))
     {
         push_section(
             &mut lines,
@@ -3369,14 +3694,18 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
         );
     }
 
-    if let Some(result) = &task.result {
+    if let Some(result) = &task.result
+        && (!task_result_is_in_conversation(app, task) || !result.evidence.is_empty())
+    {
         lines.push(Line::from(""));
         push_section(&mut lines, "RESULT", theme::GREEN);
-        push_text_lines(
-            &mut lines,
-            &compact_text(&sanitize(&result.summary), app.expanded_output, false),
-            "  ",
-        );
+        if !task_result_is_in_conversation(app, task) {
+            push_text_lines(
+                &mut lines,
+                &compact_text(&sanitize(&result.summary), app.expanded_output, false),
+                "  ",
+            );
+        }
         if !result.evidence.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!(
@@ -3490,7 +3819,7 @@ fn conversation_heading(app: &AppModel, selected: &Task) -> Line<'static> {
                 spans.push(Span::styled(
                     sanitize(&agent.name),
                     Style::default()
-                        .fg(role_color(&agent.role))
+                        .fg(app.agent_color(agent))
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -3585,9 +3914,12 @@ fn conversation_lines(
         {
             continue;
         }
+        if event.headline == Some("✓ Result") && conversation_result_repeats_output(app, event) {
+            continue;
+        }
         let color = app
             .agent_for_owner(event.speaker.unwrap_or(source.owner))
-            .map_or(event.accent, |agent| role_color(&agent.role));
+            .map_or(event.accent, |agent| app.agent_color(agent));
         let owner = app.agent_for_owner(source.owner).map_or_else(
             || short_agent_id(source.owner),
             |agent| sanitize(&agent.name),
@@ -3619,7 +3951,7 @@ fn conversation_lines(
             let heading = format!(" {owner}");
             let heading_color = app
                 .agent_for_owner(source.owner)
-                .map_or(theme::TEXT, |agent| role_color(&agent.role));
+                .map_or(theme::TEXT, |agent| app.agent_color(agent));
             for row in textwrap::wrap(&heading, usize::from(width.max(1))) {
                 lines.push(Line::from(Span::styled(
                     row.into_owned(),
@@ -3647,7 +3979,7 @@ fn conversation_lines(
                 label,
                 owner.len(),
                 app.agent_for_owner(target.owner)
-                    .map_or(theme::TEXT, |agent| role_color(&agent.role)),
+                    .map_or(theme::TEXT, |agent| app.agent_color(agent)),
             ));
         }
         if task.attempt > 1 && app.expanded_output {
@@ -3668,7 +4000,7 @@ fn conversation_lines(
                 reviewer_highlight = Some((
                     start..start + reviewer.len(),
                     app.agent_for_owner(review.reviewer)
-                        .map_or(theme::TEXT, |agent| role_color(&agent.role)),
+                        .map_or(theme::TEXT, |agent| app.agent_color(agent)),
                 ));
             }
             if let Some((approved, reason)) = &review.decision {
@@ -4160,12 +4492,13 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
         frame.render_widget(Clear, popup);
         let mut help = vec![
             help_section("NAVIGATION"),
-            Line::from("  1/2  Team / Tasks"),
-            Line::from("  Tab  Cycle tabs"),
+            Line::from("  1 / 2  Team / Tasks"),
+            Line::from("  Tab / ⇧Tab  Switch tabs"),
+            Line::from("  t  Show / hide task pane"),
             Line::from("  j/k  Browse"),
             Line::from("  Click  Select role"),
-            Line::from("  t / double-click  Open tab"),
-            Line::from("  Ctrl+W  Close tab"),
+            Line::from("  Double-click / +  Open agent tab"),
+            Line::from("  Ctrl+W  Close agent tab"),
             Line::from(""),
             help_section("TASKS & EVENTS"),
             Line::from("  e  Session events"),
@@ -4187,9 +4520,10 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
         if usize::from(popup.height) < help.len() + 4 {
             help = vec![
                 help_section("NAVIGATION"),
-                Line::from("  1/2 Team/Tasks · Tab cycle"),
+                Line::from("  1 Team · 2 Tasks · Tab/⇧Tab switch tabs"),
+                Line::from("  t show/hide task pane"),
                 Line::from("  j/k browse · Click select"),
-                Line::from("  t/double-click open · Ctrl+W close"),
+                Line::from("  Double-click / + agent tab · Ctrl+W close"),
                 Line::from(""),
                 help_section("TASKS & EVENTS"),
                 Line::from("  e events · v expand"),
@@ -5501,9 +5835,13 @@ mod tests {
         let mut a = AppModel::new(SessionId::new());
         a.reduce(Action::Down);
         assert_eq!(a.selected, 0);
-        a.reduce(Action::NextPanel);
+        a.reduce(Action::ToggleTaskPane);
+        assert!(!a.task_pane_visible);
+        a.reduce(Action::ShowTasks);
         assert_eq!(a.panel, Panel::Tasks);
-        a.reduce(Action::NextPanel);
+        a.reduce(Action::CloseTab);
+        assert_eq!(a.panel, Panel::Tasks);
+        a.reduce(Action::ShowTeam);
         assert_eq!(a.panel, Panel::Agents);
         a.reduce(Action::ToggleHelp);
         assert!(a.help)
@@ -5513,8 +5851,10 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('r')), Action::RetryTask);
         assert_eq!(action_for_key(KeyCode::Char('R')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('A')), Action::AddCredential);
+        assert_eq!(action_for_key(KeyCode::Tab), Action::NextTab);
+        assert_eq!(action_for_key(KeyCode::BackTab), Action::PreviousTab);
         assert_eq!(action_for_key(KeyCode::Enter), Action::FocusComposer);
-        assert_eq!(action_for_key(KeyCode::Char('t')), Action::OpenRoleTab);
+        assert_eq!(action_for_key(KeyCode::Char('t')), Action::ToggleTaskPane);
         assert_eq!(action_for_key(KeyCode::Char('b')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('o')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('/')), Action::None);
@@ -5531,6 +5871,7 @@ mod tests {
         assert_eq!(action_for_key(KeyCode::Char('S')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('1')), Action::ShowTeam);
         assert_eq!(action_for_key(KeyCode::Char('2')), Action::ShowTasks);
+        assert_eq!(action_for_key(KeyCode::Char('T')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('3')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('4')), Action::None);
         assert_eq!(action_for_key(KeyCode::Char('s')), Action::None);
@@ -5750,7 +6091,7 @@ mod tests {
         assert_eq!(app.tasks[0].id, newest.id);
         assert_eq!(app.tasks[1].id, older.id);
         assert_eq!(app.selected_task().map(|task| task.id), Some(newest.id));
-        app.panel = Panel::Tasks;
+        app.select_tab(TabId::Tasks);
         app.reduce(Action::Down);
         assert_eq!(app.selected_task().map(|task| task.id), Some(older.id));
         app.reduce(Action::Up);
@@ -5815,7 +6156,7 @@ mod tests {
             vec![parent_id, child_id, grandchild_id]
         );
         app.selected = 0;
-        app.panel = Panel::Tasks;
+        app.select_tab(TabId::Tasks);
 
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6335,7 +6676,7 @@ mod tests {
         app.team_lead = Some(lead.id);
         app.agents = vec![lead, specialist];
         app.selected_agent = 1;
-        app.reduce(Action::OpenRoleTab);
+        app.open_role_tab(specialist_id);
         assert_eq!(app.active_tab(), TabId::Role(specialist_id));
         assert!(
             app.routed_objective("Build an API")
@@ -6353,8 +6694,8 @@ mod tests {
             .map(|x| buffer[(x, 0)].symbol())
             .collect::<String>();
         assert!(
-            header.contains("[1] Team")
-                && header.contains("[2] Tasks")
+            header.contains("Team")
+                && header.contains("Tasks")
                 && header.contains("Linus ×")
                 && !header.contains('|'),
             "{header}"
@@ -6375,32 +6716,30 @@ mod tests {
         )));
         assert_eq!(app.active_tab(), TabId::Team);
         assert!(app.role_tabs.is_empty());
-        app.reduce(Action::CloseRoleTab);
+        app.reduce(Action::CloseTab);
         assert_eq!(app.active_tab(), TabId::Team);
     }
 
     #[test]
-    fn fixed_tabs_and_role_tabs_cycle_without_closing_fixed_tabs() {
+    fn tasks_tab_is_always_open_and_cannot_be_closed() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("Ada", "technical_lead", vec![]);
         let lead_id = lead.id;
         app.team_lead = Some(lead_id);
         app.agents = vec![lead];
-        app.reduce(Action::OpenRoleTab);
+        app.open_role_tab(lead_id);
         app.reduce(Action::ShowTeam);
-        app.reduce(Action::NextPanel);
-        assert_eq!(app.active_tab(), TabId::Tasks);
-        app.reduce(Action::NextPanel);
-        assert_eq!(app.active_tab(), TabId::Role(lead_id));
-        app.reduce(Action::CloseRoleTab);
-        assert_eq!(app.active_tab(), TabId::Team);
         app.reduce(Action::ShowTasks);
-        app.reduce(Action::CloseRoleTab);
         assert_eq!(app.active_tab(), TabId::Tasks);
+        app.reduce(Action::CloseTab);
+        assert_eq!(app.active_tab(), TabId::Tasks);
+        assert!(app.role_tabs.contains(&lead_id));
+        app.reduce(Action::ShowTeam);
+        assert_eq!(app.active_tab(), TabId::Team);
     }
 
     #[test]
-    fn cycling_tabs_preserves_rendered_order_and_click_targets() {
+    fn fixed_task_tab_and_role_tabs_preserve_rendered_order() {
         let mut app = AppModel::new(SessionId::new());
         let lead = agent("pashaaaaa", "technical_lead", vec![]);
         let frontend = agent("Frontend Agent", "frontend_developer", vec![]);
@@ -6411,6 +6750,7 @@ mod tests {
             TabId::Role(frontend.id),
         ];
         app.agents = vec![lead, frontend];
+        app.select_tab(TabId::Tasks);
         app.open_role_tab(app.agents[0].id);
         app.open_role_tab(app.agents[1].id);
         app.select_tab(order[2]);
@@ -6426,7 +6766,7 @@ mod tests {
             order
         );
         for expected in [order[3], order[0], order[1], order[2]] {
-            app.reduce(Action::NextPanel);
+            app.select_tab(expected);
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             assert_eq!(app.active_tab(), expected);
             assert_eq!(
@@ -6457,16 +6797,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_tabs_remain_visible_on_a_narrow_terminal() {
+    fn tasks_tab_is_always_shown() {
         let mut app = AppModel::new(SessionId::new());
         let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let header = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
-        assert!(
-            header.contains("[1] Team") && header.contains("[2] Tasks"),
-            "{header}"
-        );
+        assert!(header.contains("Team"), "{header}");
+        assert!(header.contains("Tasks"), "{header}");
         assert!(!app.team_tab_hitbox.is_empty());
         assert!(!app.tasks_tab_hitbox.is_empty());
     }
@@ -6627,7 +6965,7 @@ mod tests {
             app.action_for_mouse(
                 mouse(
                     MouseEventKind::Down(MouseButton::Left),
-                    app.tasks_tab_hitbox.x + 2,
+                    app.tasks_tab_hitbox.x + 1,
                     app.tasks_tab_hitbox.y,
                 ),
                 Rect::new(0, 0, 100, 30),
@@ -6648,7 +6986,7 @@ mod tests {
         );
         app.reduce(Action::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            app.tasks_tab_hitbox.x + 2,
+            app.tasks_tab_hitbox.x + 1,
             app.tasks_tab_hitbox.y,
         )));
         assert_eq!(app.panel, Panel::Tasks);
@@ -6966,10 +7304,9 @@ mod tests {
         assert!(rendered.contains("Model · qwen-test"));
         assert!(rendered.contains("4096 token limit"));
         assert!(!rendered.contains("no delegation"));
-        assert!(
-            rendered.contains("[1] Team") && rendered.contains("[2] Tasks"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Team"), "{rendered}");
+        assert!(rendered.contains("Tasks · 0"), "{rendered}");
+        assert!(rendered.contains("Tasks"), "{rendered}");
         assert!(!rendered.contains("[3 Events]"), "{rendered}");
         assert!(rendered.contains("voff · ses_"), "{rendered}");
         assert!(!rendered.contains("Team view"), "{rendered}");

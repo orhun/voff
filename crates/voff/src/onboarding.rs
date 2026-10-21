@@ -2445,18 +2445,21 @@ pub(crate) fn render_team_building_screen(
                 let role = parent
                     .map(|parent| format!("reports to {parent}"))
                     .or_else(|| (index == 0).then(|| "lead".to_owned()));
-                (name, role)
+                (name, role, theme::agent_color(index))
             })
             .collect::<Vec<_>>();
         let name_width = members
             .iter()
-            .map(|(name, _)| Line::from(name.as_str()).width())
+            .map(|(name, _, _)| Line::from(name.as_str()).width())
             .max()
             .unwrap_or_default();
-        for (name, role) in members {
+        for (name, role, color) in members {
             let name_padding = name_width.saturating_sub(Line::from(name.as_str()).width()) + 1;
             let mut member = vec![
-                Span::styled(name, Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    name,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" ".repeat(name_padding)),
             ];
             if let Some(role) = role {

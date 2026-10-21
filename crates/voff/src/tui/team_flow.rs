@@ -29,7 +29,7 @@ struct AgentCard {
     response: Option<String>,
     status: &'static str,
     status_color: Color,
-    role_color: Color,
+    agent_color: Color,
     display_level: u8,
 }
 
@@ -81,7 +81,7 @@ impl AgentCard {
         let identity = Line::from(Span::styled(
             self.identity.as_str(),
             Style::default()
-                .fg(self.role_color)
+                .fg(self.agent_color)
                 .add_modifier(Modifier::BOLD),
         ));
         let mut lines = vec![identity];
@@ -155,7 +155,7 @@ impl NodeContent for AgentCard {
                 .fg(if live_pulse {
                     self.status_color
                 } else {
-                    self.role_color
+                    self.agent_color
                 })
                 .add_modifier(Modifier::BOLD)
         } else if matches!(self.status, "approval" | "ready" | "queued") {
@@ -228,7 +228,7 @@ impl TeamFlow {
         if expected_ids != self.agent_ids {
             self.rebuild_nodes(&snapshot, selected, area);
         } else {
-            for agent in snapshot.agents {
+            for (index, agent) in snapshot.agents.iter().enumerate() {
                 if let Some(content) = self.flow.node_content_mut(&node_id(agent.id)) {
                     let max_width = content.max_width;
                     *content = agent_card(
@@ -237,6 +237,7 @@ impl TeamFlow {
                         snapshot.approvals,
                         snapshot.responses,
                         snapshot.provider_kinds,
+                        theme::agent_color(index),
                     );
                     content.max_width = max_width;
                 }
@@ -384,6 +385,7 @@ impl TeamFlow {
                             snapshot.approvals,
                             snapshot.responses,
                             snapshot.provider_kinds,
+                            theme::agent_color(index),
                         )
                     },
                 )
@@ -570,6 +572,7 @@ fn agent_card(
     approvals: &[Approval],
     responses: &HashMap<AgentId, String>,
     provider_kinds: &HashMap<AgentId, String>,
+    agent_color: Color,
 ) -> AgentCard {
     let pending = pending_delegation_for_target(approvals, &agent.name);
     let (status, status_color) = agent_status(tasks, agent, pending.is_some());
@@ -627,7 +630,7 @@ fn agent_card(
         response,
         status,
         status_color,
-        role_color: role_color(&agent.role),
+        agent_color,
         display_level: 2,
     }
 }
@@ -1205,7 +1208,7 @@ mod geometry_tests {
             response: None,
             status: "complete",
             status_color: theme::GREEN,
-            role_color: theme::YELLOW,
+            agent_color: theme::YELLOW,
             display_level: 2,
         };
         assert_eq!(card.desired_height(28), 6);
@@ -1236,7 +1239,7 @@ mod geometry_tests {
             )),
             status: "working",
             status_color: theme::GREEN,
-            role_color: theme::YELLOW,
+            agent_color: theme::YELLOW,
             display_level: 2,
         };
         let lines = card.lines(0, 26);

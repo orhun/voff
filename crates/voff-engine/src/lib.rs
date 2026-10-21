@@ -707,6 +707,11 @@ impl<R: Repository + 'static> Engine<R> {
         let delegation_targets = self
             .enabled_delegation_targets(&agent.allowed_targets)
             .await?;
+        let qualified_verification_targets = delegation_targets
+            .iter()
+            .filter(|target| target.tools.iter().any(|tool| tool == "process.test"))
+            .map(|target| target.name.as_str())
+            .collect::<Vec<_>>();
         let delegation_target_names = delegation_targets
             .iter()
             .map(|target| target.name.clone())
@@ -752,6 +757,33 @@ impl<R: Repository + 'static> Engine<R> {
             format!(
                 "{owner_prompt}\n\nClassify the request before acting. Answer simple questions directly from available evidence without delegation or workspace changes. Only propose implementation tools when the user requests implementation; never claim unperformed work or checks as complete."
             )
+        } else {
+            owner_prompt
+        };
+        let owner_prompt = if mode == RunMode::Work
+            && task.work.is_some()
+            && !agent.tools.iter().any(|tool| tool == "process.test")
+            && integrated::verification_kind(&task).is_some()
+        {
+            match (can_delegate, qualified_verification_targets.as_slice()) {
+                (false, _) | (_, []) => format!(
+                    "{owner_prompt}\n\nYou do not have process.test and no permitted verification handoff is available. Do not say the user forbids checks unless they explicitly did. If this request requires verification, explain the actual capability or delegation-limit blocker and call task.blocked."
+                ),
+                (true, targets) => {
+                    if integrated::verification_only(&task) {
+                        format!(
+                            "{owner_prompt}\n\nVERIFICATION HANDOFF REQUIRED: this request is verification-only and needs {:?}. Your process.test is unavailable. Use task.delegate to select exactly one of these enabled direct reports: {}. The original objective and acceptance criteria will be carried through. Do not claim blocked or complete before the report returns.",
+                            integrated::verification_kind(&task).expect("checked above"),
+                            targets.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "{owner_prompt}\n\nVERIFICATION CAPABILITY: this implementation requires {:?}, but you do not have process.test. Include an enabled report with process.test in the contract-first delegation plan for the appropriate verification. Do not claim blocked solely because your own profile lacks the tool.",
+                            integrated::verification_kind(&task).expect("checked above")
+                        )
+                    }
+                }
+            }
         } else {
             owner_prompt
         };
@@ -1084,6 +1116,60 @@ impl<R: Repository + 'static> Engine<R> {
                                 "task.blocked requires a concrete reason".into(),
                             ));
                         }
+                        let blocker = reason.to_lowercase();
+                        let reports_missing_process_test = blocker.contains("process.test")
+                            && [
+                                "not available",
+                                "isn't available",
+                                "unavailable",
+                                "lack",
+                                "do not have",
+                                "don't have",
+                                "does not have",
+                                "missing",
+                            ]
+                            .iter()
+                            .any(|phrase| blocker.contains(phrase));
+                        if mode == RunMode::Work
+                            && integrated::verification_only(&task)
+                            && reports_missing_process_test
+                            && !agent.tools.iter().any(|tool| tool == "process.test")
+                            && can_delegate
+                            && let Some(target) = delegation_targets.iter().find(|target| {
+                                target.tools.iter().any(|tool| tool == "process.test")
+                            })
+                        {
+                            let assignment = serde_json::json!({
+                                "target_agent": target.name
+                            })
+                            .to_string();
+                            self.record(
+                                Some(id),
+                                CanonicalEventKind::ProviderWarning(format!(
+                                    "Provider reported a blocker despite an enabled verification report; proposing the available handoff: {}.",
+                                    target.name
+                                )),
+                            )
+                            .await?;
+                            self.record(
+                                Some(id),
+                                CanonicalEventKind::ToolProposed {
+                                    tool_call_id: request.id,
+                                    name: "task.delegate".into(),
+                                },
+                            )
+                            .await?;
+                            self.request_approval(
+                                id,
+                                request.id,
+                                "task.plan".into(),
+                                ".".into(),
+                                assignment,
+                            )
+                            .await?;
+                            waiting_approval = true;
+                            continue;
+                        }
                         self.record(
                             Some(id),
                             CanonicalEventKind::ProviderFailed(format!(
@@ -1263,8 +1349,8 @@ impl<R: Repository + 'static> Engine<R> {
             self.record(Some(id), kind).await?;
         }
         if !waiting_approval {
-            if task.work.is_some() && (task.parent.is_some() || self.has_work_actions(id).await?) {
-                return Err(EngineError::InvalidDelegationPlan("work requires task.complete with verification evidence; prose is not completion".into()));
+            if task.work.is_some() {
+                return Err(EngineError::InvalidDelegationPlan("work requires an approved task.complete with evidence; prose is not completion".into()));
             }
             if response_text.trim().is_empty() {
                 return Err(EngineError::InvalidDelegationPlan(
@@ -1669,7 +1755,7 @@ impl<R: Repository + 'static> Engine<R> {
                         "parent requires completed implementations and integration".into(),
                     ));
                 }
-            } else if current.parent.is_some() || self.has_work_actions(id).await? {
+            } else {
                 let approval = self
                     .repo
                     .approvals(self.session)

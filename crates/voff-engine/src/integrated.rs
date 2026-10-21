@@ -1,7 +1,24 @@
 //! Contract-first plans and evidence-gated multi-step work.
 use super::*;
 
-pub(super) const WORK_INSTRUCTIONS: &str = "For implementation, if you have direct reports, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified direct report. Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. Integration waits for all implementations. Do not delegate simple questions. Plan a runnable, in-scope verification file for each implementation worker before dispatch; do not rely on a future integration task for a worker's checks. For Python unittest discovery, a worker must own a root test_*.py file: tests inside server.py are not discovered. Keep file ownership disjoint. Workers: produce actual project files, not a script that generates an unexecuted application. You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. Completion requires a successful test suite after the last workspace patch, plus reporting-agent acceptance review. Tests run at the workspace root: provide a root test harness that exercises the relevant components together. Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. If a missing test file, denied repair, or unavailable check makes the task impossible within its existing scope, call task.blocked with a concrete reason; do not return only prose or claim completion. Never claim generated tests were executed. The task has at most 32 turns across retries.";
+pub(super) const WORK_INSTRUCTIONS: &str = concat!(
+    "For implementation, if you have direct reports, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified direct report. ",
+    "Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. ",
+    "Integration waits for all implementations. Do not delegate simple questions. ",
+    "Workers: produce actual project files, not a script that generates an unexecuted application. ",
+    "You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. ",
+    "Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. ",
+    "When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. ",
+    "Run verification appropriate to the user's request: use a test command for an explicit test request, a build/check command for a build or compile request, and do not run tests for read-only questions. After an approved workspace patch, run the appropriate verification before completion. ",
+    "Do not invent test harnesses or test files just to satisfy a generic verification requirement. ",
+    "Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. ",
+    "For a verification-only request, use a single task.delegate assignment to an enabled direct report with process.test when you do not have that tool yourself. ",
+    "For implementation work, include an enabled qualified report in the contract-first plan to run the appropriate verification. ",
+    "The process.test tool is approval-gated; lack of arbitrary shell access does not mean verification is forbidden. ",
+    "Do not report a blocker solely because you personally lack process.test when a qualified enabled report can run it. ",
+    "If no qualified report can run it, or an approval is denied, call task.blocked with a concrete reason; do not return only prose or claim completion. ",
+    "Never claim generated tests were executed. The task has at most 32 turns across retries."
+);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,15 +28,158 @@ struct Plan {
     integration: DelegationProposal,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkDelegation {
+    Plan(Plan),
+    Verification(VerificationAssignment),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationAssignment {
+    target_agent: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum VerificationKind {
+    Tests,
+    Build,
+}
+
+/// Select the verification the user actually requested. Read-only requests do
+/// not need an unrelated test run; implementation requests retain test-suite
+/// verification as the default.
+pub(super) fn verification_kind(task: &Task) -> Option<VerificationKind> {
+    verification_kind_for_objective(&task.objective)
+}
+
+fn is_implementation_objective(objective: &str) -> bool {
+    let objective = objective.to_lowercase();
+    [
+        "implement",
+        "add ",
+        "create",
+        "fix ",
+        "update",
+        "change",
+        "remove",
+        "refactor",
+        "support",
+        "make ",
+        "build a ",
+        "build the ",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase))
+}
+
+pub(super) fn verification_only(task: &Task) -> bool {
+    verification_kind(task).is_some() && !is_implementation_objective(&task.objective)
+}
+
+fn verification_kind_for_objective(objective: &str) -> Option<VerificationKind> {
+    let objective = objective.to_lowercase();
+    if [
+        "do not run commands",
+        "don't run commands",
+        "do not execute commands",
+        "don't execute commands",
+        "without running commands",
+        "commands are forbidden",
+        "not allowed to run commands",
+        "no commands",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase))
+    {
+        return None;
+    }
+    let explicitly_skips_tests = [
+        "do not run test",
+        "don't run test",
+        "do not execute test",
+        "don't execute test",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase));
+    let explicit_test_run = [
+        "run test",
+        "execute test",
+        "check test",
+        "verify test",
+        "test suite",
+        "unit test",
+        "integration test",
+        "cargo test",
+        "npm test",
+        "node --test",
+        "unittest",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase))
+        && !explicitly_skips_tests;
+    if explicit_test_run {
+        return Some(VerificationKind::Tests);
+    }
+
+    let build_check = [
+        "build",
+        "compile",
+        "cargo check",
+        "clippy",
+        "examples",
+        "check ",
+        "check the",
+        "check if",
+        "check whether",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase));
+    if build_check {
+        return Some(VerificationKind::Build);
+    }
+
+    let implementation = [
+        "implement",
+        "add ",
+        "create",
+        "fix ",
+        "update",
+        "change",
+        "remove",
+        "refactor",
+        "support",
+        "make ",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase));
+    implementation.then_some(VerificationKind::Tests)
+}
+
+fn verification_command_matches(kind: VerificationKind, command: &str) -> bool {
+    let test_command = matches!(
+        command,
+        "cargo test" | "python3 -m unittest discover" | "node --test" | "npm test"
+    );
+    let build_command = matches!(
+        command,
+        "cargo check" | "cargo clippy" | "cargo fmt --check" | "npm run build"
+    );
+    match kind {
+        VerificationKind::Tests => test_command,
+        VerificationKind::Build => test_command || build_command,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use voff_storage::InMemoryRepository;
 
     #[test]
-    fn plan_requires_worker_owned_discoverable_checks_and_an_explicit_blocker_path() {
-        assert!(WORK_INSTRUCTIONS.contains("root test_*.py"));
-        assert!(WORK_INSTRUCTIONS.contains("before dispatch"));
+    fn plan_requires_request_appropriate_verification_and_an_explicit_blocker_path() {
+        assert!(WORK_INSTRUCTIONS.contains("verification-only request"));
         assert!(WORK_INSTRUCTIONS.contains("task.blocked"));
         let mut tools = Vec::new();
         configure_tools(&mut tools, &[], 0);
@@ -350,23 +510,33 @@ struct CriterionEvidence {
 
 pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String], limit: u16) {
     tools.retain(|tool| {
-        tool.name != "review.request" && !(tool.name == "task.delegate" && limit < 2)
+        tool.name != "review.request" && !(tool.name == "task.delegate" && limit == 0)
     });
     if let Some(tool) = tools.iter_mut().find(|tool| tool.name == "task.delegate") {
         let item = serde_json::json!({"type":"object","properties":{
             "target_agent":{"type":"string","enum":targets},"objective":{"type":"string"},
             "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
         },"required":["target_agent","objective","acceptance_criteria"],"additionalProperties":false});
-        tool.description = "Plan related implementations against one shared interface contract and assign a final integration task. Integration waits for every implementation and counts toward the child limit. All targets must have process.test; never invent capabilities.".into();
-        tool.input_schema = serde_json::json!({"type":"object","properties":{
-            "shared_contract":{"type":"string"},
-            "proposals":{"type":"array","minItems":1,"maxItems":limit.saturating_sub(1),"items":item},
-            "integration":item
-        },"required":["shared_contract","proposals","integration"],"additionalProperties":false}).to_string();
+        let verification = serde_json::json!({"type":"object","properties":{
+            "target_agent":{"type":"string","enum":targets}
+        },"required":["target_agent"],"additionalProperties":false});
+        let mut alternatives = vec![verification];
+        if limit >= 2 {
+            alternatives.insert(
+                0,
+                serde_json::json!({"type":"object","properties":{
+                    "shared_contract":{"type":"string"},
+                    "proposals":{"type":"array","minItems":1,"maxItems":limit.saturating_sub(1),"items":item},
+                    "integration":item
+                },"required":["shared_contract","proposals","integration"],"additionalProperties":false}),
+            );
+        }
+        tool.description = "For a verification-only request, assign one enabled direct report with process.test. For implementation work, plan related implementations against a shared contract and include an integration task. Assignments require approval; never invent capabilities.".into();
+        tool.input_schema = serde_json::json!({"type":"object","oneOf": alternatives}).to_string();
     }
     tools.push(ToolDefinition {
         name: "task.complete".into(),
-        description: "Request final acceptance review after actual verification. Cite persisted artifact IDs for each zero-based acceptance criterion; a patch alone cannot complete work.".into(),
+        description: "Request final acceptance with evidence for every criterion. Run the verification appropriate to the request, when required, and cite persisted artifact IDs. A patch alone cannot complete work.".into(),
         input_schema: serde_json::json!({"type":"object","properties":{
             "summary":{"type":"string"},"evidence":{"type":"array","items":{
                 "type":"object","properties":{"criterion":{"type":"integer","minimum":0},
@@ -397,7 +567,45 @@ impl<R: Repository + 'static> Engine<R> {
         if !agent.tools.iter().any(|tool| tool == "task.delegate") {
             return Err(invalid("task owner cannot delegate"));
         }
-        let plan: Plan = serde_json::from_str(json)?;
+        let delegation: WorkDelegation = serde_json::from_str(json)?;
+        let plan = match delegation {
+            WorkDelegation::Verification(assignment) => {
+                if !verification_only(task) {
+                    return Err(invalid(
+                        "single-report delegation is only for a verification-only objective",
+                    ));
+                }
+                if self
+                    .repo
+                    .tasks()
+                    .await?
+                    .iter()
+                    .any(|child| child.parent == Some(task.id))
+                {
+                    return Err(invalid(
+                        "task already dispatched a plan; do not duplicate work",
+                    ));
+                }
+                let proposal = DelegationProposal {
+                    target_agent: assignment.target_agent,
+                    objective: task.objective.clone(),
+                    acceptance_criteria: task.acceptance_criteria.clone(),
+                };
+                self.validate_delegation_proposals(task, agent, std::slice::from_ref(&proposal))
+                    .await?;
+                let target = self
+                    .delegation_target(&proposal.target_agent)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?;
+                if !target.tools.iter().any(|tool| tool == "process.test") {
+                    return Err(invalid(
+                        "verification owner must have process.test; choose an enabled qualified report",
+                    ));
+                }
+                return Ok(());
+            }
+            WorkDelegation::Plan(plan) => plan,
+        };
         if plan.shared_contract.trim().is_empty()
             || plan.shared_contract.len() > 32_768
             || plan.proposals.is_empty()
@@ -436,9 +644,11 @@ impl<R: Repository + 'static> Engine<R> {
                 .delegation_target(&proposal.target_agent)
                 .await?
                 .ok_or(EngineError::TaskNotFound)?;
-            if !target.tools.iter().any(|tool| tool == "process.test") {
+            if verification_kind_for_objective(&proposal.objective).is_some()
+                && !target.tools.iter().any(|tool| tool == "process.test")
+            {
                 return Err(invalid(
-                    "selected task owner cannot run verification; choose a qualified enabled owner with process.test",
+                    "selected task owner cannot run the requested verification; choose a qualified enabled owner with process.test",
                 ));
             }
             if index + 1 == proposals.len() && !target.tools.iter().any(|tool| tool == "file.patch")
@@ -470,7 +680,41 @@ impl<R: Repository + 'static> Engine<R> {
             .ok_or(EngineError::TaskNotFound)?;
         self.validate_integrated_plan(&parent, &agent, &approval.reason)
             .await?;
-        let plan: Plan = serde_json::from_str(&approval.reason)?;
+        let delegation: WorkDelegation = serde_json::from_str(&approval.reason)?;
+        let plan = match delegation {
+            WorkDelegation::Verification(assignment) => {
+                let mut child = self
+                    .delegate_task(
+                        parent.id,
+                        self.delegation_target(&assignment.target_agent)
+                            .await?
+                            .ok_or(EngineError::TaskNotFound)?
+                            .id,
+                        parent.objective.clone(),
+                        parent.acceptance_criteria.clone(),
+                    )
+                    .await?;
+                child.work = Some(WorkProgress {
+                    contract: format!("Verification delegated from parent task {}", parent.id),
+                    integration: true,
+                    turns: 0,
+                });
+                self.repo.save_task(child.clone()).await?;
+                self.events
+                    .send(EngineEvent::TaskUpdated(child))
+                    .await
+                    .map_err(|_| EngineError::ChannelClosed)?;
+                self.record(
+                    Some(parent.id),
+                    CanonicalEventKind::ProviderWarning(
+                        "Verification was delegated to the approved qualified report.".into(),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            WorkDelegation::Plan(plan) => plan,
+        };
         let mut implementations = Vec::new();
         let count = plan.proposals.len();
         for (index, proposal) in plan
@@ -511,15 +755,6 @@ impl<R: Repository + 'static> Engine<R> {
         }
         self.record(Some(parent.id), CanonicalEventKind::ProviderWarning("Shared contract dispatched; integration is gated on all implementation results. Patch approval is progress, not task completion.".into())).await?;
         Ok(())
-    }
-
-    pub(super) async fn has_work_actions(&self, id: TaskId) -> Result<bool, EngineError> {
-        Ok(self
-            .repo
-            .approvals(self.session)
-            .await?
-            .iter()
-            .any(|approval| approval.task_id == id && approval.action != "provider.continue"))
     }
 
     pub(super) async fn work_context(&self, task: &Task) -> Result<String, EngineError> {
@@ -609,7 +844,8 @@ impl<R: Repository + 'static> Engine<R> {
         // A later patch anywhere in this shared session invalidates earlier test
         // evidence. Both failed checks and incomplete verification fail closed.
         let approvals = self.repo.approvals(self.session).await?;
-        let mut tested = false;
+        let mut verification = false;
+        let mut required_verification = verification_kind(task);
         for event in self.repo.events(self.session).await? {
             match event.kind {
                 CanonicalEventKind::ApprovalDecided {
@@ -619,22 +855,25 @@ impl<R: Repository + 'static> Engine<R> {
                     .iter()
                     .any(|a| a.id == approval_id && a.action == "file.patch") =>
                 {
-                    tested = false
+                    if required_verification.is_none() {
+                        required_verification = Some(VerificationKind::Tests);
+                    }
+                    verification = false;
                 }
                 CanonicalEventKind::ProcessFinished {
                     program, exit_code, ..
-                } if event.task_id == Some(task.id) => {
-                    tested = matches!(
-                        program.as_str(),
-                        "cargo test" | "python3 -m unittest discover" | "node --test" | "npm test"
-                    ) && exit_code == Some(0);
+                } if event.task_id == Some(task.id)
+                    && required_verification
+                        .is_some_and(|kind| verification_command_matches(kind, &program)) =>
+                {
+                    verification = exit_code == Some(0);
                 }
                 _ => {}
             }
         }
-        if !tested {
+        if required_verification.is_some() && !verification {
             return Err(invalid(
-                "completion requires a successful test suite after the latest workspace patch",
+                "completion requires successful verification appropriate to the request after the latest workspace patch",
             ));
         }
         evidence.extend(
