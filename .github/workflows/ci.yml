@@ -27,6 +27,11 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -44,6 +49,11 @@ jobs:
         with:
           components: clippy
 
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -58,6 +68,11 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
 
       - name: Run tests
         run: cargo test --workspace --all-features
