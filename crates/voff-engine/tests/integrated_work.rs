@@ -88,8 +88,14 @@ impl ModelProvider for Team {
                     "file.patch",
                     serde_json::json!({"path":"src/lib.rs","replacement":"#[test] fn contract() { assert_eq!(include_str!(\"../client.txt\"), include_str!(\"../server.txt\")); assert_eq!(include_str!(\"../server.txt\"), \"port=8000\"); }"}),
                 ),
-                ("components", 3) => ("process.test", serde_json::json!({"command":"cargo test"})),
-                ("integrate", 4) => ("process.test", serde_json::json!({"command":"cargo test"})),
+                ("components", 3) => (
+                    "process.test",
+                    serde_json::json!({"program":"cargo","args":["test"],"purpose":"Run the assigned tests","verification":true}),
+                ),
+                ("integrate", 4) => (
+                    "process.test",
+                    serde_json::json!({"program":"cargo","args":["test"],"purpose":"Verify the integrated changes","verification":true}),
+                ),
                 _ => {
                     let evidence = self
                         .repo

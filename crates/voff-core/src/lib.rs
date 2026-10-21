@@ -274,7 +274,13 @@ pub enum CanonicalEventKind {
     },
     Usage {
         input_tokens: u64,
+        /// Cached input tokens are included in `input_tokens`.
+        #[serde(default)]
+        cached_input_tokens: u64,
         output_tokens: u64,
+        /// Effective provider model, when reported by the provider.
+        #[serde(default)]
+        model: Option<String>,
     },
     ProviderCompleted,
     ProviderFailed(String),
@@ -330,6 +336,8 @@ pub enum CanonicalEventKind {
     },
     ProcessFinished {
         program: String,
+        #[serde(default)]
+        verification: bool,
         exit_code: Option<i32>,
         truncated: bool,
     },

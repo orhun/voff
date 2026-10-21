@@ -36,6 +36,7 @@ textwrap = { version = "0.16.4", default-features = false, features = ["unicode-
 unicode-width = "0.2.2"
 tokio-util.workspace = true
 tui-piechart = "1.1.0"
+voff-prompts = { version = "0.1.0-beta.1", path = "../voff-prompts" }
 [lints]
 workspace = true
 [dev-dependencies]

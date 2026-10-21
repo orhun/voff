@@ -144,8 +144,7 @@ async fn application(cli: Cli) -> Result<()> {
                     config_root.join(path)
                 }
             });
-            let mut setup_prompts = parsed.setup_prompts.clone();
-            setup_prompts.upgrade_legacy_defaults();
+            let setup_prompts = parsed.setup_prompts.clone();
             (
                 setup_from_file(parsed)?,
                 configured_workspace,
@@ -311,8 +310,7 @@ fn load_workspace_setup_config(
         .with_context(|| format!("could not read config {}", path.display()))?;
     let parsed: FileConfig = toml::from_str(&source)
         .with_context(|| format!("invalid TOML config {}", path.display()))?;
-    let mut setup_prompts = parsed.setup_prompts.clone();
-    setup_prompts.upgrade_legacy_defaults();
+    let setup_prompts = parsed.setup_prompts.clone();
     Ok((setup_from_file(parsed)?, setup_prompts))
 }
 
@@ -1224,6 +1222,7 @@ fn provider(
             MockStep::Event(voff_provider::ProviderEvent::Usage(voff_provider::Usage {
                 input_tokens: 4,
                 output_tokens: 3,
+                ..voff_provider::Usage::default()
             })),
             MockStep::Event(voff_provider::ProviderEvent::Completed),
         ])),

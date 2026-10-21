@@ -16,6 +16,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+voff-prompts = { version = "0.1.0-beta.1", path = "../voff-prompts" }
 [dev-dependencies]
 async-trait.workspace = true
 voff-provider = { workspace = true, features = ["test-support"] }

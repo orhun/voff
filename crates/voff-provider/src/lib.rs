@@ -83,10 +83,14 @@ pub struct StructuredToolRequest {
     pub name: String,
     pub arguments_json: String,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
     pub input_tokens: u64,
+    /// Cached input tokens are included in `input_tokens`.
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    /// The effective provider model, when the provider reports it.
+    pub model: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderEvent {

@@ -3536,6 +3536,7 @@ dependencies = [
  "unicode-width",
  "voff-core",
  "voff-engine",
+ "voff-prompts",
  "voff-provider",
  "voff-storage",
  "voff-tools",
@@ -3566,10 +3567,15 @@ dependencies = [
  "tokio-util",
  "tracing",
  "voff-core",
+ "voff-prompts",
  "voff-provider",
  "voff-storage",
  "voff-tools",
 ]
+
+[[package]]
+name = "voff-prompts"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "voff-provider"
@@ -3588,6 +3594,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "voff-core",
+ "voff-prompts",
 ]
 
 [[package]]

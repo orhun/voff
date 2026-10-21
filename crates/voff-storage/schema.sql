@@ -48,3 +48,12 @@ CREATE TABLE IF NOT EXISTS team_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS composer_history (
+    id INTEGER PRIMARY KEY,
+    workspace TEXT NOT NULL,
+    prompt TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS composer_history_workspace_id
+    ON composer_history(workspace, id);

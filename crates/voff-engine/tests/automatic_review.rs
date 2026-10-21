@@ -480,6 +480,53 @@ async fn unchanged_denied_proposal_cannot_be_approved_on_a_retry() {
 }
 
 #[tokio::test]
+async fn denied_proposal_gets_fresh_review_after_retry_adds_evidence() {
+    let (engine, repo, provider, dir, session, lead) =
+        setup(vec![patch(), verdict(false), patch(), verdict(true)], false).await;
+    let root = engine.create_task(lead, "Build", vec![]).await.unwrap();
+    engine.mark_ready(root.id).await.unwrap();
+    engine.run_task(root.id).await.unwrap();
+    engine.coordinate_pending().await.unwrap();
+
+    let retry = repo
+        .tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.retry_of == Some(root.id))
+        .expect("denial feedback should create a retry");
+    let new_evidence = "The inspected workspace manifest confirms the package is in the workspace.";
+    engine
+        .publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: retry.id,
+            kind: "file_read".into(),
+            location: "Cargo.toml".into(),
+            digest: "manifest-read".into(),
+            preview: new_evidence.into(),
+        })
+        .await
+        .unwrap();
+
+    engine.mark_ready(retry.id).await.unwrap();
+    engine.run_task(retry.id).await.unwrap();
+    engine.coordinate_pending().await.unwrap();
+
+    let approvals = repo.approvals(session).await.unwrap();
+    assert!(approvals.iter().any(|approval| {
+        approval.task_id == retry.id && approval.decision == ApprovalDecision::ApprovedOnce
+    }));
+    assert!(dir.path().join("backend/src/app.js").is_file());
+    let requests = provider.requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        4,
+        "the retry action should receive a fresh review"
+    );
+    assert!(requests[3].messages[1].content.contains(new_evidence));
+}
+
+#[tokio::test]
 async fn changed_but_rejected_revisions_stop_at_attempt_limit() {
     let mut script = vec![];
     for attempt in 1..=3 {

@@ -44,7 +44,7 @@ pub struct ProcessResult {
 }
 #[derive(Debug, Error)]
 pub enum ExecutorError {
-    #[error("command is not in the test allowlist")]
+    #[error("process invocation is invalid or uses a shell")]
     Denied,
     #[error("working directory is outside the workspace")]
     OutsideWorkspace,
@@ -59,6 +59,55 @@ pub enum ExecutorError {
 pub struct ControlledExecutor {
     root: PathBuf,
 }
+
+/// Check the direct-execution shape and resource bounds before a command is
+/// sent to the reporting agent for semantic review.
+pub fn validate_process_argv(program: &str, args: &[String]) -> Result<(), ExecutorError> {
+    const MAX_ARGUMENTS: usize = 64;
+    const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
+    const MAX_TOTAL_ARGUMENT_BYTES: usize = 16 * 1024;
+
+    let valid_program = !program.is_empty()
+        && program.len() <= 128
+        && program
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && program
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'));
+    let shell = matches!(
+        program.to_ascii_lowercase().as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "ash"
+            | "ksh"
+            | "csh"
+            | "tcsh"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "pwsh"
+            | "nu"
+    );
+    let total_argument_bytes = args.iter().map(String::len).sum::<usize>();
+    let valid_args = args.len() <= MAX_ARGUMENTS
+        && total_argument_bytes <= MAX_TOTAL_ARGUMENT_BYTES
+        && args.iter().all(|arg| {
+            arg.len() <= MAX_ARGUMENT_BYTES
+                && !arg
+                    .chars()
+                    .any(|character| matches!(character, '\0' | '\n' | '\r'))
+        });
+
+    if !valid_program || shell || !valid_args {
+        return Err(ExecutorError::Denied);
+    }
+    Ok(())
+}
+
 impl ControlledExecutor {
     pub fn new(root: &Path) -> Result<Self, ExecutorError> {
         Ok(Self {
@@ -66,27 +115,7 @@ impl ControlledExecutor {
         })
     }
     fn validate(&self, spec: &CommandSpec) -> Result<PathBuf, ExecutorError> {
-        let args = spec.args.iter().map(String::as_str).collect::<Vec<_>>();
-        let allowed = match spec.program.as_str() {
-            "cargo" => matches!(
-                args.as_slice(),
-                ["test"] | ["check"] | ["clippy"] | ["fmt", "--check"]
-            ),
-            "python3" => args == ["-m", "unittest", "discover"],
-            "node" => args == ["--test"],
-            "npm" => matches!(args.as_slice(), ["test"] | ["run", "build"]),
-            _ => false,
-        };
-        if !allowed {
-            return Err(ExecutorError::Denied);
-        }
-        if spec
-            .args
-            .iter()
-            .any(|v| v.contains(['\n', '\r']) || v == "--manifest-path")
-        {
-            return Err(ExecutorError::Denied);
-        }
+        validate_process_argv(&spec.program, &spec.args)?;
         let cwd = spec.cwd.canonicalize()?;
         if !cwd.starts_with(&self.root) {
             return Err(ExecutorError::OutsideWorkspace);
@@ -186,7 +215,7 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn approved_scoped_cargo_check_runs() {
+    async fn approved_scoped_argv_process_runs() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("src")).unwrap();
         std::fs::write(
@@ -223,24 +252,17 @@ mod tests {
     }
 
     #[test]
-    fn verification_allowlist_is_exact_and_does_not_allow_install_or_shell() {
+    fn argv_validation_is_bounded_without_an_executable_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let executor = ControlledExecutor::new(dir.path()).unwrap();
         for (program, args, allowed) in [
-            ("python3", vec!["-m", "unittest", "discover"], true),
-            ("node", vec!["--test"], true),
-            ("npm", vec!["test"], true),
-            ("npm", vec!["run", "build"], true),
-            ("npm", vec!["install"], false),
-            ("npm", vec!["exec", "anything"], false),
-            ("node", vec!["-e", "arbitrary code"], false),
-            ("python3", vec!["-c", "arbitrary code"], false),
+            ("cargo", vec!["check", "-p", "sparkline"], true),
+            ("just", vec!["test", "--package", "ratatui"], true),
+            ("git", vec!["diff", "--stat"], true),
             ("sh", vec!["-c", "npm test"], false),
-            (
-                "cargo",
-                vec!["test", "--manifest-path", "/tmp/other/Cargo.toml"],
-                false,
-            ),
+            ("/usr/bin/ls", vec!["-la"], false),
+            ("tool", vec!["line\nbreak"], false),
+            ("tool", vec!["a"; 65], false),
         ] {
             let spec = CommandSpec {
                 program: program.into(),

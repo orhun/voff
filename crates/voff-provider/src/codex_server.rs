@@ -261,6 +261,11 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             "Codex did not confirm an ephemeral read-only thread with approvals disabled",
         ));
     }
+    let resolved_model = thread["thread"]["model"]
+        .as_str()
+        .or_else(|| config["config"]["model"].as_str())
+        .or_else(|| (model != "default").then_some(model))
+        .map(str::to_owned);
     let thread_id = thread["thread"]["id"]
         .as_str()
         .ok_or_else(|| invalid("Codex omitted thread ID"))?;
@@ -279,7 +284,9 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut output_bytes = 0usize;
     let mut reported_usage = Usage {
         input_tokens: 0,
+        cached_input_tokens: 0,
         output_tokens: 0,
+        model: resolved_model.clone(),
     };
     loop {
         let value = wire.next().await?;
@@ -348,7 +355,9 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
             }
             Some("thread/tokenUsage/updated") => {
-                if let Some(total) = codex_total_usage(&params["tokenUsage"]["total"]) {
+                if let Some(total) =
+                    codex_total_usage(&params["tokenUsage"]["total"], resolved_model.as_deref())
+                {
                     reported_usage = total;
                 }
             }
@@ -374,10 +383,12 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
-fn codex_total_usage(total: &Value) -> Option<Usage> {
+fn codex_total_usage(total: &Value, model: Option<&str>) -> Option<Usage> {
     Some(Usage {
         input_tokens: total["inputTokens"].as_u64()?,
+        cached_input_tokens: total["cachedInputTokens"].as_u64().unwrap_or_default(),
         output_tokens: total["outputTokens"].as_u64()?,
+        model: model.map(str::to_owned),
     })
 }
 

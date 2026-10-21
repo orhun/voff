@@ -41,6 +41,7 @@ struct AgentCard {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct TokenUsage {
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -149,7 +150,7 @@ impl AgentCard {
             let cost = self.estimated_cost.map_or_else(
                 || {
                     if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
-                        " · cost unreported".to_owned()
+                        " · price unavailable".to_owned()
                     } else {
                         String::new()
                     }
@@ -236,6 +237,8 @@ pub(super) struct TeamSnapshot<'a> {
     pub reviews: &'a HashMap<TaskId, String>,
     pub responses: &'a HashMap<AgentId, String>,
     pub usage: &'a HashMap<AgentId, TokenUsage>,
+    pub runtime_models: &'a HashMap<AgentId, String>,
+    pub estimated_costs: &'a HashMap<AgentId, Option<f64>>,
     pub provider_kinds: &'a HashMap<AgentId, String>,
     pub team_lead: Option<AgentId>,
 }
@@ -273,15 +276,7 @@ impl TeamFlow {
             for (index, agent) in snapshot.agents.iter().enumerate() {
                 if let Some(content) = self.flow.node_content_mut(&node_id(agent.id)) {
                     let max_width = content.max_width;
-                    *content = agent_card(
-                        agent,
-                        snapshot.tasks,
-                        snapshot.approvals,
-                        snapshot.responses,
-                        snapshot.usage,
-                        snapshot.provider_kinds,
-                        theme::agent_color(index),
-                    );
+                    *content = agent_card(agent, &snapshot, theme::agent_color(index));
                     content.max_width = max_width;
                 }
             }
@@ -421,15 +416,7 @@ impl TeamFlow {
                     (width, height),
                     AgentCard {
                         max_width: width,
-                        ..agent_card(
-                            agent,
-                            snapshot.tasks,
-                            snapshot.approvals,
-                            snapshot.responses,
-                            snapshot.usage,
-                            snapshot.provider_kinds,
-                            theme::agent_color(index),
-                        )
+                        ..agent_card(agent, snapshot, theme::agent_color(index))
                     },
                 )
                 .with_selected(index == selected)
@@ -628,18 +615,10 @@ fn nearest_sides(
     )
 }
 
-fn agent_card(
-    agent: &AgentProfile,
-    tasks: &[Task],
-    approvals: &[Approval],
-    responses: &HashMap<AgentId, String>,
-    usage: &HashMap<AgentId, TokenUsage>,
-    provider_kinds: &HashMap<AgentId, String>,
-    agent_color: Color,
-) -> AgentCard {
-    let pending = pending_delegation_for_target(approvals, &agent.name);
-    let (status, status_color) = agent_status(tasks, agent, pending.is_some());
-    let display_task = agent_display_task(tasks, agent.id);
+fn agent_card(agent: &AgentProfile, snapshot: &TeamSnapshot<'_>, agent_color: Color) -> AgentCard {
+    let pending = pending_delegation_for_target(snapshot.approvals, &agent.name);
+    let (status, status_color) = agent_status(snapshot.tasks, agent, pending.is_some());
+    let display_task = agent_display_task(snapshot.tasks, agent.id);
     let task = display_task
         .map(|task| task.objective.as_str())
         .or_else(|| pending.as_ref().map(|proposal| proposal.objective.as_str()))
@@ -647,13 +626,19 @@ fn agent_card(
     let focus = (agent.enabled && task.is_none())
         .then(|| prompt_summary(&agent.system_prompt))
         .flatten();
-    let provider_kind = provider_kinds
+    let provider_kind = snapshot
+        .provider_kinds
         .get(&agent.id)
         .map_or(agent.provider.as_str(), String::as_str);
-    let model = (!agent.model.trim().is_empty() && agent.model != "default")
-        .then(|| truncate_label(&sanitize(&agent.model), 32));
+    let model_id = snapshot
+        .runtime_models
+        .get(&agent.id)
+        .unwrap_or(&agent.model);
+    let model = (!model_id.trim().is_empty() && model_id != "default")
+        .then(|| truncate_label(&sanitize(model_id), 32));
     let task_text = task.as_deref().unwrap_or_default();
-    let response = responses
+    let response = snapshot
+        .responses
         .get(&agent.id)
         .filter(|response| !response.trim().is_empty())
         .filter(|response| !repeats_task(response, task_text))
@@ -668,8 +653,12 @@ fn agent_card(
                 truncate_label(&excerpt, 112)
             }
         });
-    let usage = usage.get(&agent.id).copied().unwrap_or_default();
-    let estimated_cost = estimate_cost(provider_kind, &agent.model, usage);
+    let usage = snapshot.usage.get(&agent.id).copied().unwrap_or_default();
+    let estimated_cost = snapshot
+        .estimated_costs
+        .get(&agent.id)
+        .copied()
+        .unwrap_or_else(|| estimate_cost(provider_kind, model_id, usage));
     let name = sanitize(&agent.name);
     let identity = format!("{} {name}", role_icon(&agent.role));
     AgentCard {
@@ -730,13 +719,41 @@ fn prompt_summary(prompt: &str) -> Option<String> {
 }
 
 pub(super) fn estimate_cost(provider: &str, model_id: &str, usage: TokenUsage) -> Option<f64> {
-    let model = ProviderIndex::embedded()
-        .models_for(provider)
-        .iter()
-        .find(|model| model.id == model_id)?;
-    let cost = model.cost.as_ref()?;
+    // Codex CLI can run models absent from the API catalog. These are the
+    // standard Codex rates for GPT-6 Luna, in USD per million tokens.
+    let codex_rate = (provider == "codex_cli" && model_id.eq_ignore_ascii_case("gpt-6-luna"))
+        .then_some((0.10, 0.01, 0.50));
+    let (input_rate, cached_input_rate, output_rate) = if let Some(rates) = codex_rate {
+        rates
+    } else {
+        let catalog = ProviderIndex::embedded();
+        let model = catalog
+            .models_for(provider)
+            .iter()
+            .find(|model| model.id == model_id)
+            .or_else(|| {
+                (provider == "codex_cli")
+                    .then(|| {
+                        catalog
+                            .models_for("openai")
+                            .iter()
+                            .find(|model| model.id == model_id)
+                    })
+                    .flatten()
+            })?;
+        let cost = model.cost.as_ref()?;
+        (
+            cost.input,
+            cost.cache_read.unwrap_or(cost.input),
+            cost.output,
+        )
+    };
+    let cached_input = usage.cached_input_tokens.min(usage.input_tokens);
+    let regular_input = usage.input_tokens.saturating_sub(cached_input);
     Some(
-        (usage.input_tokens as f64 * cost.input + usage.output_tokens as f64 * cost.output)
+        (regular_input as f64 * input_rate
+            + cached_input as f64 * cached_input_rate
+            + usage.output_tokens as f64 * output_rate)
             / 1_000_000.0,
     )
 }
@@ -1510,6 +1527,7 @@ mod geometry_tests {
             response: None,
             usage: TokenUsage {
                 input_tokens: 1_240,
+                cached_input_tokens: 0,
                 output_tokens: 318,
             },
             estimated_cost: None,
@@ -1545,7 +1563,7 @@ mod geometry_tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(details.contains("Tokens · 1.2k in / 318 out · cost unreported"));
+        assert!(details.contains("Tokens · 1.2k in / 318 out · price unavailable"));
     }
 
     #[test]

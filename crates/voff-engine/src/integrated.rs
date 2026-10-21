@@ -1,25 +1,7 @@
 //! Contract-first plans and evidence-gated multi-step work.
 use super::*;
-
-pub(super) const WORK_INSTRUCTIONS: &str = concat!(
-    "For implementation, if you have direct reports, use task.delegate with a shared_contract, proposals, and a separate integration task assigned to an available qualified direct report. ",
-    "Define exact interfaces (routes, payloads, authentication, ports), file ownership, preservation requirements and end-to-end checks in the shared contract before dispatch. ",
-    "Integration waits for all implementations. Do not delegate simple questions. ",
-    "Workers: produce actual project files, not a script that generates an unexecuted application. ",
-    "You can propose one file.patch or process.test per turn; after approval you receive updated workspace and progress and can continue with more files/checks. ",
-    "Preserve existing functionality. A partial patch may be reviewed as progress, not as whole-task completion. ",
-    "When finished, call task.complete with a summary and one evidence entry per acceptance criterion, referencing recorded art_ prefixed artifact IDs. ",
-    "Run verification appropriate to the user's request: use a test command for an explicit test request, a build/check command for a build or compile request, and do not run tests for read-only questions. After an approved workspace patch, run the appropriate verification before completion. ",
-    "Do not invent test harnesses or test files just to satisfy a generic verification requirement. ",
-    "Available commands are listed in process.test; no arbitrary shell, package installation, git, or deployment tools are available. ",
-    "The provider may run with its native filesystem, shell, network, and subagent tools disabled in an isolated sandbox. That restriction applies only to the provider's native tools. Voff actions listed in your response schema are a separate, mediated interface: use available file.read/search.text actions to inspect the configured workspace and propose available file.patch/process.test/task.delegate actions through Voff. Voff applies them only within existing scope and approval checks; a proposal does not execute directly. The provider's temporary working directory is not the configured workspace. Do not call task.blocked only because native provider tools are disabled or the thread is read-only. ",
-    "For a verification-only request, use a single task.delegate assignment to an enabled direct report with process.test when you do not have that tool yourself. ",
-    "For implementation work, include an enabled qualified report in the contract-first plan to run the appropriate verification. ",
-    "The process.test tool is approval-gated; lack of arbitrary shell access does not mean verification is forbidden. ",
-    "Do not report a blocker solely because you personally lack process.test when a qualified enabled report can run it. ",
-    "If no qualified report can run it, or an approval is denied, call task.blocked with a concrete reason; do not return only prose or claim completion. ",
-    "Never claim generated tests were executed. The task has at most 32 turns across retries."
-);
+use voff_prompts::tool_descriptions;
+pub(super) use voff_prompts::workflow::WORK_INSTRUCTIONS;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +15,7 @@ struct Plan {
 #[serde(untagged)]
 enum WorkDelegation {
     Plan(Plan),
+    Single(DelegationProposal),
     Verification(VerificationAssignment),
 }
 
@@ -48,6 +31,38 @@ pub(super) enum VerificationKind {
     Build,
 }
 
+/// Return task IDs in a valid same-scope retry chain, including `task`.
+/// Earlier attempts remain useful for evidence until a later patch invalidates
+/// their verification.
+pub(super) fn retry_lineage_ids(task: &Task, tasks: &[Task]) -> HashSet<TaskId> {
+    let mut lineage = HashSet::from([task.id]);
+    let mut newer = task;
+    while let Some(previous_id) = newer.retry_of {
+        if lineage.contains(&previous_id) {
+            break;
+        }
+        let Some(previous) = tasks.iter().find(|candidate| candidate.id == previous_id) else {
+            break;
+        };
+        let same_scope = previous.owner == task.owner
+            && previous.parent == task.parent
+            && previous.requested_target == task.requested_target
+            && previous.acceptance_criteria == task.acceptance_criteria
+            && previous.depth == task.depth
+            && previous.limits.max_delegation_depth == task.limits.max_delegation_depth
+            && previous.limits.max_children == task.limits.max_children
+            && previous.limits.max_duration_seconds == task.limits.max_duration_seconds
+            && previous.work.is_some()
+            && previous.attempt.checked_add(1) == Some(newer.attempt);
+        if !same_scope {
+            break;
+        }
+        lineage.insert(previous_id);
+        newer = previous;
+    }
+    lineage
+}
+
 /// Select the verification the user actually requested. Read-only requests do
 /// not need an unrelated test run; implementation requests retain test-suite
 /// verification as the default.
@@ -55,7 +70,7 @@ pub(super) fn verification_kind(task: &Task) -> Option<VerificationKind> {
     verification_kind_for_objective(&task.objective)
 }
 
-fn is_implementation_objective(objective: &str) -> bool {
+pub(super) fn is_implementation_objective(objective: &str) -> bool {
     let objective = objective.to_lowercase();
     [
         "implement",
@@ -158,21 +173,6 @@ fn verification_kind_for_objective(objective: &str) -> Option<VerificationKind> 
     implementation.then_some(VerificationKind::Tests)
 }
 
-fn verification_command_matches(kind: VerificationKind, command: &str) -> bool {
-    let test_command = matches!(
-        command,
-        "cargo test" | "python3 -m unittest discover" | "node --test" | "npm test"
-    );
-    let build_command = matches!(
-        command,
-        "cargo check" | "cargo clippy" | "cargo fmt --check" | "npm run build"
-    );
-    match kind {
-        VerificationKind::Tests => test_command,
-        VerificationKind::Build => test_command || build_command,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +190,137 @@ mod tests {
         let mut tools = Vec::new();
         configure_tools(&mut tools, &[], 0);
         assert!(tools.iter().any(|tool| tool.name == "task.blocked"));
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_verified_processes_without_command_allowlist() {
+        let (engine, _repo, task, artifact) = fixture().await;
+        let json = completion(artifact.id);
+        engine
+            .record(
+                Some(task.id),
+                CanonicalEventKind::ProcessFinished {
+                    program: "cargo check -p sparkline".into(),
+                    verification: true,
+                    exit_code: Some(0),
+                    truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(engine.validate_completion(&task, &json).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_ancestor_evidence_and_verification_until_a_new_patch() {
+        let (engine, repo, mut original, prior_report) = fixture().await;
+        original.status = TaskStatus::Blocked;
+        repo.save_task(original.clone()).await.unwrap();
+        let mut retry = original.clone();
+        retry.id = TaskId::new();
+        retry.attempt = 2;
+        retry.retry_of = Some(original.id);
+        retry.objective.push_str("\nRepair attempt");
+        retry.status = TaskStatus::Queued;
+        retry.result = None;
+        repo.save_task(retry.clone()).await.unwrap();
+
+        let mut unrelated_attempt = original.clone();
+        unrelated_attempt.id = TaskId::new();
+        unrelated_attempt.owner = AgentId::new();
+        unrelated_attempt.retry_of = None;
+        repo.save_task(unrelated_attempt.clone()).await.unwrap();
+        let unrelated_report = Artifact {
+            id: ArtifactId::new(),
+            producer: unrelated_attempt.id,
+            kind: "test_report".into(),
+            location: "unrelated check".into(),
+            digest: String::new(),
+            preview: "unrelated report".into(),
+        };
+        repo.save_artifact(unrelated_report.clone()).await.unwrap();
+        let mut out_of_scope_retry = retry.clone();
+        out_of_scope_retry.id = TaskId::new();
+        out_of_scope_retry.retry_of = Some(unrelated_attempt.id);
+        let tasks = repo.tasks().await.unwrap();
+        assert!(!retry_lineage_ids(&out_of_scope_retry, &tasks).contains(&unrelated_attempt.id));
+
+        let context = engine.work_context(&retry).await.unwrap();
+        assert!(context.contains(&prior_report.id.to_string()));
+        assert!(context.contains("attempt 1"));
+        assert!(!context.contains(&unrelated_report.id.to_string()));
+
+        engine
+            .record(
+                Some(original.id),
+                CanonicalEventKind::ProcessFinished {
+                    program: "cargo test".into(),
+                    verification: true,
+                    exit_code: Some(0),
+                    truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .validate_completion(&retry, &completion(prior_report.id))
+                .await
+                .is_ok()
+        );
+        assert!(
+            engine
+                .validate_completion(&retry, &completion(unrelated_report.id))
+                .await
+                .is_err()
+        );
+
+        let patch_approval = Approval {
+            id: ApprovalId::new(),
+            task_id: retry.id,
+            tool_call_id: ToolCallId::new(),
+            action: "file.patch".into(),
+            working_directory: ".".into(),
+            reason: "{}".into(),
+            decision: ApprovalDecision::ApprovedOnce,
+            created_at: chrono::Utc::now(),
+        };
+        repo.save_approval(patch_approval.clone()).await.unwrap();
+        engine
+            .record(
+                Some(retry.id),
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id: patch_approval.id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .validate_completion(&retry, &completion(prior_report.id))
+                .await
+                .is_err()
+        );
+
+        engine
+            .record(
+                Some(retry.id),
+                CanonicalEventKind::ProcessFinished {
+                    program: "cargo test".into(),
+                    verification: true,
+                    exit_code: Some(0),
+                    truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .validate_completion(&retry, &completion(prior_report.id))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -280,7 +411,21 @@ mod tests {
             .record(
                 Some(task.id),
                 CanonicalEventKind::ProcessFinished {
+                    program: "git diff --stat".into(),
+                    verification: false,
+                    exit_code: Some(0),
+                    truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(engine.validate_completion(&task, &json).await.is_err());
+        engine
+            .record(
+                Some(task.id),
+                CanonicalEventKind::ProcessFinished {
                     program: "cargo test".into(),
+                    verification: true,
                     exit_code: Some(1),
                     truncated: false,
                 },
@@ -293,6 +438,7 @@ mod tests {
                 Some(task.id),
                 CanonicalEventKind::ProcessFinished {
                     program: "cargo test".into(),
+                    verification: true,
                     exit_code: Some(0),
                     truncated: false,
                 },
@@ -526,7 +672,7 @@ pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String
         let verification = serde_json::json!({"type":"object","properties":{
             "target_agent":{"type":"string","enum":targets}
         },"required":["target_agent"],"additionalProperties":false});
-        let mut alternatives = vec![verification];
+        let mut alternatives = vec![verification, item.clone()];
         if limit >= 2 {
             alternatives.insert(
                 0,
@@ -537,12 +683,12 @@ pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String
                 },"required":["shared_contract","proposals","integration"],"additionalProperties":false}),
             );
         }
-        tool.description = "For a verification-only request, assign one enabled direct report with process.test. For implementation work, plan related implementations against a shared contract and include an integration task. Assignments require approval; never invent capabilities.".into();
+        tool.description = tool_descriptions::DELEGATE.into();
         tool.input_schema = serde_json::json!({"type":"object","oneOf": alternatives}).to_string();
     }
     tools.push(ToolDefinition {
         name: "task.complete".into(),
-        description: "Request final acceptance with evidence for every criterion. Run the verification appropriate to the request, when required, and cite persisted artifact IDs. A patch alone cannot complete work.".into(),
+        description: tool_descriptions::COMPLETE.into(),
         input_schema: serde_json::json!({"type":"object","properties":{
             "summary":{"type":"string"},"evidence":{"type":"array","items":{
                 "type":"object","properties":{"criterion":{"type":"integer","minimum":0},
@@ -552,10 +698,11 @@ pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String
     });
     tools.push(ToolDefinition {
         name: "task.blocked".into(),
-        description: "Report a concrete blocker when required work or verification cannot be completed within the current scope. This does not complete the task or widen permissions.".into(),
+        description: tool_descriptions::BLOCKED.into(),
         input_schema: serde_json::json!({"type":"object","properties":{
             "reason":{"type":"string","minLength":1}
-        },"required":["reason"],"additionalProperties":false}).to_string(),
+        },"required":["reason"],"additionalProperties":false})
+        .to_string(),
     });
 }
 
@@ -576,11 +723,6 @@ impl<R: Repository + 'static> Engine<R> {
         let delegation: WorkDelegation = serde_json::from_str(json)?;
         let plan = match delegation {
             WorkDelegation::Verification(assignment) => {
-                if !verification_only(task) {
-                    return Err(invalid(
-                        "single-report delegation is only for a verification-only objective",
-                    ));
-                }
                 if self
                     .repo
                     .tasks()
@@ -606,6 +748,50 @@ impl<R: Repository + 'static> Engine<R> {
                 if !target.tools.iter().any(|tool| tool == "process.test") {
                     return Err(invalid(
                         "verification owner must have process.test; choose an enabled qualified report",
+                    ));
+                }
+                return Ok(());
+            }
+            WorkDelegation::Single(proposal) => {
+                if self
+                    .repo
+                    .tasks()
+                    .await?
+                    .iter()
+                    .any(|child| child.parent == Some(task.id))
+                {
+                    return Err(invalid(
+                        "task already has delegated work; continue from its existing results",
+                    ));
+                }
+                self.validate_delegation_proposals(task, agent, std::slice::from_ref(&proposal))
+                    .await?;
+                if proposal.acceptance_criteria.is_empty()
+                    || proposal
+                        .acceptance_criteria
+                        .iter()
+                        .any(|criterion| criterion.trim().is_empty())
+                {
+                    return Err(invalid(
+                        "a delegated task requires explicit acceptance criteria",
+                    ));
+                }
+                let target = self
+                    .delegation_target(&proposal.target_agent)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?;
+                let changes_workspace = !super::is_read_only_request(&proposal.objective);
+                let requires_verification =
+                    verification_kind_for_objective(&proposal.objective).is_some();
+                if changes_workspace && !target.tools.iter().any(|tool| tool == "file.patch") {
+                    return Err(invalid(
+                        "implementation owner must have file.patch to produce workspace changes",
+                    ));
+                }
+                if requires_verification && !target.tools.iter().any(|tool| tool == "process.test")
+                {
+                    return Err(invalid(
+                        "the delegated task needs an enabled owner with process.test for the requested verification",
                     ));
                 }
                 return Ok(());
@@ -689,6 +875,13 @@ impl<R: Repository + 'static> Engine<R> {
         let delegation: WorkDelegation = serde_json::from_str(&approval.reason)?;
         let plan = match delegation {
             WorkDelegation::Verification(assignment) => {
+                let check = match verification_kind(&parent) {
+                    Some(VerificationKind::Build) => "compile check",
+                    Some(VerificationKind::Tests) | None => "test suite",
+                };
+                let objective = format!(
+                    "Inspect the completed work with the project's {check} and report results. Avoid changing files."
+                );
                 let mut child = self
                     .delegate_task(
                         parent.id,
@@ -696,12 +889,15 @@ impl<R: Repository + 'static> Engine<R> {
                             .await?
                             .ok_or(EngineError::TaskNotFound)?
                             .id,
-                        parent.objective.clone(),
+                        objective,
                         parent.acceptance_criteria.clone(),
                     )
                     .await?;
                 child.work = Some(WorkProgress {
-                    contract: format!("Verification delegated from parent task {}", parent.id),
+                    contract: format!(
+                        "Verification handoff for task {}: {}",
+                        parent.id, parent.objective
+                    ),
                     integration: true,
                     turns: 0,
                 });
@@ -714,6 +910,39 @@ impl<R: Repository + 'static> Engine<R> {
                     Some(parent.id),
                     CanonicalEventKind::ProviderWarning(
                         "Verification was delegated to the approved qualified report.".into(),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            WorkDelegation::Single(proposal) => {
+                let owner = self
+                    .delegation_target(&proposal.target_agent)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?;
+                let mut child = self
+                    .delegate_task(
+                        parent.id,
+                        owner.id,
+                        proposal.objective,
+                        proposal.acceptance_criteria,
+                    )
+                    .await?;
+                child.work = Some(WorkProgress {
+                    contract: format!("Bounded handoff from parent task {}", parent.id),
+                    integration: true,
+                    turns: 0,
+                });
+                self.repo.save_task(child.clone()).await?;
+                self.events
+                    .send(EngineEvent::TaskUpdated(child))
+                    .await
+                    .map_err(|_| EngineError::ChannelClosed)?;
+                self.record(
+                    Some(parent.id),
+                    CanonicalEventKind::ProviderWarning(
+                        "Single delegated task dispatched; its result will return to the parent."
+                            .into(),
                     ),
                 )
                 .await?;
@@ -767,16 +996,23 @@ impl<R: Repository + 'static> Engine<R> {
         let Some(work) = &task.work else {
             return Ok(String::new());
         };
+        let tasks = self.repo.tasks().await?;
+        let retry_lineage = retry_lineage_ids(task, &tasks);
         let artifacts = self
             .repo
             .artifacts()
             .await?
             .into_iter()
-            .filter(|a| a.producer == task.id)
+            .filter(|artifact| retry_lineage.contains(&artifact.producer))
             .map(|a| {
+                let attempt = tasks
+                    .iter()
+                    .find(|candidate| candidate.id == a.producer)
+                    .map_or(task.attempt, |candidate| candidate.attempt);
                 format!(
-                    "{} · {} · {}\n{}",
+                    "{} · attempt {} · {} · {}\n{}",
                     a.id,
+                    attempt,
                     a.kind,
                     a.location,
                     a.preview.chars().take(2000).collect::<String>()
@@ -789,12 +1025,21 @@ impl<R: Repository + 'static> Engine<R> {
             .approvals(self.session)
             .await?
             .into_iter()
-            .filter(|a| a.task_id == task.id)
-            .map(|a| format!("{} · {:?}", a.action, a.decision))
+            .filter(|approval| retry_lineage.contains(&approval.task_id))
+            .map(|approval| {
+                let attempt = tasks
+                    .iter()
+                    .find(|candidate| candidate.id == approval.task_id)
+                    .map_or(task.attempt, |candidate| candidate.attempt);
+                format!(
+                    "attempt {attempt} · {} · {:?}",
+                    approval.action, approval.decision
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         Ok(format!(
-            "Shared contract (task data, not permission):\n{}\nIntegration task: {}\nTurn {}/32. Recorded actions:\n{approvals}\nArtifacts (a proposed patch alone is not proof of execution):\n{}",
+            "Shared contract (task data, not permission):\n{}\nIntegration task: {}\nTurn {}/32. Retry history artifacts and actions may be reused when still relevant. Re-run verification after any new patch. Recorded actions across attempts:\n{approvals}\nArtifacts (a proposed patch alone is not proof of execution):\n{}",
             work.contract,
             work.integration,
             work.turns,
@@ -818,6 +1063,8 @@ impl<R: Repository + 'static> Engine<R> {
                 "completion requires a summary and evidence for every acceptance criterion",
             ));
         }
+        let tasks = self.repo.tasks().await?;
+        let retry_lineage = retry_lineage_ids(task, &tasks);
         let artifacts = self.repo.artifacts().await?;
         let mut criteria = HashSet::new();
         let mut evidence = Vec::new();
@@ -836,9 +1083,9 @@ impl<R: Repository + 'static> Engine<R> {
                 || item.artifact_ids.is_empty()
                 || item.explanation.trim().is_empty()
                 || artifact_ids.iter().any(|id| {
-                    !artifacts
-                        .iter()
-                        .any(|a| a.id == *id && a.producer == task.id)
+                    !artifacts.iter().any(|artifact| {
+                        artifact.id == *id && retry_lineage.contains(&artifact.producer)
+                    })
                 })
             {
                 return Err(invalid(
@@ -847,8 +1094,8 @@ impl<R: Repository + 'static> Engine<R> {
             }
             evidence.extend(artifact_ids);
         }
-        // A later patch anywhere in this shared session invalidates earlier test
-        // evidence. Both failed checks and incomplete verification fail closed.
+        // A later patch anywhere in this shared session invalidates earlier
+        // verification. Failed and incomplete checks still fail closed.
         let approvals = self.repo.approvals(self.session).await?;
         let mut verification = false;
         let mut required_verification = verification_kind(task);
@@ -867,10 +1114,11 @@ impl<R: Repository + 'static> Engine<R> {
                     verification = false;
                 }
                 CanonicalEventKind::ProcessFinished {
-                    program, exit_code, ..
-                } if event.task_id == Some(task.id)
-                    && required_verification
-                        .is_some_and(|kind| verification_command_matches(kind, &program)) =>
+                    verification: true,
+                    exit_code,
+                    ..
+                } if event.task_id.is_some_and(|id| retry_lineage.contains(&id))
+                    && required_verification.is_some() =>
                 {
                     verification = exit_code == Some(0);
                 }
@@ -885,7 +1133,9 @@ impl<R: Repository + 'static> Engine<R> {
         evidence.extend(
             artifacts
                 .iter()
-                .filter(|a| a.producer == task.id && a.kind == "test_report")
+                .filter(|artifact| {
+                    retry_lineage.contains(&artifact.producer) && artifact.kind == "test_report"
+                })
                 .map(|a| a.id),
         );
         evidence.sort_by_key(ToString::to_string);

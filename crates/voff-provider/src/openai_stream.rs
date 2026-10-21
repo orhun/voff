@@ -221,7 +221,11 @@ impl Decoder {
         ) {
             (Some(input_tokens), Some(output_tokens)) => Some(Usage {
                 input_tokens,
+                cached_input_tokens: response["usage"]["input_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or_default(),
                 output_tokens,
+                model: response["model"].as_str().map(str::to_owned),
             }),
             _ => None,
         };

@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use tokio_rusqlite::rusqlite::{self, OptionalExtension};
 use voff_core::*;
 
+pub const PROMPT_HISTORY_LIMIT: usize = 200;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("record not found")]
@@ -180,6 +182,78 @@ pub struct SqliteRepository {
 }
 
 impl SqliteRepository {
+    /// Load the most recent submitted prompts for a workspace, oldest first.
+    pub async fn prompt_history(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let workspace = workspace.to_string_lossy().into_owned();
+        self.call(move |connection| {
+            let mut query = connection
+                .prepare(
+                    "SELECT prompt FROM (
+                        SELECT id, prompt FROM composer_history
+                        WHERE workspace=?1 ORDER BY id DESC LIMIT ?2
+                    ) ORDER BY id ASC",
+                )
+                .map_err(db)?;
+            query
+                .query_map(
+                    rusqlite::params![workspace, PROMPT_HISTORY_LIMIT as i64],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(db)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db)
+        })
+        .await
+    }
+
+    /// Store a submitted prompt, retaining only the latest 200 per workspace.
+    pub async fn save_prompt_history(
+        &self,
+        workspace: &std::path::Path,
+        prompt: &str,
+    ) -> Result<(), RepositoryError> {
+        if prompt.trim().is_empty() {
+            return Err(RepositoryError::Invariant(
+                "prompt history entry must not be empty".into(),
+            ));
+        }
+        let workspace = workspace.to_string_lossy().into_owned();
+        let prompt = prompt.to_owned();
+        self.call(move |connection| {
+            let transaction = connection.transaction().map_err(db)?;
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT prompt FROM composer_history WHERE workspace=?1 ORDER BY id DESC LIMIT 1",
+                    [&workspace],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)?;
+            if previous.as_deref() != Some(prompt.as_str()) {
+                transaction
+                    .execute(
+                        "INSERT INTO composer_history(workspace, prompt) VALUES(?1, ?2)",
+                        rusqlite::params![workspace, prompt],
+                    )
+                    .map_err(db)?;
+                transaction
+                    .execute(
+                        "DELETE FROM composer_history WHERE workspace=?1 AND id NOT IN (
+                            SELECT id FROM composer_history WHERE workspace=?1
+                            ORDER BY id DESC LIMIT ?2
+                        )",
+                        rusqlite::params![workspace, PROMPT_HISTORY_LIMIT as i64],
+                    )
+                    .map_err(db)?;
+            }
+            transaction.commit().map_err(db)
+        })
+        .await
+    }
+
     /// Persist a secret-free workspace/team preference.
     pub async fn save_setting(&self, key: &str, value: &str) -> Result<(), RepositoryError> {
         if key.trim().is_empty() {
@@ -768,6 +842,7 @@ mod tests {
                 "agents",
                 "approvals",
                 "artifacts",
+                "composer_history",
                 "credentials",
                 "events",
                 "sessions",
@@ -776,6 +851,44 @@ mod tests {
                 "team_settings",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_history_survives_reopen_and_is_workspace_scoped_and_bounded() {
+        let path = std::env::temp_dir().join(format!("voff-prompts-{}.db", uuid::Uuid::new_v4()));
+        let workspace = std::path::Path::new("/workspace/one");
+        {
+            let repository = SqliteRepository::open(&path).await.unwrap();
+            for index in 0..205 {
+                repository
+                    .save_prompt_history(workspace, &format!("prompt {index}"))
+                    .await
+                    .unwrap();
+            }
+            repository
+                .save_prompt_history(workspace, "prompt 204")
+                .await
+                .unwrap();
+            assert_eq!(
+                repository.prompt_history(workspace).await.unwrap().len(),
+                200
+            );
+            assert!(
+                repository
+                    .prompt_history(std::path::Path::new("/workspace/two"))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let repository = SqliteRepository::open(&path).await.unwrap();
+        let history = repository.prompt_history(workspace).await.unwrap();
+        assert_eq!(history.len(), 200);
+        assert_eq!(history.first().map(String::as_str), Some("prompt 5"));
+        assert_eq!(history.last().map(String::as_str), Some("prompt 204"));
+        drop(repository);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

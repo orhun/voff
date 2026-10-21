@@ -41,6 +41,7 @@ impl MockProvider {
             MockStep::Event(ProviderEvent::Usage(Usage {
                 input_tokens: 2,
                 output_tokens: 3,
+                ..Usage::default()
             })),
             MockStep::Event(ProviderEvent::Completed),
         ])
@@ -407,6 +408,7 @@ async fn stream_model<M: CompletionModel>(
     let usage = terminal.usage.has_values().then_some(Usage {
         input_tokens: terminal.usage.input_tokens,
         output_tokens: terminal.usage.output_tokens,
+        ..Usage::default()
     });
     if let Some(usage) = &usage {
         send(&sink, ProviderEvent::Usage(usage.clone()), &cancellation).await?;
@@ -765,6 +767,7 @@ mod tests {
             ProviderEvent::Usage(Usage {
                 input_tokens: 7,
                 output_tokens: 3,
+                ..Usage::default()
             })
         );
         assert_eq!(received[3], ProviderEvent::Completed);

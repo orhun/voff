@@ -45,7 +45,8 @@ use voff_core::{
 use voff_engine::{
     DelegationProposal, Engine, EngineEvent, OutputContinuation, is_conversational_request,
 };
-use voff_storage::{Repository, SqliteRepository};
+use voff_prompts::workflow::routed_agent_objective;
+use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, SqliteRepository};
 
 use self::team_flow::{
     TeamFlow, TeamSnapshot, TokenUsage, compact_count, estimate_cost, format_usd, handoff_summary,
@@ -166,6 +167,8 @@ pub struct AppModel {
     pub artifacts: Vec<Artifact>,
     pub model_catalog: ModelCatalog,
     pub agent_provider_kinds: HashMap<AgentId, String>,
+    agent_runtime_models: HashMap<AgentId, String>,
+    agent_estimated_costs: HashMap<AgentId, Option<f64>>,
     pub workspace_root: PathBuf,
     pub event_viewer: bool,
     pub event_scroll: u16,
@@ -204,6 +207,9 @@ pub struct AppModel {
     credential_error: Option<String>,
     composer: TextArea<'static>,
     composer_drafts: HashMap<TabId, TextArea<'static>>,
+    composer_history: Vec<String>,
+    composer_history_index: Option<usize>,
+    composer_history_draft: Option<String>,
     composer_active: bool,
     composer_hitbox: Rect,
     retry_starting: bool,
@@ -259,6 +265,8 @@ impl AppModel {
             artifacts: vec![],
             model_catalog: ModelCatalog::default(),
             agent_provider_kinds: HashMap::new(),
+            agent_runtime_models: HashMap::new(),
+            agent_estimated_costs: HashMap::new(),
             workspace_root: ".".into(),
             event_viewer: false,
             event_scroll: 0,
@@ -297,6 +305,9 @@ impl AppModel {
             credential_error: None,
             composer,
             composer_drafts: HashMap::new(),
+            composer_history: Vec::new(),
+            composer_history_index: None,
+            composer_history_draft: None,
             composer_active: false,
             composer_hitbox: Rect::default(),
             retry_starting: false,
@@ -354,6 +365,7 @@ impl AppModel {
             self.task_pane_focused = self.task_pane_focused_before_tasks_tab;
         }
         if current != tab {
+            self.reset_composer_history_navigation();
             self.task_layout.cancel_drag();
             self.task_inspector_scroll = 0;
             self.notifications.clear();
@@ -438,10 +450,7 @@ impl AppModel {
                 if Some(agent.id) == self.team_lead {
                     message.to_owned()
                 } else {
-                    format!(
-                        "The user addressed this request to {} ({}). As Team Lead, delegate it to this role through the normal persisted task workflow, then review and integrate its response. If that is unsafe or impossible, report the blocker; do not impersonate the role or bypass approvals.\n\nUser request:\n{message}",
-                        agent.name, agent.role
-                    )
+                    routed_agent_objective(&agent.name, &agent.role, message)
                 }
             },
         )
@@ -1067,6 +1076,69 @@ impl AppModel {
         }
     }
 
+    fn reset_composer_history_navigation(&mut self) {
+        self.composer_history_index = None;
+        self.composer_history_draft = None;
+    }
+
+    fn remember_composer_prompt(&mut self, prompt: &str) {
+        if self
+            .composer_history
+            .last()
+            .is_none_or(|previous| previous != prompt)
+        {
+            self.composer_history.push(prompt.to_owned());
+            if self.composer_history.len() > PROMPT_HISTORY_LIMIT {
+                self.composer_history.remove(0);
+            }
+        }
+        self.reset_composer_history_navigation();
+    }
+
+    fn set_composer_text(&mut self, text: &str) {
+        self.composer.clear();
+        self.composer.insert_str(text);
+    }
+
+    fn navigate_composer_history(&mut self, older: bool) -> bool {
+        if self.composer_history.is_empty() {
+            return false;
+        }
+
+        if self.composer_history_index.is_none() {
+            if !older {
+                return false;
+            }
+            let DataCursor(line, _) = self.composer.cursor();
+            if line != 0 {
+                return false;
+            }
+        }
+
+        if older {
+            let index = self.composer_history_index.map_or_else(
+                || {
+                    self.composer_history_draft = Some(self.composer.lines().join("\n"));
+                    self.composer_history.len() - 1
+                },
+                |index| index.saturating_sub(1),
+            );
+            self.composer_history_index = Some(index);
+            self.set_composer_text(&self.composer_history[index].clone());
+        } else if let Some(index) = self.composer_history_index {
+            if index + 1 < self.composer_history.len() {
+                let next = index + 1;
+                self.composer_history_index = Some(next);
+                self.set_composer_text(&self.composer_history[next].clone());
+            } else {
+                self.composer_history_index = None;
+                let draft = self.composer_history_draft.take().unwrap_or_default();
+                self.set_composer_text(&draft);
+            }
+        }
+        true
+    }
+
     fn handle_composer_event(&mut self, event: &Event) -> ComposerEvent {
         if self.application_notice.is_some()
             && matches!(event, Event::Key(key) if matches!(key.code, KeyCode::Char('A' | 'e')))
@@ -1087,11 +1159,13 @@ impl AppModel {
         }
         match event {
             Event::Paste(value) => {
+                self.reset_composer_history_navigation();
                 self.composer.insert_str(value);
                 ComposerEvent::Consumed
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => {
+                    self.reset_composer_history_navigation();
                     self.composer_active = false;
                     self.quit = true;
                     ComposerEvent::Consumed
@@ -1101,10 +1175,12 @@ impl AppModel {
                         .modifiers
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
+                    self.reset_composer_history_navigation();
                     self.composer.insert_newline();
                     ComposerEvent::Consumed
                 }
                 KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.reset_composer_history_navigation();
                     self.composer.insert_newline();
                     ComposerEvent::Consumed
                 }
@@ -1117,24 +1193,40 @@ impl AppModel {
                         self.warn("Keep messages under 8,000 bytes.");
                         ComposerEvent::Consumed
                     } else {
+                        self.remember_composer_prompt(&message);
                         self.composer.clear();
                         self.composer_active = false;
                         ComposerEvent::Submit(message)
                     }
                 }
                 KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.reset_composer_history_navigation();
                     self.composer.undo();
                     ComposerEvent::Consumed
                 }
                 KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.reset_composer_history_navigation();
                     self.composer.redo();
                     ComposerEvent::Consumed
                 }
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     ComposerEvent::Ignored
                 }
+                KeyCode::Up => {
+                    if !self.navigate_composer_history(true) {
+                        self.composer.input(*key);
+                    }
+                    ComposerEvent::Consumed
+                }
+                KeyCode::Down => {
+                    if !self.navigate_composer_history(false) {
+                        self.composer.input(*key);
+                    }
+                    ComposerEvent::Consumed
+                }
                 KeyCode::Tab | KeyCode::BackTab => ComposerEvent::Ignored,
                 _ => {
+                    self.reset_composer_history_navigation();
                     self.composer.input(*key);
                     ComposerEvent::Consumed
                 }
@@ -1152,6 +1244,7 @@ impl AppModel {
                     .composer_hitbox
                     .contains((mouse.column, mouse.row).into()) =>
             {
+                self.reset_composer_history_navigation();
                 self.composer.input(*mouse);
                 ComposerEvent::Consumed
             }
@@ -1578,11 +1671,52 @@ impl AppModel {
                 }
                 CanonicalEventKind::Usage {
                     input_tokens,
+                    cached_input_tokens,
                     output_tokens,
+                    model,
                 } => {
                     let usage = self.agent_usage.entry(owner).or_default();
                     usage.input_tokens = usage.input_tokens.saturating_add(*input_tokens);
+                    usage.cached_input_tokens = usage
+                        .cached_input_tokens
+                        .saturating_add(*cached_input_tokens);
                     usage.output_tokens = usage.output_tokens.saturating_add(*output_tokens);
+                    if let Some(model) = model.as_ref().filter(|model| !model.trim().is_empty()) {
+                        self.agent_runtime_models.insert(owner, model.clone());
+                    }
+                    let provider = self
+                        .agent_provider_kinds
+                        .get(&owner)
+                        .map(String::as_str)
+                        .or_else(|| {
+                            self.agents
+                                .iter()
+                                .chain(self.known_agents.values())
+                                .find(|agent| agent.id == owner)
+                                .map(|agent| agent.provider.as_str())
+                        })
+                        .unwrap_or_default();
+                    let effective_model = model
+                        .as_deref()
+                        .filter(|model| !model.trim().is_empty())
+                        .or_else(|| self.agent_runtime_models.get(&owner).map(String::as_str))
+                        .or_else(|| {
+                            self.agents
+                                .iter()
+                                .chain(self.known_agents.values())
+                                .find(|agent| agent.id == owner)
+                                .map(|agent| agent.model.as_str())
+                        })
+                        .unwrap_or_default();
+                    // Re-estimate the agent's accumulated usage with its latest
+                    // resolved model. Older persisted events may not have model
+                    // metadata, so they can only be priced once one is known.
+                    let estimate = estimate_cost(
+                        provider,
+                        effective_model,
+                        self.agent_usage.get(&owner).copied().unwrap_or_default(),
+                    );
+                    self.agent_estimated_costs.insert(owner, estimate);
                 }
                 _ => {}
             }
@@ -1990,6 +2124,7 @@ fn format_event(kind: &CanonicalEventKind) -> String {
         CanonicalEventKind::Usage {
             input_tokens,
             output_tokens,
+            ..
         } => format!("usage: {input_tokens} in / {output_tokens} out"),
         CanonicalEventKind::ProviderCompleted => "provider completed".into(),
         CanonicalEventKind::ProviderFailed(e) => format!("provider failed: {}", sanitize(e)),
@@ -2034,10 +2169,16 @@ fn format_event(kind: &CanonicalEventKind) -> String {
         }
         CanonicalEventKind::ProcessFinished {
             program,
+            verification,
             exit_code,
             truncated,
         } => format!(
-            "process {program}: exit {exit_code:?}{}",
+            "{} {program}: exit {exit_code:?}{}",
+            if *verification {
+                "verification"
+            } else {
+                "process"
+            },
             if *truncated { " (truncated)" } else { "" }
         ),
         CanonicalEventKind::TaskDelegated { parent, child, .. } => {
@@ -2286,6 +2427,10 @@ pub(crate) enum TuiExit {
 pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiExit>, TuiError> {
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
     let credential_repository = Arc::clone(&config.repo);
+    let composer_history = credential_repository
+        .prompt_history(&config.workspace_root)
+        .await
+        .map_err(|error| TuiError::Io(io::Error::other(error)))?;
     let agent_profiles = config.agent_profiles.clone();
     let startup_scan_provider = config.providers.get(&config.default_provider).cloned();
     let startup_setup_prompt = if config.startup_goal.is_some() {
@@ -2309,6 +2454,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
     let mut app = AppModel::new(config.session);
     app.automatic_review = config.automatic_review;
     app.workspace_root = config.workspace_root.clone();
+    app.composer_history = composer_history;
     app.agents = agent_profiles;
     app.known_agents = config.known_agents;
     app.model_catalog = config.model_catalog;
@@ -2632,6 +2778,18 @@ async fn terminal_loop<R: Repository + 'static>(
                 } else if !handled {
                     match model.handle_composer_event(&event) {
                         ComposerEvent::Submit(objective) => {
+                            if let Err(error) = credential_repository
+                                .save_prompt_history(&model.workspace_root, &objective)
+                                .await
+                            {
+                                let _ = model.notify(
+                                    "Prompt history not saved",
+                                    &error.to_string(),
+                                    Level::Error,
+                                    theme::RED,
+                                    false,
+                                );
+                            }
                             let role_target = model
                                 .composer_target()
                                 .filter(|agent| Some(agent.id) != model.team_lead)
@@ -3019,7 +3177,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut AppModel) {
         let DataCursor(line, column) = app.composer.cursor();
         Some((
             Line::from(format!(
-                " Enter send · Shift+Enter newline · {}:{} ",
+                " Enter send · Shift+Enter newline · ↑/↓ history · {}:{} ",
                 line + 1,
                 column + 1
             ))
@@ -4520,7 +4678,9 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("+/-/0/f", "Zoom / reset / fit"),
             help_binding("Ctrl+arrows", "Move agent card"),
             help_binding("Enter / Shift+Enter", "Message / new line"),
+            help_binding("↑ / ↓", "Prompt history"),
             help_binding("Ctrl+Z / Y", "Undo / redo"),
+            Line::from(""),
         ]
     } else {
         vec![
@@ -4550,7 +4710,9 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Ctrl+arrows", "Move agent card"),
             help_binding("Enter", "Message agent"),
             help_binding("Shift+Enter", "New line"),
+            help_binding("↑ / ↓", "Prompt history"),
             help_binding("Ctrl+Z / Y", "Undo / redo"),
+            Line::from(""),
         ]
     }
 }
@@ -4757,6 +4919,8 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
             reviews: &app.lead_reviews,
             responses: &app.agent_responses,
             usage: &app.agent_usage,
+            runtime_models: &app.agent_runtime_models,
+            estimated_costs: &app.agent_estimated_costs,
             provider_kinds: &app.agent_provider_kinds,
             team_lead: app.team_lead,
         },
@@ -4823,11 +4987,30 @@ fn agent_usage_rows(app: &AppModel) -> Vec<AgentUsageRow> {
                     other => other,
                 }
                 .to_owned(),
-                model: (!agent.model.trim().is_empty() && agent.model != "default")
-                    .then(|| sanitize(&agent.model)),
+                model: app
+                    .agent_runtime_models
+                    .get(&agent.id)
+                    .map(String::as_str)
+                    .filter(|model| !model.trim().is_empty() && *model != "default")
+                    .or_else(|| {
+                        (!agent.model.trim().is_empty() && agent.model != "default")
+                            .then_some(agent.model.as_str())
+                    })
+                    .map(sanitize),
                 usage,
                 estimated_cost: has_usage
-                    .then(|| estimate_cost(provider, &agent.model, usage))
+                    .then(|| {
+                        app.agent_estimated_costs
+                            .get(&agent.id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                let model = app
+                                    .agent_runtime_models
+                                    .get(&agent.id)
+                                    .map_or(agent.model.as_str(), String::as_str);
+                                estimate_cost(provider, model, usage)
+                            })
+                    })
                     .flatten(),
                 task_count,
                 completed_count,
@@ -4973,7 +5156,7 @@ fn usage_agent_lines(rows: &[AgentUsageRow], total_cost: f64, width: u16) -> Vec
             let cost = row.estimated_cost.map_or_else(
                 || {
                     if row.token_count() > 0 {
-                        "unpriced".to_owned()
+                        "n/a".to_owned()
                     } else {
                         "no usage".to_owned()
                     }
@@ -5058,7 +5241,7 @@ fn usage_agent_lines(rows: &[AgentUsageRow], total_cost: f64, width: u16) -> Vec
         let cost = row.estimated_cost.map_or_else(
             || {
                 if row.token_count() > 0 {
-                    "unpriced".to_owned()
+                    "n/a".to_owned()
                 } else {
                     "—".to_owned()
                 }
@@ -5400,9 +5583,11 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
                         .add_modifier(Modifier::BOLD),
                 )))
                 .title_bottom(
-                    Line::from(" ? / Esc close · q safe exit ")
-                        .style(Style::default().fg(theme::AQUA))
-                        .alignment(Alignment::Center),
+                    Line::from(Span::styled(
+                        " [?] / [Esc] close · [q] safe exit ",
+                        Style::default().fg(theme::AQUA),
+                    ))
+                    .alignment(Alignment::Center),
                 )
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -6174,7 +6359,9 @@ mod tests {
             Some(child.id),
             &CanonicalEventKind::Usage {
                 input_tokens: 17,
+                cached_input_tokens: 0,
                 output_tokens: 9,
+                model: None,
             },
         );
         app.push_scoped_event(
@@ -6572,7 +6759,9 @@ mod tests {
             Some(task.id),
             &CanonicalEventKind::Usage {
                 input_tokens: 1,
+                cached_input_tokens: 0,
                 output_tokens: 2,
+                model: None,
             },
         );
         app.push_scoped_event(
@@ -6753,6 +6942,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!help.contains("Ctrl+F4"));
+        assert!(help.contains("↑ / ↓"));
+        assert!(help.contains("Prompt history"));
+        assert!(
+            help_lines(false)
+                .last()
+                .is_some_and(|line| line.width() == 0)
+        );
     }
 
     #[test]
@@ -6763,6 +6959,7 @@ mod tests {
             model: None,
             usage: TokenUsage {
                 input_tokens: 2_000,
+                cached_input_tokens: 0,
                 output_tokens: 400,
             },
             estimated_cost: None,
@@ -6808,6 +7005,7 @@ mod tests {
             priced.id,
             TokenUsage {
                 input_tokens: 1_000,
+                cached_input_tokens: 0,
                 output_tokens: 1_000,
             },
         );
@@ -6815,6 +7013,7 @@ mod tests {
             high_usage.id,
             TokenUsage {
                 input_tokens: 28_000,
+                cached_input_tokens: 0,
                 output_tokens: 118,
             },
         );
@@ -6840,6 +7039,7 @@ mod tests {
             backend.id,
             TokenUsage {
                 input_tokens: 1_240,
+                cached_input_tokens: 0,
                 output_tokens: 318,
             },
         );
@@ -6847,6 +7047,7 @@ mod tests {
             cli.id,
             TokenUsage {
                 input_tokens: 400,
+                cached_input_tokens: 0,
                 output_tokens: 100,
             },
         );
@@ -7666,10 +7867,19 @@ mod tests {
             colored_logo_cells > 10,
             "ANSI logo should retain its colors"
         );
-        assert!(rendered.contains("Add agent"));
+        let (_, compact, _) = help_popup_layout(Rect::new(0, 0, 112, 32));
+        assert!(rendered.contains(if compact {
+            "Add / remove agent"
+        } else {
+            "Add agent"
+        }));
         assert!(popup.width < 104, "popup should fit its content: {popup:?}");
         assert!(popup.width > 60, "logo and help list should fit: {popup:?}");
-        assert_eq!(popup.height, 29);
+        assert!(
+            usize::from(popup.height) >= help_lines(compact).len() + 2,
+            "popup should leave room for the help list and its padding: {popup:?}"
+        );
+        assert!(rendered.contains("[?] / [Esc] close · [q] safe exit"));
         let title_row = (0..112)
             .map(|x| buffer[(x, popup.y)].symbol())
             .collect::<String>();
@@ -7898,6 +8108,52 @@ mod tests {
         );
         assert!(!app.composer_active);
         assert_eq!(app.composer.lines(), [""]);
+    }
+
+    #[test]
+    fn composer_up_down_navigates_prompt_history_and_restores_the_draft() {
+        let mut app = AppModel::new(SessionId::new());
+        let enter = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        for prompt in ["first request", "second request"] {
+            app.composer_active = true;
+            app.handle_composer_event(&Event::Paste(prompt.into()));
+            assert_eq!(
+                app.handle_composer_event(&enter),
+                ComposerEvent::Submit(prompt.into())
+            );
+        }
+
+        app.composer_active = true;
+        app.handle_composer_event(&Event::Paste("unsent draft".into()));
+        let up = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        ));
+        let down = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.handle_composer_event(&up), ComposerEvent::Consumed);
+        assert_eq!(app.composer.lines(), ["second request"]);
+        app.handle_composer_event(&up);
+        assert_eq!(app.composer.lines(), ["first request"]);
+        app.handle_composer_event(&up);
+        assert_eq!(app.composer.lines(), ["first request"]);
+        app.handle_composer_event(&down);
+        assert_eq!(app.composer.lines(), ["second request"]);
+        app.handle_composer_event(&down);
+        assert_eq!(app.composer.lines(), ["unsent draft"]);
+
+        app.handle_composer_event(&Event::Paste("\nsecond line".into()));
+        assert_eq!(app.composer.cursor().0, 1);
+        app.handle_composer_event(&up);
+        assert_eq!(app.composer.cursor().0, 0);
+        app.handle_composer_event(&down);
+        assert_eq!(app.composer.cursor().0, 1);
     }
 
     #[test]
@@ -8308,7 +8564,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             kind: CanonicalEventKind::Usage {
                 input_tokens: 1_000,
+                cached_input_tokens: 0,
                 output_tokens: 500,
+                model: None,
             },
         }));
         assert!(!app.events.is_empty());
