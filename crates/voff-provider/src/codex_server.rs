@@ -44,7 +44,7 @@ pub(crate) async fn run(
     schema: &Value,
     sink: &ProviderEventSink,
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
     let mut overrides = Vec::new();
     for _ in 0..2 {
         match run_isolated(
@@ -58,7 +58,7 @@ pub(crate) async fn run(
         )
         .await?
         {
-            Outcome::Response(bytes) => return Ok(bytes),
+            Outcome::Response(bytes, usage) => return Ok((bytes, usage)),
             Outcome::DisableIntegrations(settings) => overrides = settings,
         }
     }
@@ -68,7 +68,7 @@ pub(crate) async fn run(
 }
 
 enum Outcome {
-    Response(Vec<u8>),
+    Response(Vec<u8>, Option<Usage>),
     DisableIntegrations(Vec<String>),
 }
 
@@ -277,6 +277,10 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut turn_id = None;
     let mut final_text = None;
     let mut output_bytes = 0usize;
+    let mut reported_usage = Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+    };
     loop {
         let value = wire.next().await?;
         deny_server_request(&mut input, &value).await?;
@@ -343,6 +347,11 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     final_text = Some(text.as_bytes().to_vec());
                 }
             }
+            Some("thread/tokenUsage/updated") => {
+                if let Some(total) = codex_total_usage(&params["tokenUsage"]["total"]) {
+                    reported_usage = total;
+                }
+            }
             Some("turn/completed") => {
                 if let Some(expected) = &turn_id
                     && params["turn"]["id"].as_str() != Some(expected)
@@ -354,13 +363,22 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     error.message = format!("Codex turn failed: {}", error.message);
                     return Err(error);
                 }
-                return final_text
-                    .map(Outcome::Response)
-                    .ok_or_else(|| invalid("Codex completed without a structured final message"));
+                let response = final_text
+                    .ok_or_else(|| invalid("Codex completed without a structured final message"))?;
+                let usage = (reported_usage.input_tokens > 0 || reported_usage.output_tokens > 0)
+                    .then_some(reported_usage);
+                return Ok(Outcome::Response(response, usage));
             }
             _ => {} // Ignore additive protocol events, never parse reasoning as text.
         }
     }
+}
+
+fn codex_total_usage(total: &Value) -> Option<Usage> {
+    Some(Usage {
+        input_tokens: total["inputTokens"].as_u64()?,
+        output_tokens: total["outputTokens"].as_u64()?,
+    })
 }
 
 fn integration_overrides(config: &Value) -> Vec<String> {
@@ -451,6 +469,7 @@ fn disconnected() -> ProviderError {
 fn rpc_error(error: &Value) -> ProviderError {
     // Classify internally; never echo an RPC message which could contain input.
     let text = error.to_string().to_ascii_lowercase();
+    let code = error["code"].as_i64();
     let (kind, retryable, message) = if text.contains("experimental") {
         (
             ProviderErrorKind::InvalidResponse,
@@ -475,18 +494,39 @@ fn rpc_error(error: &Value) -> ProviderError {
     } else if text.contains("ratelimit")
         || text.contains("rate_limit")
         || text.contains("usage limit")
+        || text.contains("too many requests")
     {
         (
             ProviderErrorKind::RateLimit,
             true,
             "Codex account was rate limited",
         )
-    } else if text.contains("stream") || text.contains("connect") || text.contains("internalserver")
+    } else if code == Some(-32603)
+        || [
+            "stream",
+            "connect",
+            "internalserver",
+            "internal server",
+            "server error",
+            "service unavailable",
+            "temporarily unavailable",
+            "temporary failure",
+            "try again later",
+            "overloaded",
+            "gateway timeout",
+            "bad gateway",
+            "status: 500",
+            "status: 502",
+            "status: 503",
+            "status: 504",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
     {
         (
             ProviderErrorKind::Internal,
             true,
-            "Codex upstream connection failed",
+            "Codex app-server reported a temporary upstream failure",
         )
     } else {
         (

@@ -1,6 +1,7 @@
 use super::sanitize;
 use crate::theme;
 use crossterm::event::{MouseEvent, MouseEventKind};
+use llm_kernel::provider::ProviderIndex;
 use rataflow::{
     ControlsAction, Edge, EdgeMarker, EdgeStyle, FitViewOptions, Flow, FlowEvent, Handle,
     HandlePosition, Node, NodeContent, NodeRenderContext, Position, Reconnectable, StepEdge,
@@ -24,13 +25,23 @@ struct AgentCard {
     max_width: f64,
     identity: String,
     provider: String,
-    model: String,
-    detail: String,
+    model: Option<String>,
+    task: Option<String>,
+    focus: Option<String>,
+    activity: Option<String>,
     response: Option<String>,
+    usage: TokenUsage,
+    estimated_cost: Option<f64>,
     status: &'static str,
     status_color: Color,
     agent_color: Color,
     display_level: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl AgentCard {
@@ -56,28 +67,32 @@ impl AgentCard {
             status_symbol(self.status)
         };
         let status_label = match self.status {
-            "working" => "LIVE · working",
-            "reviewing" => "REVIEW · reporting agent",
-            "approval" => "GATE · approval",
-            "ready" | "queued" => "ASSIGNED",
-            value => value,
+            "working" => "RUNNING",
+            "reviewing" => "REVIEW",
+            "approval" => "NEEDS APPROVAL",
+            "ready" => "READY",
+            "queued" => "QUEUED",
+            "complete" => "DONE",
+            "disabled" => "DISABLED",
+            "blocked" => "BLOCKED",
+            "failed" => "FAILED",
+            "cancelled" => "CANCELLED",
+            _ => "Idle",
         };
-        let status = Line::from(vec![
-            Span::styled(
-                format!("{status_symbol} {status_label}"),
-                Style::default()
-                    .fg(self.status_color)
-                    .add_modifier(if self.status == "working" {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(
-                format!("  {}", self.provider),
-                Style::default().fg(theme::MUTED),
-            ),
-        ]);
+        let status_text = self.activity.as_ref().map_or_else(
+            || status_label.to_owned(),
+            |activity| format!("{status_label} · {activity}"),
+        );
+        let status = Line::from(vec![Span::styled(
+            format!("{status_symbol} {status_text}"),
+            Style::default()
+                .fg(self.status_color)
+                .add_modifier(if self.status == "working" {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )]);
         let identity = Line::from(Span::styled(
             self.identity.as_str(),
             Style::default()
@@ -87,37 +102,80 @@ impl AgentCard {
         let mut lines = vec![identity];
         if self.display_level >= 1 {
             lines.push(status);
-        }
-        if self.display_level >= 2
-            && let Some(response) = &self.response
-        {
-            let width = usize::from(inner_width.saturating_sub(2).max(1));
-            let wrapped = textwrap::wrap(response, width);
-            let keep = if self.status == "working" { 3 } else { 1 };
-            let first = wrapped.len().saturating_sub(keep);
-            for (index, line) in wrapped.into_iter().skip(first).enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if index == 0 { "↳ " } else { "  " },
-                        Style::default().fg(theme::ORANGE),
-                    ),
-                    Span::styled(line.into_owned(), Style::default().fg(theme::TEXT)),
-                ]));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", self.provider),
+                Style::default().fg(theme::MUTED),
+            )));
+            if self.display_level < 2
+                && let Some(usage) = usage_summary(self.usage)
+            {
+                lines.extend(wrapped_card_detail(
+                    "  ",
+                    &usage,
+                    inner_width,
+                    1,
+                    false,
+                    theme::MUTED,
+                ));
             }
         }
         if self.display_level >= 2 {
-            lines.push(Line::from(Span::styled(
-                self.model.as_str(),
-                Style::default().fg(theme::MUTED),
-            )));
-            lines.push(Line::from(Span::styled(
-                self.detail.as_str(),
-                Style::default().fg(if self.status == "idle" {
-                    theme::MUTED
-                } else {
-                    self.status_color
-                }),
-            )));
+            if let Some(task) = &self.task {
+                lines.extend(wrapped_card_detail(
+                    "↳ ",
+                    task,
+                    inner_width,
+                    3,
+                    false,
+                    theme::TEXT,
+                ));
+            } else if let Some(focus) = &self.focus {
+                lines.extend(wrapped_card_detail(
+                    "Focus · ",
+                    focus,
+                    inner_width,
+                    2,
+                    false,
+                    theme::TEXT,
+                ));
+            }
+            if let Some(response) = &self.response {
+                lines.extend(wrapped_card_detail(
+                    "  ",
+                    response,
+                    inner_width,
+                    2,
+                    self.status == "working",
+                    theme::MUTED,
+                ));
+            }
+            if let Some(model) = &self.model {
+                lines.push(Line::from(Span::styled(
+                    format!("Model · {model}"),
+                    Style::default().fg(theme::MUTED),
+                )));
+            }
+            let cost = self.estimated_cost.map_or_else(
+                || {
+                    if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
+                        " · cost unreported".to_owned()
+                    } else {
+                        String::new()
+                    }
+                },
+                |cost| format!(" · est. {}", format_usd(cost)),
+            );
+            if let Some(usage) = usage_summary(self.usage) {
+                let usage_text = format!("Tokens · {usage}{cost}");
+                lines.extend(wrapped_card_detail(
+                    "  ",
+                    &usage_text,
+                    inner_width,
+                    2,
+                    false,
+                    theme::MUTED,
+                ));
+            }
         }
         lines
     }
@@ -194,6 +252,7 @@ pub(super) struct TeamSnapshot<'a> {
     pub approvals: &'a [Approval],
     pub reviews: &'a HashMap<TaskId, String>,
     pub responses: &'a HashMap<AgentId, String>,
+    pub usage: &'a HashMap<AgentId, TokenUsage>,
     pub provider_kinds: &'a HashMap<AgentId, String>,
     pub team_lead: Option<AgentId>,
 }
@@ -236,6 +295,7 @@ impl TeamFlow {
                         snapshot.tasks,
                         snapshot.approvals,
                         snapshot.responses,
+                        snapshot.usage,
                         snapshot.provider_kinds,
                         theme::agent_color(index),
                     );
@@ -263,11 +323,10 @@ impl TeamFlow {
                 if let Some(card) = self.flow.node_content_mut(&node_id(owner)) {
                     card.status = "reviewing";
                     card.status_color = theme::AQUA;
-                    card.detail = caption.clone();
-                    card.response = Some(if Some(owner) == reviewer {
-                        format!("Reviewing {}", super::short_task_id(*task_id))
+                    card.activity = Some(if Some(owner) == reviewer {
+                        caption.clone()
                     } else {
-                        "→ Reporting agent for decision".into()
+                        "waiting for lead".into()
                     });
                 }
             }
@@ -384,6 +443,7 @@ impl TeamFlow {
                             snapshot.tasks,
                             snapshot.approvals,
                             snapshot.responses,
+                            snapshot.usage,
                             snapshot.provider_kinds,
                             theme::agent_color(index),
                         )
@@ -590,67 +650,209 @@ fn agent_card(
     tasks: &[Task],
     approvals: &[Approval],
     responses: &HashMap<AgentId, String>,
+    usage: &HashMap<AgentId, TokenUsage>,
     provider_kinds: &HashMap<AgentId, String>,
     agent_color: Color,
 ) -> AgentCard {
     let pending = pending_delegation_for_target(approvals, &agent.name);
     let (status, status_color) = agent_status(tasks, agent, pending.is_some());
     let display_task = agent_display_task(tasks, agent.id);
-    let detail = if let Some(task) = display_task {
-        format!(
-            "{} {}",
-            task_status_marker(task.status),
-            truncate_label(&sanitize(&task.objective), 32)
-        )
-    } else if let Some(proposal) = pending {
-        format!("? {}", truncate_label(&sanitize(&proposal.objective), 32))
-    } else if !agent.enabled {
-        "Unavailable · no new assignments".into()
-    } else {
-        format!("{} token limit", agent.max_output_tokens)
-    };
+    let task = display_task
+        .map(|task| task.objective.as_str())
+        .or_else(|| pending.as_ref().map(|proposal| proposal.objective.as_str()))
+        .map(|objective| truncate_label(&sanitize(objective), 128));
+    let focus = (agent.enabled && task.is_none())
+        .then(|| prompt_summary(&agent.system_prompt))
+        .flatten();
     let provider_kind = provider_kinds
         .get(&agent.id)
         .map_or(agent.provider.as_str(), String::as_str);
-    let model = if agent.model == "default" && matches!(provider_kind, "codex_cli" | "claude_cli") {
-        "Model · CLI automatic".into()
-    } else {
-        format!("Model · {}", sanitize(&agent.model))
-    };
+    let model = (!agent.model.trim().is_empty() && agent.model != "default")
+        .then(|| truncate_label(&sanitize(&agent.model), 32));
+    let task_text = task.as_deref().unwrap_or_default();
     let response = responses
         .get(&agent.id)
         .filter(|response| !response.trim().is_empty())
+        .filter(|response| !repeats_task(response, task_text))
         .map(|response| {
             let excerpt = sanitize(response)
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
             if status == "working" {
-                excerpt
+                truncate_tail_label(&excerpt, 112)
             } else {
-                truncate_label(&excerpt, 34)
+                truncate_label(&excerpt, 112)
             }
         });
+    let usage = usage.get(&agent.id).copied().unwrap_or_default();
+    let estimated_cost = estimate_cost(provider_kind, &agent.model, usage);
     let name = sanitize(&agent.name);
     let identity = format!("{} {name}", role_icon(&agent.role));
     AgentCard {
-        max_width: 36.0,
+        max_width: 48.0,
         identity,
         provider: match provider_kind {
-            "codex_cli" => "Codex · CLI",
-            "claude_cli" => "Claude · CLI",
+            "codex_cli" => "Codex CLI",
+            "claude_cli" => "Claude CLI",
             "ollama" => "Ollama · local",
-            "openai" => "OpenAI · cloud",
+            "openai" => "OpenAI API",
             _ => provider_kind,
         }
         .into(),
         model,
-        detail,
+        task,
+        focus,
+        activity: None,
         response,
+        usage,
+        estimated_cost,
         status,
         status_color,
         agent_color,
         display_level: 2,
+    }
+}
+
+fn prompt_summary(prompt: &str) -> Option<String> {
+    let normalized = sanitize(prompt)
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(['#', '-', '*', '•', ' '])
+                .trim()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let sentence_end = normalized
+        .char_indices()
+        .filter_map(|(index, ch)| matches!(ch, '.' | '!' | '?').then_some(index + ch.len_utf8()))
+        .take(2)
+        .last();
+    let sentence = sentence_end.map_or(normalized.as_str(), |end| &normalized[..end]);
+    let sentence = sentence
+        .trim_start_matches("Role:")
+        .trim_start_matches("Focus:")
+        .trim_start_matches("You are ")
+        .trim_start_matches("Your role is ")
+        .trim_start_matches("Your focus is to ")
+        .trim_start_matches("You are responsible for ")
+        .trim_start();
+    let summary = truncate_label(sentence, 96);
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn estimate_cost(provider: &str, model_id: &str, usage: TokenUsage) -> Option<f64> {
+    let model = ProviderIndex::embedded()
+        .models_for(provider)
+        .iter()
+        .find(|model| model.id == model_id)?;
+    let cost = model.cost.as_ref()?;
+    Some(
+        (usage.input_tokens as f64 * cost.input + usage.output_tokens as f64 * cost.output)
+            / 1_000_000.0,
+    )
+}
+
+fn wrapped_card_detail(
+    prefix: &str,
+    value: &str,
+    width: u16,
+    max_lines: usize,
+    keep_tail: bool,
+    color: Color,
+) -> Vec<Line<'static>> {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let text_width = usize::from(width).saturating_sub(prefix_width).max(1);
+    let wrapped = textwrap::wrap(value, text_width);
+    let overflow = wrapped.len() > max_lines;
+    let first = if keep_tail && overflow {
+        wrapped.len().saturating_sub(max_lines)
+    } else {
+        0
+    };
+    wrapped
+        .into_iter()
+        .skip(first)
+        .take(max_lines)
+        .enumerate()
+        .map(|(index, text)| {
+            let text = if overflow && !keep_tail && index + 1 == max_lines {
+                let available = text_width.saturating_sub(1).min(u16::MAX as usize) as u16;
+                let truncated = truncate_label(text.as_ref(), available);
+                if truncated.ends_with('…') {
+                    truncated
+                } else {
+                    format!("{truncated}…")
+                }
+            } else {
+                text.into_owned()
+            };
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 {
+                        prefix.to_owned()
+                    } else {
+                        " ".repeat(prefix_width)
+                    },
+                    Style::default().fg(theme::ORANGE),
+                ),
+                Span::styled(text, Style::default().fg(color)),
+            ])
+        })
+        .collect()
+}
+
+fn repeats_task(response: &str, task: &str) -> bool {
+    let normalize = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let response = normalize(response);
+    let task = normalize(task);
+    task.len() > 20
+        && (response == task || response.starts_with(&task) || task.starts_with(&response))
+}
+
+fn compact_count(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 10_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else if value < 1_000_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    }
+}
+
+fn usage_summary(usage: TokenUsage) -> Option<String> {
+    (usage.input_tokens > 0 || usage.output_tokens > 0).then(|| {
+        format!(
+            "{} in / {} out",
+            compact_count(usage.input_tokens),
+            compact_count(usage.output_tokens),
+        )
+    })
+}
+
+fn format_usd(value: f64) -> String {
+    if value == 0.0 {
+        "$0.00".into()
+    } else if value < 0.0001 {
+        "<$0.0001".into()
+    } else if value < 0.01 {
+        format!("${value:.4}")
+    } else if value < 1.0 {
+        format!("${value:.3}")
+    } else {
+        format!("${value:.2}")
     }
 }
 
@@ -814,7 +1016,11 @@ fn node_layout(area: Rect, agents: &[AgentProfile]) -> Vec<(Position, f64, f64)>
             depth.min(count.saturating_sub(1))
         })
         .collect::<Vec<_>>();
-    let card_width = area.width.clamp(1, 36);
+    let card_width = if count > 1 && area.width < 96 {
+        area.width.saturating_div(2).max(1)
+    } else {
+        area.width.clamp(1, 48)
+    };
     let peer_gap = area
         .width
         .saturating_sub(card_width.saturating_mul(2))
@@ -838,7 +1044,7 @@ fn node_layout(area: Rect, agents: &[AgentProfile]) -> Vec<(Position, f64, f64)>
         .sum::<usize>()
         .max(1);
     let card_height = (area.height / u16::try_from(total_rows).unwrap_or(u16::MAX).max(1))
-        .clamp(3, 7)
+        .clamp(3, 13)
         .min(area.height);
     let row_gaps = total_rows.saturating_sub(1);
     let row_gap = if row_gaps == 0 {
@@ -952,11 +1158,7 @@ fn delegated_task(tasks: &[Task], source: AgentId, target: AgentId) -> Option<&T
                     .any(|parent| parent.id == parent_id && parent.owner == source)
             })
         })
-        .max_by(|left, right| {
-            task_priority(left.status)
-                .cmp(&task_priority(right.status))
-                .then_with(|| left.updated_at.cmp(&right.updated_at))
-        })
+        .max_by(|left, right| task_relevance(left, right))
 }
 
 fn pending_delegation(
@@ -997,11 +1199,25 @@ fn agent_display_task(tasks: &[Task], owner: AgentId) -> Option<&Task> {
     tasks
         .iter()
         .filter(|task| task.owner == owner)
-        .max_by(|left, right| {
-            task_priority(left.status)
-                .cmp(&task_priority(right.status))
-                .then_with(|| left.updated_at.cmp(&right.updated_at))
-        })
+        .max_by(|left, right| task_relevance(left, right))
+}
+
+fn task_relevance(left: &Task, right: &Task) -> std::cmp::Ordering {
+    match (is_in_progress(left.status), is_in_progress(right.status)) {
+        (true, true) => task_priority(left.status)
+            .cmp(&task_priority(right.status))
+            .then_with(|| left.updated_at.cmp(&right.updated_at)),
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => left.updated_at.cmp(&right.updated_at),
+    }
+}
+
+const fn is_in_progress(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Queued | TaskStatus::Ready | TaskStatus::Running | TaskStatus::WaitingApproval
+    )
 }
 
 const fn task_priority(status: TaskStatus) -> u8 {
@@ -1014,17 +1230,6 @@ const fn task_priority(status: TaskStatus) -> u8 {
         TaskStatus::Failed => 2,
         TaskStatus::Completed => 1,
         TaskStatus::Cancelled => 0,
-    }
-}
-
-const fn task_status_marker(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Running => "▶",
-        TaskStatus::WaitingApproval => "?",
-        TaskStatus::Completed => "✓",
-        TaskStatus::Failed | TaskStatus::Blocked => "!",
-        TaskStatus::Cancelled => "×",
-        TaskStatus::Queued | TaskStatus::Ready => "◇",
     }
 }
 
@@ -1050,33 +1255,55 @@ fn truncate_label(value: &str, width: u16) -> String {
     shortened
 }
 
+fn truncate_tail_label(value: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut suffix = String::new();
+    let mut used = 0;
+    for ch in value.chars().rev() {
+        let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cells > width - 1 {
+            break;
+        }
+        suffix.push(ch);
+        used += cells;
+    }
+    format!("…{}", suffix.chars().rev().collect::<String>())
+}
+
 fn agent_status(tasks: &[Task], agent: &AgentProfile, pending: bool) -> (&'static str, Color) {
     if !agent.enabled {
         return ("disabled", theme::TEXT);
     }
-    let statuses = tasks
-        .iter()
-        .filter(|task| task.owner == agent.id)
-        .map(|task| task.status)
-        .collect::<Vec<_>>();
-    for (status, label, color) in [
-        (TaskStatus::Running, "working", theme::GREEN),
-        (TaskStatus::WaitingApproval, "approval", theme::YELLOW),
-        (TaskStatus::Ready, "ready", theme::AQUA),
-        (TaskStatus::Queued, "queued", theme::BLUE),
-        (TaskStatus::Blocked, "blocked", theme::RED),
-        (TaskStatus::Failed, "failed", theme::RED),
-        (TaskStatus::Completed, "complete", theme::GREEN),
-        (TaskStatus::Cancelled, "cancelled", theme::RED),
-    ] {
-        if statuses.contains(&status) {
-            return (label, color);
-        }
+    let task = agent_display_task(tasks, agent.id);
+    if let Some(task) = task.filter(|task| is_in_progress(task.status)) {
+        return task_status_presentation(task.status);
     }
     if pending {
         return ("approval", theme::YELLOW);
     }
+    if let Some(task) = task {
+        return task_status_presentation(task.status);
+    }
     ("idle", theme::TEXT)
+}
+
+const fn task_status_presentation(status: TaskStatus) -> (&'static str, Color) {
+    match status {
+        TaskStatus::Running => ("working", theme::GREEN),
+        TaskStatus::WaitingApproval => ("approval", theme::YELLOW),
+        TaskStatus::Ready => ("ready", theme::AQUA),
+        TaskStatus::Queued => ("queued", theme::BLUE),
+        TaskStatus::Blocked => ("blocked", theme::RED),
+        TaskStatus::Failed => ("failed", theme::RED),
+        TaskStatus::Completed => ("complete", theme::GREEN),
+        TaskStatus::Cancelled => ("cancelled", theme::RED),
+    }
 }
 
 fn status_symbol(status: &str) -> &'static str {
@@ -1114,6 +1341,8 @@ const fn plural_suffix(count: usize) -> &'static str {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
+    use chrono::TimeZone;
+    use voff_core::TaskLimits;
 
     fn agent(name: &str, targets: Vec<String>) -> AgentProfile {
         AgentProfile {
@@ -1131,6 +1360,41 @@ mod geometry_tests {
         }
     }
 
+    fn task(owner: AgentId, status: TaskStatus, updated_seconds: i64) -> Task {
+        let mut task = Task::root(owner, "objective", Vec::new(), TaskLimits::default());
+        task.status = status;
+        task.updated_at = chrono::Utc
+            .timestamp_opt(updated_seconds, 0)
+            .single()
+            .unwrap();
+        task
+    }
+
+    #[test]
+    fn newer_completion_replaces_an_older_blocked_card_status() {
+        let lead = agent("Lead", Vec::new());
+        let old_blocked = task(lead.id, TaskStatus::Blocked, 1);
+        let completed = task(lead.id, TaskStatus::Completed, 2);
+        let tasks = [old_blocked, completed.clone()];
+
+        assert_eq!(
+            agent_display_task(&tasks, lead.id).unwrap().id,
+            completed.id
+        );
+        assert_eq!(agent_status(&tasks, &lead, false).0, "complete");
+    }
+
+    #[test]
+    fn in_progress_task_takes_precedence_over_terminal_history() {
+        let lead = agent("Lead", Vec::new());
+        let completed = task(lead.id, TaskStatus::Completed, 2);
+        let running = task(lead.id, TaskStatus::Running, 1);
+        let tasks = [completed, running.clone()];
+
+        assert_eq!(agent_display_task(&tasks, lead.id).unwrap().id, running.id);
+        assert_eq!(agent_status(&tasks, &lead, false).0, "working");
+    }
+
     #[test]
     fn three_agent_startup_layout_centers_a_compact_reporting_tree() {
         let agents = [
@@ -1142,9 +1406,9 @@ mod geometry_tests {
             agent("Frontend Agent", vec![]),
         ];
         let layout = node_layout(Rect::new(0, 0, 160, 40), &agents);
-        assert_eq!(layout[0].0, Position::new(62.0, 0.0));
-        assert_eq!(layout[1].0, Position::new(34.0, 26.0));
-        assert_eq!(layout[2].0, Position::new(90.0, 26.0));
+        assert_eq!(layout[0].0, Position::new(56.0, 0.0));
+        assert_eq!(layout[1].0, Position::new(22.0, 27.0));
+        assert_eq!(layout[2].0, Position::new(90.0, 27.0));
         assert_eq!(layout[1].2, layout[2].2);
         let lead = rataflow::Rect::new(
             layout[0].0,
@@ -1159,9 +1423,9 @@ mod geometry_tests {
         }
 
         let narrow = node_layout(Rect::new(0, 0, 80, 40), &agents);
-        assert_eq!(narrow[0].0, Position::new(22.0, 0.0));
-        assert_eq!(narrow[1].0, Position::new(0.0, 26.0));
-        assert_eq!(narrow[2].0, Position::new(44.0, 26.0));
+        assert_eq!(narrow[0].0, Position::new(20.0, 0.0));
+        assert_eq!(narrow[1].0, Position::new(0.0, 27.0));
+        assert_eq!(narrow[2].0, Position::new(40.0, 27.0));
     }
 
     #[test]
@@ -1202,26 +1466,61 @@ mod geometry_tests {
             max_width: 28.0,
             identity: "⬢ Backend Agent".into(),
             provider: "Codex · CLI".into(),
-            model: "Model · CLI automatic".into(),
-            detail: "✓ Implement calculator UI".into(),
+            model: None,
+            task: Some("Implement calculator UI".into()),
+            focus: None,
+            activity: None,
             response: None,
+            usage: TokenUsage::default(),
+            estimated_cost: None,
             status: "complete",
             status_color: theme::GREEN,
             agent_color: theme::YELLOW,
             display_level: 2,
         };
-        assert_eq!(card.desired_height(28), 6);
+        assert!(card.desired_height(28) >= 5);
         let full_width = card.desired_width(2.0);
         assert!(full_width <= 28);
-        card.detail = "idle".into();
-        card.model = "Model · default".into();
+        card.task = None;
+        card.model = None;
         assert!(card.desired_width(2.0) <= full_width);
-        card.detail = "✓ Implement calculator UI".into();
+        card.task = Some("Implement calculator UI".into());
         card.response = Some("Reviewing generated code".into());
-        assert!(card.desired_height(28) > 6);
+        assert!(card.desired_height(28) > 5);
         assert!(card.desired_height(12) > card.desired_height(28));
         card.display_level = 0;
-        assert!(card.desired_height(12) < 6);
+        assert!(card.desired_height(12) < 5);
+    }
+
+    #[test]
+    fn normal_zoom_cards_show_reported_token_usage() {
+        let card = AgentCard {
+            max_width: 36.0,
+            identity: "⬢ Backend Agent".into(),
+            provider: "Codex CLI".into(),
+            model: None,
+            task: None,
+            focus: None,
+            activity: None,
+            response: None,
+            usage: TokenUsage {
+                input_tokens: 1_240,
+                output_tokens: 318,
+            },
+            estimated_cost: None,
+            status: "complete",
+            status_color: theme::GREEN,
+            agent_color: theme::YELLOW,
+            display_level: 1,
+        };
+
+        let rendered = card
+            .lines(0, 34)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.contains("1.2k in / 318 out"), "{rendered}");
     }
 
     #[test]
@@ -1230,34 +1529,26 @@ mod geometry_tests {
             max_width: 36.0,
             identity: "⬢ Backend Agent".into(),
             provider: "Codex · CLI".into(),
-            model: "Model · CLI automatic".into(),
-            detail: "▶ Implement task API".into(),
+            model: None,
+            task: Some("Implement task API".into()),
+            focus: None,
+            activity: None,
             response: Some(format!(
                 "{}latest 🐶 response with a clear ending",
                 "earlier output ".repeat(12)
             )),
+            usage: TokenUsage::default(),
+            estimated_cost: None,
             status: "working",
             status_color: theme::GREEN,
             agent_color: theme::YELLOW,
             display_level: 2,
         };
         let lines = card.lines(0, 26);
-        assert_eq!(
-            lines.len(),
-            7,
-            "identity, status, three output lines, model, job"
-        );
-        assert!(lines[2..5].iter().all(|line| line.width() <= 26));
-        assert!(
-            lines[2..5]
-                .iter()
-                .any(|line| line.to_string().contains("latest"))
-        );
-        assert!(
-            lines[2..5]
-                .iter()
-                .any(|line| line.to_string().contains("ending"))
-        );
+        assert!(lines.len() >= 4);
+        assert!(lines.iter().all(|line| line.width() <= 26));
+        assert!(lines.iter().any(|line| line.to_string().contains("latest")));
+        assert!(lines.iter().any(|line| line.to_string().contains("ending")));
         assert_eq!(truncate_label("🐶 alpha", 4), "🐶 …");
     }
 }

@@ -129,20 +129,40 @@ impl ModelProvider for LocalCliProvider {
         let (schema, tools) = output_schema(&request)?;
         let prompt = local_prompt(&request, &tools)?;
         let tool_required = matches!(request.tool_choice, ToolChoice::Specific(_));
-        let output = match self.kind {
+        let (output, usage) = match self.kind {
             LocalCliKind::Codex => {
                 self.run_codex(&request.model, &prompt, &schema, &sink, &cancellation)
-                    .await?
+                    .await
             }
             LocalCliKind::Claude => {
                 self.run_claude(&request.model, &prompt, &schema, &sink, &cancellation)
-                    .await?
+                    .await
             }
-        };
-        let output = parse_local_output(&output, &tools, tool_required)?;
+        }
+        .inspect_err(|error| {
+            tracing::warn!(
+                task_id = %request.task_id,
+                provider = self.kind.id(),
+                kind = ?error.kind,
+                diagnostic = %error.message,
+                "local CLI request failed"
+            );
+        })?;
+        let output = parse_local_output(&output, &tools, tool_required).inspect_err(|error| {
+            tracing::warn!(
+                task_id = %request.task_id,
+                provider = self.kind.id(),
+                kind = ?error.kind,
+                diagnostic = %error.message,
+                "local CLI response rejected"
+            );
+        })?;
         tracing::info!(task_id = %request.task_id, provider = self.kind.id(), tool_calls = output.tool_calls.len(), "local CLI response decoded");
         if output.text.is_empty() && output.tool_calls.is_empty() {
             return Err(invalid_cli_response("local CLI returned no usable output"));
+        }
+        if let Some(usage) = &usage {
+            send(&sink, ProviderEvent::Usage(usage.clone()), &cancellation).await?;
         }
         if !output.text.is_empty() {
             send(&sink, ProviderEvent::TextDelta(output.text), &cancellation).await?;
@@ -160,7 +180,7 @@ impl ModelProvider for LocalCliProvider {
             .await?;
         }
         send(&sink, ProviderEvent::Completed, &cancellation).await?;
-        Ok(ProviderCompletion { usage: None })
+        Ok(ProviderCompletion { usage })
     }
 }
 
@@ -232,7 +252,7 @@ impl LocalCliProvider {
         schema: &Value,
         sink: &ProviderEventSink,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
         crate::codex_server::run(&self.executable, model, prompt, schema, sink, cancellation).await
     }
 
@@ -243,7 +263,7 @@ impl LocalCliProvider {
         schema: &Value,
         sink: &ProviderEventSink,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
         let schema = serde_json::to_string(schema).map_err(|error| {
             invalid_cli_response(&format!("could not encode local output schema: {error}"))
         })?;
@@ -276,13 +296,36 @@ impl LocalCliProvider {
         let envelope: Value = serde_json::from_slice(&envelope).map_err(|error| {
             invalid_cli_response(&format!("Claude CLI returned invalid JSON: {error}"))
         })?;
-        serde_json::to_vec(
+        let usage = claude_usage(&envelope["usage"]);
+        let output = serde_json::to_vec(
             envelope
                 .get("structured_output")
                 .ok_or_else(|| invalid_cli_response("Claude CLI omitted structured_output"))?,
         )
-        .map_err(|error| invalid_cli_response(&format!("Claude structured output: {error}")))
+        .map_err(|error| invalid_cli_response(&format!("Claude structured output: {error}")))?;
+        Ok((output, usage))
     }
+}
+
+fn claude_usage(usage: &Value) -> Option<Usage> {
+    let input_tokens = usage["input_tokens"]
+        .as_u64()
+        .unwrap_or_default()
+        .saturating_add(
+            usage["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+        )
+        .saturating_add(
+            usage["cache_read_input_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+    let output_tokens = usage["output_tokens"].as_u64().unwrap_or_default();
+    (input_tokens > 0 || output_tokens > 0).then_some(Usage {
+        input_tokens,
+        output_tokens,
+    })
 }
 
 pub(super) fn configure_environment(command: &mut Command) {
@@ -464,6 +507,7 @@ fn classify_process_failure(
         } else if diagnostic.contains("rate_limit")
             || diagnostic.contains("rate limit")
             || diagnostic.contains("status: 429")
+            || diagnostic.contains("too many requests")
         {
             (
                 ProviderErrorKind::RateLimit,
@@ -478,6 +522,24 @@ fn classify_process_failure(
                 ProviderErrorKind::Authorization,
                 false,
                 "does not support the required safe CLI flags; update the CLI",
+            )
+        } else if diagnostic.contains("internal server")
+            || diagnostic.contains("server error")
+            || diagnostic.contains("service unavailable")
+            || diagnostic.contains("temporarily unavailable")
+            || diagnostic.contains("temporary failure")
+            || diagnostic.contains("try again later")
+            || diagnostic.contains("overloaded")
+            || diagnostic.contains("gateway timeout")
+            || diagnostic.contains("bad gateway")
+            || ["status: 500", "status: 502", "status: 503", "status: 504"]
+                .iter()
+                .any(|marker| diagnostic.contains(marker))
+        {
+            (
+                ProviderErrorKind::Internal,
+                true,
+                "hit a temporary upstream error; retrying the request",
             )
         } else if diagnostic.contains("model_not_found")
             || diagnostic.contains("model not found")
@@ -799,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn exact_cli_processes_are_probed_and_schema_validated() {
         let directory = tempfile::tempdir().unwrap();
-        for (kind, script) in [
+        for (kind, script, expected_usage) in [
             (
                 LocalCliKind::Codex,
                 r#"#!/bin/sh
@@ -813,11 +875,12 @@ while IFS= read -r line; do
     *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{"notify":[],"web_search":"disabled","features":{"hooks":false,"shell_tool":false,"plugins":false,"enable_mcp_apps":false,"unified_exec":false,"shell_snapshot":false,"multi_agent":false,"multi_agent_v2":false,"code_mode":false,"js_repl":false,"memories":false,"view_image":false}}}}' ;;
     *'"method":"thread/start"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-test","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}' ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn-test"}}}' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","delta":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"type":"agentMessage","text":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}}' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn-test"}}}' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","delta":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"type":"agentMessage","text":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}}' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-test","turnId":"turn-test","tokenUsage":{"last":{"inputTokens":8,"cachedInputTokens":1,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":11},"total":{"inputTokens":8,"cachedInputTokens":1,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":11}}}}' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-test","turnId":"turn-test","tokenUsage":{"last":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":19},"total":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":19}}}}' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
       ;;
   esac
 done
 "#,
+                (12, 7),
             ),
             (
                 LocalCliKind::Claude,
@@ -827,8 +890,9 @@ if [ "$1" = '--help' ]; then
   exit 0
 fi
 cat >/dev/null
-printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"claude"}}}' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"claude ok","tool_calls":[]}}'
+printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"claude"}}}' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":6,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"structured_output":{"text":"claude ok","tool_calls":[]}}'
 "#,
+                (11, 4),
             ),
         ] {
             let executable = directory.path().join(kind.id());
@@ -849,6 +913,16 @@ printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","tex
             assert!(events.iter().any(
                 |event| matches!(event, ProviderEvent::TextDelta(text) if text.ends_with("ok"))
             ));
+            let actual_usage = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::Usage(usage) => Some((usage.input_tokens, usage.output_tokens)),
+                    _ => None,
+                })
+                .fold((0, 0), |(input, output), (next_input, next_output)| {
+                    (input + next_input, output + next_output)
+                });
+            assert_eq!(actual_usage, expected_usage);
 
             let cancellation = CancellationToken::new();
             cancellation.cancel();

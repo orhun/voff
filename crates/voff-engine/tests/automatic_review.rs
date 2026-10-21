@@ -177,14 +177,7 @@ async fn lead_answers_simple_questions_without_delegation_in_team_and_solo_mode(
                 .content
                 .contains("Answer simple questions directly")
         );
-        if team {
-            assert!(
-                requests[0]
-                    .tools
-                    .iter()
-                    .any(|tool| tool.name == "task.delegate")
-            );
-        }
+        assert!(requests[0].tools.is_empty());
     }
 }
 
@@ -220,9 +213,10 @@ async fn lead_reviews_nested_patch_without_human_prompt() {
 }
 
 #[tokio::test]
-async fn failed_or_malformed_review_never_writes_or_retries() {
+async fn failed_or_malformed_review_stays_pending_without_execution() {
     for review in [
         error(ProviderErrorKind::Authentication),
+        error(ProviderErrorKind::Timeout),
         call("workflow.decide", serde_json::json!({"approve":true})),
         call(
             "workflow.decide",
@@ -244,9 +238,81 @@ async fn failed_or_malformed_review_never_writes_or_retries() {
         assert_eq!(provider.requests.lock().await.len(), 2);
         assert_eq!(
             repo.approvals(session).await.unwrap()[0].decision,
-            ApprovalDecision::Denied
+            ApprovalDecision::Pending
         );
     }
+}
+
+#[tokio::test]
+async fn explicitly_selected_indirect_agent_can_handle_read_only_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Arc::new(InMemoryRepository::default());
+    let provider = Arc::new(Script {
+        responses: Mutex::new(
+            vec![
+                call(
+                    "task.delegate",
+                    serde_json::json!({"proposals":[{
+                        "target_agent":"Quality",
+                        "objective":"Check the quality of this repository",
+                        "acceptance_criteria":["Report the most important findings"]
+                    }]}),
+                ),
+                Ok(vec![
+                    ProviderEvent::TextDelta("No critical issues found.".into()),
+                    ProviderEvent::Completed,
+                ]),
+            ]
+            .into(),
+        ),
+        requests: Mutex::new(vec![]),
+        hold_review: AtomicBool::new(false),
+        review_started: Notify::new(),
+    });
+    let mut lead = profile("Lead", &["task.delegate"]);
+    lead.allowed_targets = vec!["Core".into()];
+    let mut core = profile("Core", &["task.delegate"]);
+    core.allowed_targets = vec!["Quality".into()];
+    let quality = profile("Quality", &["file.read"]);
+    for agent in [&lead, &core, &quality] {
+        repo.save_agent(agent.clone()).await.unwrap();
+    }
+    let session = SessionId::new();
+    let (tx, mut rx) = mpsc::channel::<EngineEvent>(256);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let engine = Arc::new(
+        Engine::new(repo.clone(), provider.clone(), session, tx)
+            .with_team_lead(lead.id)
+            .with_formation_agents(&[lead.clone(), core, quality.clone()])
+            .with_automatic_review(true)
+            .with_safe_workflow(dir.path())
+            .unwrap(),
+    );
+    let task = engine
+        .create_task_for_agent(
+            lead.id,
+            quality.id,
+            "Check the quality of this repository",
+            vec!["Return concise findings".into()],
+        )
+        .await
+        .unwrap();
+    assert!(task.work.is_none());
+    engine.mark_ready(task.id).await.unwrap();
+    engine.run_task_and_schedule(task.id, 2).await.unwrap();
+
+    let tasks = repo.tasks().await.unwrap();
+    let child = tasks
+        .iter()
+        .find(|candidate| candidate.parent == Some(task.id))
+        .unwrap();
+    assert_eq!(child.owner, quality.id);
+    assert_eq!(child.status, TaskStatus::Completed);
+    assert_eq!(
+        repo.task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Completed
+    );
+    assert_eq!(provider.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]

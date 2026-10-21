@@ -41,10 +41,12 @@ use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
     CanonicalEventKind, SessionId, Task, TaskStatus,
 };
-use voff_engine::{DelegationProposal, Engine, EngineEvent, OutputContinuation};
+use voff_engine::{
+    DelegationProposal, Engine, EngineEvent, OutputContinuation, is_conversational_request,
+};
 use voff_storage::{Repository, SqliteRepository};
 
-use self::team_flow::{TeamFlow, TeamSnapshot, handoff_summary, role_color, role_icon};
+use self::team_flow::{TeamFlow, TeamSnapshot, TokenUsage, handoff_summary, role_color, role_icon};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Panel {
@@ -221,6 +223,7 @@ pub struct AppModel {
     team_flow: TeamFlow,
     streaming_text: bool,
     agent_responses: HashMap<AgentId, String>,
+    agent_usage: HashMap<AgentId, TokenUsage>,
 }
 impl AppModel {
     #[must_use]
@@ -311,6 +314,7 @@ impl AppModel {
             team_flow: TeamFlow::default(),
             streaming_text: false,
             agent_responses: HashMap::new(),
+            agent_usage: HashMap::new(),
         }
     }
 
@@ -1092,9 +1096,6 @@ impl AppModel {
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     ComposerEvent::Ignored
                 }
-                KeyCode::F(4) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    ComposerEvent::Ignored
-                }
                 KeyCode::Tab | KeyCode::BackTab => ComposerEvent::Ignored,
                 _ => {
                     self.composer.input(*key);
@@ -1528,6 +1529,14 @@ impl AppModel {
                     response.push_str(&sanitize(delta));
                     trim_response_buffer(response);
                 }
+                CanonicalEventKind::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    let usage = self.agent_usage.entry(owner).or_default();
+                    usage.input_tokens = usage.input_tokens.saturating_add(*input_tokens);
+                    usage.output_tokens = usage.output_tokens.saturating_add(*output_tokens);
+                }
                 _ => {}
             }
         }
@@ -1854,11 +1863,6 @@ fn action_for_event(value: Event) -> Action {
         }
         Event::Key(key)
             if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            Action::CloseTab
-        }
-        Event::Key(key)
-            if key.code == KeyCode::F(4) && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             Action::CloseTab
         }
@@ -2563,7 +2567,21 @@ async fn terminal_loop<R: Repository + 'static>(
                                 .composer_target()
                                 .filter(|agent| Some(agent.id) != model.team_lead)
                                 .map(|agent| (agent.id, agent.name.clone()));
+                            let conversational = role_target.is_none()
+                                && is_conversational_request(&objective);
                             let routed = model.routed_objective(&objective);
+                            let acceptance_criteria = if conversational {
+                                vec!["Answer the user's question from available context".into()]
+                            } else {
+                                vec![
+                                    if role_target.is_some() {
+                                        "Team Lead delegates to the requested role and integrates its response, or reports a blocker"
+                                    } else {
+                                        "Team Lead completes or delegates the requested work"
+                                    }
+                                    .into(),
+                                ]
+                            };
                             model.pending_submissions += 1;
                             if let Some((id, name)) = &role_target {
                                 model.role_requests.push((*id, objective.clone()));
@@ -2598,20 +2616,24 @@ async fn terminal_loop<R: Repository + 'static>(
                             let lead_submission_tx = lead_submission_tx.clone();
                             tokio::spawn(async move {
                                 let result = async {
-                                    let task = engine
-                                        .create_task(
-                                            owner,
-                                            routed,
-                                            vec![
-                                                if role_target.is_some() {
-                                                    "Team Lead delegates to the requested role and integrates its response, or reports a blocker"
-                                                } else {
-                                                    "Team Lead completes or delegates the requested work"
-                                                }
-                                                .into(),
-                                            ],
-                                        )
-                                        .await?;
+                                    let task = if let Some((target_id, _)) = role_target {
+                                        engine
+                                            .create_task_for_agent(
+                                                owner,
+                                                target_id,
+                                                routed,
+                                                acceptance_criteria,
+                                            )
+                                            .await?
+                                    } else {
+                                        engine
+                                            .create_task(
+                                                owner,
+                                                routed,
+                                                acceptance_criteria,
+                                            )
+                                            .await?
+                                    };
                                     engine.mark_ready(task.id).await?;
                                     engine.run_task_and_schedule(task.id, max_parallel_tasks).await
                                 }
@@ -4399,7 +4421,7 @@ fn help_binding(key: &str, action: &str) -> Line<'static> {
         Span::styled(
             format!("    {key:<14}"),
             Style::default()
-                .fg(theme::AQUA)
+                .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(action.to_owned(), Style::default().fg(theme::TEXT)),
@@ -4416,7 +4438,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("t / h", "Focus / toggle pane"),
             help_binding("j/k / click", "Browse / select"),
             help_binding("o / +", "Open agent tab"),
-            help_binding("Ctrl+W / Ctrl+F4", "Close tab"),
+            help_binding("Ctrl+W", "Close tab"),
             help_section("TASKS & EVENTS"),
             help_binding("e / v", "Events / details"),
             help_binding("PgUp / Dn", "Scroll inspector"),
@@ -4441,7 +4463,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("j / k", "Browse agents"),
             help_binding("Click", "Select agent"),
             help_binding("o / +", "Open agent tab"),
-            help_binding("Ctrl+W / Ctrl+F4", "Close agent tab"),
+            help_binding("Ctrl+W", "Close agent tab"),
             help_section("TASKS & EVENTS"),
             help_binding("e", "Events"),
             help_binding("v", "Output details"),
@@ -4663,6 +4685,7 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
             approvals: &app.approvals,
             reviews: &app.lead_reviews,
             responses: &app.agent_responses,
+            usage: &app.agent_usage,
             provider_kinds: &app.agent_provider_kinds,
             team_lead: app.team_lead,
         },
@@ -6081,6 +6104,25 @@ mod tests {
             Action::ToggleApprovalDetails
         );
         assert_eq!(action_for_key(KeyCode::Char('l')), Action::None);
+        assert_eq!(
+            action_for_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::F(4),
+                KeyModifiers::CONTROL,
+            ))),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn help_keys_are_white_and_ctrl_f4_is_not_advertised() {
+        let binding = help_binding("Ctrl+W", "Close agent tab");
+        assert_eq!(binding.spans[0].style.fg, Some(theme::TEXT));
+        let help = help_lines(false)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!help.contains("Ctrl+F4"));
     }
 
     #[test]

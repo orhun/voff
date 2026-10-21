@@ -169,6 +169,9 @@ pub struct Task {
     pub retry_of: Option<TaskId>,
     /// Verified multi-step workflow.
     pub work: Option<WorkProgress>,
+    /// Agent explicitly selected by the user for this root task, if any.
+    #[serde(default)]
+    pub requested_target: Option<AgentId>,
     pub parent: Option<TaskId>,
     pub owner: AgentId,
     pub objective: String,
@@ -194,6 +197,7 @@ impl Task {
             attempt: 1,
             retry_of: None,
             work: None,
+            requested_target: None,
             parent: None,
             owner,
             objective: objective.into(),
@@ -419,6 +423,7 @@ impl TaskGraph {
                 integration: false,
                 turns: 0,
             }),
+            requested_target: None,
             parent: Some(parent),
             owner,
             objective: objective.into(),

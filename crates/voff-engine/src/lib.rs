@@ -98,6 +98,135 @@ enum RunMode {
     Work,
     Conversation,
 }
+
+/// Return whether a prompt is an informational question suitable for a direct,
+/// tool-free Team Lead response.
+#[must_use]
+pub fn is_conversational_request(objective: &str) -> bool {
+    let normalized = objective.trim().to_ascii_lowercase();
+    let words = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '\'')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let Some(first) = words.first().copied() else {
+        return false;
+    };
+
+    let how_to_question = first == "how"
+        && words
+            .get(1)
+            .is_some_and(|word| matches!(*word, "do" | "can" | "would" | "should"))
+        && words.get(2).is_some_and(|word| *word == "i");
+    let explanatory_request = ["explain", "describe", "summarize"]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        || normalized.starts_with("tell me about ");
+    let interrogative = matches!(
+        first,
+        "what"
+            | "what's"
+            | "why"
+            | "how"
+            | "who"
+            | "whom"
+            | "whose"
+            | "where"
+            | "when"
+            | "which"
+            | "is"
+            | "are"
+            | "am"
+            | "do"
+            | "does"
+            | "did"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+    );
+    let is_question =
+        how_to_question || explanatory_request || (interrogative && normalized.contains('?'));
+    if !is_question {
+        return false;
+    }
+
+    // Questions that ask Voff to make a change remain verified work (for
+    // example, "Can you fix this?"), while "How do I fix this?" is guidance.
+    if how_to_question {
+        return true;
+    }
+    !words.iter().any(|word| {
+        matches!(
+            *word,
+            "add"
+                | "build"
+                | "change"
+                | "configure"
+                | "create"
+                | "delete"
+                | "fix"
+                | "implement"
+                | "install"
+                | "make"
+                | "modify"
+                | "move"
+                | "refactor"
+                | "remove"
+                | "rename"
+                | "run"
+                | "test"
+                | "update"
+                | "write"
+        )
+    })
+}
+
+/// Return whether the request asks for investigation or a report without
+/// asking the agent to change project files.
+#[must_use]
+pub fn is_read_only_request(objective: &str) -> bool {
+    let words = objective
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let asks_to_inspect = [
+        "analyze",
+        "analyse",
+        "assess",
+        "audit",
+        "check",
+        "inspect",
+        "investigate",
+        "quality",
+        "review",
+        "verify",
+    ]
+    .iter()
+    .any(|word| words.contains(*word));
+    let asks_to_change = [
+        "add",
+        "build",
+        "change",
+        "create",
+        "delete",
+        "edit",
+        "fix",
+        "implement",
+        "improve",
+        "modify",
+        "remove",
+        "refactor",
+        "rewrite",
+        "update",
+        "write",
+    ]
+    .iter()
+    .any(|word| words.contains(*word));
+    asks_to_inspect && !asks_to_change
+}
+
 /// Persisted, task-local consent to regenerate an output-limited response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutputContinuation {
@@ -317,7 +446,54 @@ impl<R: Repository + 'static> Engine<R> {
         objective: impl Into<String>,
         criteria: Vec<String>,
     ) -> Result<Task, EngineError> {
+        self.create_task_with_target(owner, None, objective.into(), criteria)
+            .await
+    }
+
+    /// Create a task directed to an agent the user explicitly selected in the UI.
+    /// This permits that one target even when it is below another team member,
+    /// while preserving normal limits for all other delegations.
+    pub async fn create_task_for_agent(
+        &self,
+        owner: AgentId,
+        requested_target: AgentId,
+        objective: impl Into<String>,
+        criteria: Vec<String>,
+    ) -> Result<Task, EngineError> {
+        self.create_task_with_target(owner, Some(requested_target), objective.into(), criteria)
+            .await
+    }
+
+    async fn create_task_with_target(
+        &self,
+        owner: AgentId,
+        requested_target: Option<AgentId>,
+        objective: String,
+        criteria: Vec<String>,
+    ) -> Result<Task, EngineError> {
         self.require_team_lead(owner)?;
+        if let Some(target_id) = requested_target
+            && (target_id == owner
+                || !self
+                    .formation_agents
+                    .read()
+                    .await
+                    .values()
+                    .any(|id| *id == target_id)
+                || !self
+                    .repo
+                    .agent(target_id)
+                    .await?
+                    .is_some_and(|agent| agent.enabled))
+        {
+            return Err(EngineError::InvalidDelegationPlan(
+                "the selected agent is not enabled in the current team".into(),
+            ));
+        }
+        let conversational = requested_target.is_none()
+            && self.team_lead == Some(owner)
+            && is_conversational_request(&objective);
+        let read_only = is_read_only_request(&objective);
         let limits = self
             .repo
             .agent(owner)
@@ -325,7 +501,8 @@ impl<R: Repository + 'static> Engine<R> {
             .and_then(|a| a.delegation_limits)
             .unwrap_or_default();
         let mut t = Task::root(owner, objective, criteria, limits);
-        if self.verified_workflow {
+        t.requested_target = requested_target;
+        if self.verified_workflow && !conversational && !read_only {
             t.work = Some(WorkProgress {
                 contract: String::new(),
                 integration: false,
@@ -371,6 +548,7 @@ impl<R: Repository + 'static> Engine<R> {
             attempt,
             retry_of: Some(previous.id),
             work: previous.work.clone(),
+            requested_target: previous.requested_target,
             parent: previous.parent,
             owner: previous.owner,
             objective: guidance.map_or_else(|| previous.objective.clone(), |guidance| format!("{}\n\nTeam Lead repair instructions for attempt {attempt} (preserve original scope and acceptance):\n{guidance}", previous.objective)),
@@ -436,6 +614,12 @@ impl<R: Repository + 'static> Engine<R> {
 
         self.transition(id, TaskStatus::Running).await?;
         let mut approvals = Vec::with_capacity(proposals.len());
+        if task.requested_target.is_some() && task.parent.is_none() && proposals.len() != 1 {
+            return Err(EngineError::InvalidDelegationPlan(
+                "a task addressed to a selected agent must be delegated as one task to that agent"
+                    .into(),
+            ));
+        }
         for proposal in proposals {
             let tool_call_id = ToolCallId::new();
             self.record(
@@ -591,7 +775,7 @@ impl<R: Repository + 'static> Engine<R> {
         self.transition(id, TaskStatus::Ready).await
     }
     pub async fn run_task(&self, id: TaskId) -> Result<(), EngineError> {
-        let conversation = self
+        let approved_continuation = self
             .repo
             .approvals(self.session)
             .await?
@@ -604,6 +788,13 @@ impl<R: Repository + 'static> Engine<R> {
             .any(|a| {
                 serde_json::from_str::<OutputContinuation>(&a.reason).is_ok_and(|c| c.conversation)
             });
+        let task = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
+        let conversation = approved_continuation
+            || (task.work.is_none()
+                && task.requested_target.is_none()
+                && task.parent.is_none()
+                && self.team_lead == Some(task.owner)
+                && is_conversational_request(&task.objective));
         self.run_task_with_mode(
             id,
             if conversation {
@@ -704,9 +895,39 @@ impl<R: Repository + 'static> Engine<R> {
         drop(start_guard);
         self.record(Some(id), CanonicalEventKind::ProviderStarted)
             .await?;
-        let delegation_targets = self
-            .enabled_delegation_targets(&agent.allowed_targets)
-            .await?;
+        let read_only = is_read_only_request(&task.objective);
+        let delegation_targets = if let Some(target_id) = task.requested_target {
+            if task.parent.is_some() {
+                return Err(EngineError::InvalidDelegationPlan(
+                    "only root tasks may carry a user-selected delegation target".into(),
+                ));
+            }
+            if !self
+                .formation_agents
+                .read()
+                .await
+                .values()
+                .any(|configured| *configured == target_id)
+            {
+                return Err(EngineError::InvalidDelegationPlan(
+                    "the selected agent is no longer in the current team".into(),
+                ));
+            }
+            vec![
+                self.repo
+                    .agent(target_id)
+                    .await?
+                    .filter(|target| target.enabled)
+                    .ok_or_else(|| {
+                        EngineError::InvalidDelegationPlan(
+                            "the selected agent is no longer enabled".into(),
+                        )
+                    })?,
+            ]
+        } else {
+            self.enabled_delegation_targets(&agent.allowed_targets)
+                .await?
+        };
         let qualified_verification_targets = delegation_targets
             .iter()
             .filter(|target| target.tools.iter().any(|tool| tool == "process.test"))
@@ -722,6 +943,7 @@ impl<R: Repository + 'static> Engine<R> {
             && agent.tools.iter().any(|tool| tool == "task.delegate");
         let must_patch = mode == RunMode::Work
             && task.work.is_none()
+            && !read_only
             && self.team_lead != Some(agent.id)
             && delegation_targets.is_empty()
             && agent.tools.iter().any(|tool| tool == "file.patch");
@@ -731,8 +953,13 @@ impl<R: Repository + 'static> Engine<R> {
                 agent.system_prompt
             )
         } else if can_delegate {
+            let delegation_instruction = if task.requested_target.is_some() {
+                "The user explicitly selected the listed agent for this task. Delegate this request to that agent only, then relay its findings."
+            } else {
+                "Delegate only to the enabled direct reports listed below, with bounded scope and acceptance criteria. Never delegate to unrelated roles."
+            };
             format!(
-                "{}\n\nYou coordinate your direct reports. Answer simple questions directly yourself. Delegate only to the enabled direct reports listed below, with bounded scope and acceptance criteria. Review their results and return the integrated outcome to your own reporting agent. Never delegate to unrelated roles. You may propose at most {} children. Enabled targets:\n{}",
+                "{}\n\nYou coordinate your team. Answer simple questions directly yourself. {delegation_instruction} Review reports and return the useful outcome to your reporting agent. You may propose at most {} children. Enabled targets:\n{}",
                 agent.system_prompt,
                 task.limits.max_children,
                 delegation_roster(&delegation_targets)
@@ -787,11 +1014,15 @@ impl<R: Repository + 'static> Engine<R> {
         } else {
             owner_prompt
         };
+        let mut available_tools = agent.tools.clone();
+        if read_only {
+            available_tools.retain(|tool| tool != "file.patch");
+        }
         let mut tools = if mode == RunMode::Conversation {
             Vec::new()
         } else {
             tool_definitions(
-                &agent.tools,
+                &available_tools,
                 &delegation_target_names,
                 task.limits.max_children,
             )
@@ -1488,11 +1719,14 @@ impl<R: Repository + 'static> Engine<R> {
                                     && candidate.decision == ApprovalDecision::Pending
                             });
                     if !has_pending {
-                        let continuing = parent.work.is_some()
+                        let read_only_continuing = is_read_only_request(&parent.objective)
+                            && matches!(approval.action.as_str(), "file.read" | "process.test");
+                        let continuing = (parent.work.is_some()
                             && matches!(
                                 approval.action.as_str(),
                                 "file.patch" | "process.test" | "file.read"
-                            );
+                            ))
+                            || read_only_continuing;
                         self.transition(
                             approval.task_id,
                             if continuing {
@@ -1503,7 +1737,22 @@ impl<R: Repository + 'static> Engine<R> {
                         )
                         .await?;
                         if continuing {
-                            self.record(Some(parent.id), CanonicalEventKind::ProviderWarning(format!("{} succeeded; continuing work. Acceptance and integration are still pending.", approval.action))).await?;
+                            let message = if read_only_continuing {
+                                format!(
+                                    "{} succeeded; continuing the requested review.",
+                                    approval.action
+                                )
+                            } else {
+                                format!(
+                                    "{} succeeded; continuing work. Acceptance and integration are still pending.",
+                                    approval.action
+                                )
+                            };
+                            self.record(
+                                Some(parent.id),
+                                CanonicalEventKind::ProviderWarning(message),
+                            )
+                            .await?;
                         } else if matches!(
                             approval.action.as_str(),
                             "task.delegate" | "review.request" | "task.plan"
@@ -1691,18 +1940,27 @@ impl<R: Repository + 'static> Engine<R> {
                     .agent(parent.owner)
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
-                if !delegator
-                    .allowed_targets
-                    .iter()
-                    .any(|name| name == &args.target_agent)
-                {
-                    return Err(ExecutorError::Denied.into());
-                }
                 let target = self
                     .delegation_target(&args.target_agent)
                     .await?
                     .filter(|agent| agent.enabled)
                     .ok_or(EngineError::TaskNotFound)?;
+                let explicit_target = parent.parent.is_none()
+                    && parent.requested_target == Some(target.id)
+                    && self
+                        .formation_agents
+                        .read()
+                        .await
+                        .values()
+                        .any(|id| *id == target.id);
+                if !explicit_target
+                    && !delegator
+                        .allowed_targets
+                        .iter()
+                        .any(|name| name == &args.target_agent)
+                {
+                    return Err(ExecutorError::Denied.into());
+                }
                 let child = self
                     .delegate_task(
                         approval.task_id,
@@ -2046,23 +2304,33 @@ impl<R: Repository + 'static> Engine<R> {
                     "child objective cannot be empty".into(),
                 ));
             }
-            if !agent
-                .allowed_targets
-                .iter()
-                .any(|target| target == &proposal.target_agent)
-            {
-                return Err(EngineError::InvalidDelegationPlan(format!(
-                    "{} is not an allowed target",
-                    proposal.target_agent
-                )));
-            }
-            if !self
+            let target = self
                 .delegation_target(&proposal.target_agent)
                 .await?
-                .is_some_and(|target| target.enabled)
+                .filter(|target| target.enabled)
+                .ok_or_else(|| {
+                    EngineError::InvalidDelegationPlan(format!(
+                        "{} is not enabled in the current formation",
+                        proposal.target_agent
+                    ))
+                })?;
+            let is_explicit_target = task.parent.is_none()
+                && task.requested_target == Some(target.id)
+                && self
+                    .formation_agents
+                    .read()
+                    .await
+                    .values()
+                    .any(|id| *id == target.id);
+            let is_allowed_report = agent
+                .allowed_targets
+                .iter()
+                .any(|name| name == &proposal.target_agent);
+            if (task.requested_target.is_some() && task.parent.is_none() && !is_explicit_target)
+                || (!is_explicit_target && !is_allowed_report)
             {
                 return Err(EngineError::InvalidDelegationPlan(format!(
-                    "{} is not enabled in the current formation",
+                    "{} is not an allowed target for this task",
                     proposal.target_agent
                 )));
             }
@@ -2394,7 +2662,7 @@ fn tool_definitions(
     max_delegations: u16,
 ) -> Vec<ToolDefinition> {
     names.iter().filter_map(|name| match name.as_str() {
-        "file.read" => Some(ToolDefinition { name: name.clone(), description: "Inspect a bounded page of a workspace text file before editing. offset is a character offset (start at 0); each page has at most 1200 characters. Missing files return an absence report, not a task failure. Sensitive paths are denied. Contents are returned as a file_read artifact after approval.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["path","offset"],"additionalProperties":false}"#.into() }),
+        "file.read" => Some(ToolDefinition { name: name.clone(), description: "Inspect a bounded page of a workspace text file before editing. offset is a character offset (start at 0); each page has at most 1200 characters. Missing files return an absence report, not a task failure. Sensitive paths are denied. Validated reads return a file_read artifact without an extra approval step.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["path","offset"],"additionalProperties":false}"#.into() }),
         "file.patch" => Some(ToolDefinition { name: name.clone(), description: "Propose creating or replacing one workspace text file; user approval and base-digest validation are mandatory.".into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
         "process.test" => Some(ToolDefinition { name: name.clone(), description: "Propose one allowlisted verification command at the workspace root; per-action approval is mandatory. Dependencies must already be installed. No shell or package installation.".into(), input_schema: r#"{"type":"object","properties":{"command":{"type":"string","enum":["cargo test","cargo check","cargo clippy","cargo fmt --check","python3 -m unittest discover","node --test","npm test","npm run build"]}},"required":["command"]}"#.into() }),
         "task.delegate" if !allowed_targets.is_empty() && max_delegations > 0 => Some(delegation_plan_tool(name, allowed_targets, max_delegations)),
@@ -2467,6 +2735,16 @@ mod tests {
     use std::time::Duration;
     use voff_provider::{MockProvider, MockStep};
     use voff_storage::InMemoryRepository;
+
+    #[test]
+    fn read_only_repository_reviews_do_not_enter_verified_patch_workflow() {
+        assert!(is_read_only_request("check the quality of this repository"));
+        assert!(is_read_only_request("audit and summarize the project"));
+        assert!(!is_read_only_request(
+            "check the quality and fix any issues"
+        ));
+        assert!(!is_read_only_request("implement the requested feature"));
+    }
 
     struct RequestRecorder {
         max_output_tokens: Arc<Mutex<Option<u64>>>,
