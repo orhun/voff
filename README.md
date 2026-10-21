@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/voff/assets/logo.gif" width="360" alt="voff logo">
+  <img src="crates/voff/assets/logo.gif" width="180" alt="voff logo">
   <br>
   <b>Workflow builder for coding agents 🐶</b>
   <br><br>
