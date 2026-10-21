@@ -80,12 +80,19 @@ struct WorkspaceAgentPlan {
 pub enum ProviderChoice {
     Ollama,
     OpenAi,
+    ClaudeCloud,
     CodexCli,
     ClaudeCli,
 }
 
 impl ProviderChoice {
-    const ALL: [Self; 4] = [Self::Ollama, Self::OpenAi, Self::CodexCli, Self::ClaudeCli];
+    const ALL: [Self; 5] = [
+        Self::Ollama,
+        Self::OpenAi,
+        Self::ClaudeCloud,
+        Self::CodexCli,
+        Self::ClaudeCli,
+    ];
 
     fn is_available(self) -> bool {
         match self {
@@ -93,16 +100,25 @@ impl ProviderChoice {
             Self::OpenAi => {
                 std::env::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty())
             }
+            Self::ClaudeCloud => {
+                std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|value| !value.is_empty())
+            }
             Self::CodexCli => executable_available("codex"),
             Self::ClaudeCli => executable_available("claude"),
         }
     }
 
     fn available_ordered() -> Vec<Self> {
-        [Self::CodexCli, Self::ClaudeCli, Self::Ollama, Self::OpenAi]
-            .into_iter()
-            .filter(|provider| provider.is_available())
-            .collect()
+        [
+            Self::CodexCli,
+            Self::ClaudeCli,
+            Self::Ollama,
+            Self::OpenAi,
+            Self::ClaudeCloud,
+        ]
+        .into_iter()
+        .filter(|provider| provider.is_available())
+        .collect()
     }
 
     pub(crate) fn default_provider() -> Self {
@@ -113,6 +129,7 @@ impl ProviderChoice {
         match value.to_ascii_lowercase().as_str() {
             "ollama" => Ok(Self::Ollama),
             "openai" | "open_ai" => Ok(Self::OpenAi),
+            "anthropic" | "claude_api" | "claude_cloud" => Ok(Self::ClaudeCloud),
             "codex" | "codex_cli" => Ok(Self::CodexCli),
             "claude" | "claude_cli" => Ok(Self::ClaudeCli),
             _ => Err(format!("unsupported provider `{value}`")),
@@ -124,6 +141,7 @@ impl ProviderChoice {
         match self {
             Self::Ollama => "ollama",
             Self::OpenAi => "openai",
+            Self::ClaudeCloud => "anthropic",
             Self::CodexCli => "codex_cli",
             Self::ClaudeCli => "claude_cli",
         }
@@ -134,9 +152,22 @@ impl ProviderChoice {
         match self {
             Self::Ollama => "Ollama · local",
             Self::OpenAi => "OpenAI · cloud",
+            Self::ClaudeCloud => "Claude · cloud",
             Self::CodexCli => "Codex · CLI",
             Self::ClaudeCli => "Claude · CLI",
         }
+    }
+
+    pub(crate) fn credential_env(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAi => Some("OPENAI_API_KEY"),
+            Self::ClaudeCloud => Some("ANTHROPIC_API_KEY"),
+            Self::Ollama | Self::CodexCli | Self::ClaudeCli => None,
+        }
+    }
+
+    pub(crate) fn uses_api_key(self) -> bool {
+        self.credential_env().is_some()
     }
 
     fn cycle(self, delta: isize) -> Self {
@@ -1458,8 +1489,7 @@ impl Wizard {
                 || (self.field == Field::Prompt && self.mode != WizardMode::Configure)
                 || (index == 0 && self.field == Field::ReportsTo)
                 || (self.field == Field::OutputLimit && self.mode != WizardMode::Configure)
-                || (self.field == Field::Token
-                    && self.developers[index].provider != ProviderChoice::OpenAi))
+                || (self.field == Field::Token && !self.developers[index].provider.uses_api_key()))
             {
                 break;
             }
@@ -1512,7 +1542,7 @@ impl Wizard {
         }
         if let Step::Developer(index) = self.step
             && self.field == Field::Token
-            && self.developers[index].provider == ProviderChoice::OpenAi
+            && self.developers[index].provider.uses_api_key()
         {
             self.developers[index]
                 .api_token
@@ -1734,11 +1764,15 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     error = None;
                 }
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if provider == ProviderChoice::OpenAi
-                        && api_token.is_empty()
-                        && !provider.is_available()
-                    {
-                        error = Some("Enter an OpenAI API key to use this provider.".into());
+                    if provider.uses_api_key() && api_token.is_empty() && !provider.is_available() {
+                        error = Some(format!(
+                            "Enter a {} API key to use this provider.",
+                            if provider == ProviderChoice::ClaudeCloud {
+                                "Claude"
+                            } else {
+                                "OpenAI"
+                            }
+                        ));
                     } else if !description.trim().is_empty() {
                         return Ok(StartupChoice::Build {
                             workspace: workspace.clone(),
@@ -1772,14 +1806,14 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                 KeyCode::Up => {
                     focused = focused.previous(
                         catalog.models(provider.id()).len() > 1,
-                        provider == ProviderChoice::OpenAi && !provider.is_available(),
+                        provider.uses_api_key() && !provider.is_available(),
                     );
                     error = None;
                 }
                 KeyCode::Down => {
                     focused = focused.next(
                         catalog.models(provider.id()).len() > 1,
-                        provider == ProviderChoice::OpenAi && !provider.is_available(),
+                        provider.uses_api_key() && !provider.is_available(),
                     );
                     error = None;
                 }
@@ -2146,8 +2180,7 @@ fn render_startup_splash_with_popup(
     } = view;
     render_startup_background(frame);
     let logo = logo_text();
-    let api_key_field =
-        selected_provider == ProviderChoice::OpenAi && !selected_provider.is_available();
+    let api_key_field = selected_provider.uses_api_key() && !selected_provider.is_available();
     let active_style = Style::default()
         .fg(theme::ORANGE)
         .add_modifier(Modifier::BOLD);
@@ -3863,10 +3896,11 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
             form.push(Line::from(""));
         }
     }
-    if developer.provider == ProviderChoice::OpenAi {
-        let token = openai_token_label(
+    if developer.provider.uses_api_key() {
+        let token = api_token_label(
+            developer.provider,
             &developer.api_token,
-            std::env::var_os("OPENAI_API_KEY").is_some_and(|token| !token.is_empty()),
+            developer.provider.is_available(),
         );
         if !compact {
             form.push(Line::from(""));
@@ -3942,11 +3976,14 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
     }
 }
 
-fn openai_token_label(entered: &str, env_available: bool) -> String {
+fn api_token_label(provider: ProviderChoice, entered: &str, env_available: bool) -> String {
     if !entered.is_empty() {
         "•".repeat(entered.chars().count().min(36))
     } else if env_available {
-        "Configured via OPENAI_API_KEY".into()
+        format!(
+            "Configured via {}",
+            provider.credential_env().unwrap_or("API key")
+        )
     } else {
         "Required".into()
     }
@@ -4007,7 +4044,7 @@ fn developer_field_at_row(
     if show_output_limit {
         fields.push(Field::OutputLimit);
     }
-    if provider == ProviderChoice::OpenAi {
+    if provider.uses_api_key() {
         fields.push(Field::Token);
     }
     let mut field_row = 0;
@@ -4237,12 +4274,18 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Model        default"), "{rendered}");
         assert!(!rendered.contains("default  (1/1)"), "{rendered}");
-        assert_eq!(openai_token_label("", false), "Required");
         assert_eq!(
-            openai_token_label("", true),
+            api_token_label(ProviderChoice::OpenAi, "", false),
+            "Required"
+        );
+        assert_eq!(
+            api_token_label(ProviderChoice::OpenAi, "", true),
             "Configured via OPENAI_API_KEY"
         );
-        assert_eq!(openai_token_label("secret", false), "••••••");
+        assert_eq!(
+            api_token_label(ProviderChoice::OpenAi, "secret", false),
+            "••••••"
+        );
     }
 
     #[test]

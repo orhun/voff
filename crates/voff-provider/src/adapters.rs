@@ -1,4 +1,4 @@
-//! Built-in provider adapters backed by Rig's provider-neutral model clients.
+//! Built-in provider adapters backed by provider SDKs and direct APIs.
 use crate::*;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -168,6 +168,115 @@ pub struct OpenAiProvider {
     base_url: String,
     api_key: OpenAiApiKey,
     http: reqwest::Client,
+}
+
+/// Direct adapter for Anthropic's Messages API.
+#[derive(Clone)]
+pub struct AnthropicProvider {
+    base_url: String,
+    api_key: AnthropicApiKey,
+    http: reqwest::Client,
+}
+
+#[derive(Clone)]
+enum AnthropicApiKey {
+    Static(String),
+    Dynamic(Arc<dyn Fn() -> Option<String> + Send + Sync>),
+}
+
+impl AnthropicProvider {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        let api_key = api_key.into();
+        if base_url != "https://api.anthropic.com" {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Authorization,
+                message: "Anthropic endpoint must be https://api.anthropic.com".into(),
+                retryable: false,
+            });
+        }
+        if api_key.trim().is_empty() {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Authentication,
+                message: "Anthropic API key is empty".into(),
+                retryable: false,
+            });
+        }
+        Ok(Self {
+            base_url,
+            api_key: AnthropicApiKey::Static(api_key),
+            http: crate::anthropic_stream::client()?,
+        })
+    }
+
+    /// Create an adapter that resolves its credential at request time.
+    pub fn new_deferred(
+        base_url: impl Into<String>,
+        api_key: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Result<Self, ProviderError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if base_url != "https://api.anthropic.com" {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Authorization,
+                message: "Anthropic endpoint must be https://api.anthropic.com".into(),
+                retryable: false,
+            });
+        }
+        Ok(Self {
+            base_url,
+            api_key: AnthropicApiKey::Dynamic(api_key),
+            http: crate::anthropic_stream::client()?,
+        })
+    }
+
+    fn credential(&self) -> Result<String, ProviderError> {
+        match &self.api_key {
+            AnthropicApiKey::Static(value) => Some(value.clone()),
+            AnthropicApiKey::Dynamic(resolve) => resolve(),
+        }
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ProviderError {
+            kind: ProviderErrorKind::Authentication,
+            message: "Anthropic API key is missing".into(),
+            retryable: false,
+        })
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "anthropic".into(),
+            display_name: "Anthropic Messages API".into(),
+            capabilities: provider_capabilities(),
+        }
+    }
+
+    async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+        crate::anthropic_stream::models(&self.http, &self.base_url, &self.credential()?).await
+    }
+
+    async fn start(
+        &self,
+        request: CanonicalRequest,
+        sink: ProviderEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderCompletion, ProviderError> {
+        let key = self.credential()?;
+        crate::anthropic_stream::run(
+            &self.http,
+            &self.base_url,
+            &key,
+            &request,
+            &sink,
+            &cancellation,
+        )
+        .await
+    }
 }
 
 #[derive(Clone)]

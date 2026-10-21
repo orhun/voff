@@ -1,12 +1,13 @@
 //! Provider-neutral model execution port.
 mod adapters;
+mod anthropic_stream;
 mod codex_server;
 mod local_cli;
 mod openai_stream;
 mod response;
 pub use response::{collect_response, collect_response_with_preview};
 
-pub use adapters::{MockProvider, MockStep, OllamaProvider, OpenAiProvider};
+pub use adapters::{AnthropicProvider, MockProvider, MockStep, OllamaProvider, OpenAiProvider};
 pub use local_cli::{LocalCliKind, LocalCliProvider};
 
 use async_trait::async_trait;

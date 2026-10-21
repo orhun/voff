@@ -11,6 +11,7 @@ pub struct ModelOption {
 pub struct ModelCatalog {
     ollama: Vec<ModelOption>,
     openai: Vec<ModelOption>,
+    anthropic: Vec<ModelOption>,
     cli: Vec<ModelOption>,
 }
 
@@ -43,6 +44,17 @@ impl Default for ModelCatalog {
         Self {
             ollama: options("ollama"),
             openai: options("openai"),
+            // Keep a short, current Claude API list here instead of exposing
+            // the embedded catalog's retired Anthropic snapshots.
+            anthropic: [
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-fable-5-1",
+                "claude-haiku-5-5",
+            ]
+            .into_iter()
+            .map(|id| ModelOption { id: id.into() })
+            .collect(),
             cli: vec![ModelOption {
                 id: "default".into(),
             }],
@@ -56,6 +68,7 @@ impl ModelCatalog {
         match provider {
             "ollama" => &self.ollama,
             "openai" => &self.openai,
+            "anthropic" => &self.anthropic,
             "codex_cli" | "claude_cli" => &self.cli,
             _ => &[],
         }

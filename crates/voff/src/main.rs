@@ -27,7 +27,8 @@ use voff_core::{
     SessionId, TaskStatus,
 };
 use voff_provider::{
-    LocalCliKind, LocalCliProvider, MockProvider, MockStep, OllamaProvider, OpenAiProvider,
+    AnthropicProvider, LocalCliKind, LocalCliProvider, MockProvider, MockStep, OllamaProvider,
+    OpenAiProvider,
 };
 use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
@@ -608,16 +609,26 @@ fn setup_provider_route(developer: &onboarding::DeveloperDraft, index: usize) ->
 
 fn provider_from_developer(developer: &onboarding::DeveloperDraft) -> ProviderConfig {
     let mut provider = provider_from_choice(developer.provider, &developer.model);
-    if let ProviderConfig::Openai { api_key_env, .. } = &mut provider {
+    if let ProviderConfig::Openai { api_key_env, .. }
+    | ProviderConfig::Anthropic { api_key_env, .. } = &mut provider
+    {
         // A replacement gets a fresh per-role credential reference.
         *api_key_env = if developer.api_token.trim().is_empty() {
-            developer
-                .credential_reference
-                .clone()
-                .unwrap_or_else(|| "OPENAI_API_KEY".into())
+            developer.credential_reference.clone().unwrap_or_else(|| {
+                developer
+                    .provider
+                    .credential_env()
+                    .unwrap_or_default()
+                    .into()
+            })
         } else {
             format!(
-                "VOFF_OPENAI_ROLE_{}",
+                "VOFF_{}_ROLE_{}",
+                developer
+                    .provider
+                    .credential_env()
+                    .unwrap_or("API_KEY")
+                    .trim_end_matches("_API_KEY"),
                 AgentId::new().to_string().to_uppercase()
             )
         };
@@ -631,7 +642,7 @@ async fn store_setup_credentials(
     repository: &SqliteRepository,
 ) -> Result<()> {
     for (index, developer) in draft.developers.iter().enumerate() {
-        if developer.provider != ProviderChoice::OpenAi || developer.api_token.trim().is_empty() {
+        if !developer.provider.uses_api_key() || developer.api_token.trim().is_empty() {
             continue;
         }
         let configured = if draft.developers.len() == 1 {
@@ -655,6 +666,7 @@ fn setup_draft_for_team(config: &RuntimeTeam, agents: &[AgentProfile]) -> Option
             let provider = match configured {
                 ProviderConfig::Ollama { .. } => ProviderChoice::Ollama,
                 ProviderConfig::Openai { .. } => ProviderChoice::OpenAi,
+                ProviderConfig::Anthropic { .. } => ProviderChoice::ClaudeCloud,
                 ProviderConfig::CodexCli { .. } => ProviderChoice::CodexCli,
                 ProviderConfig::ClaudeCli { .. } => ProviderChoice::ClaudeCli,
                 ProviderConfig::Mock => return None,
@@ -703,6 +715,10 @@ fn provider_from_choice(provider: ProviderChoice, model: &str) -> ProviderConfig
         ProviderChoice::OpenAi => ProviderConfig::Openai {
             model: model.into(),
             api_key_env: "OPENAI_API_KEY".into(),
+        },
+        ProviderChoice::ClaudeCloud => ProviderConfig::Anthropic {
+            model: model.into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
         },
         ProviderChoice::CodexCli => ProviderConfig::CodexCli {
             model: model.into(),
@@ -1184,7 +1200,8 @@ fn provider_registry(
 
 fn provider_api_key_env(value: &ProviderConfig) -> Option<&str> {
     match value {
-        ProviderConfig::Openai { api_key_env, .. } => Some(api_key_env),
+        ProviderConfig::Openai { api_key_env, .. }
+        | ProviderConfig::Anthropic { api_key_env, .. } => Some(api_key_env),
         ProviderConfig::Mock
         | ProviderConfig::Ollama { .. }
         | ProviderConfig::CodexCli { .. }
@@ -1197,6 +1214,7 @@ fn provider_name(value: &ProviderConfig) -> &'static str {
         ProviderConfig::Mock => "mock",
         ProviderConfig::Ollama { .. } => "ollama",
         ProviderConfig::Openai { .. } => "openai",
+        ProviderConfig::Anthropic { .. } => "anthropic",
         ProviderConfig::CodexCli { .. } => "codex_cli",
         ProviderConfig::ClaudeCli { .. } => "claude_cli",
     }
@@ -1206,6 +1224,7 @@ fn model_name(value: &ProviderConfig) -> String {
         ProviderConfig::Mock => "mock-v1".into(),
         ProviderConfig::Ollama { model, .. } => model.clone(),
         ProviderConfig::Openai { model, .. } => model.clone(),
+        ProviderConfig::Anthropic { model, .. } => model.clone(),
         ProviderConfig::CodexCli { model } | ProviderConfig::ClaudeCli { model } => model.clone(),
     }
 }
@@ -1234,6 +1253,16 @@ fn provider(
                 .unwrap_or_default();
             Arc::new(OpenAiProvider::new_deferred(
                 "https://api.openai.com",
+                Arc::new(move || slot.get()),
+            )?)
+        }
+        ProviderConfig::Anthropic { api_key_env, .. } => {
+            let slot = credential_slots
+                .get(api_key_env)
+                .cloned()
+                .unwrap_or_default();
+            Arc::new(AnthropicProvider::new_deferred(
+                "https://api.anthropic.com",
                 Arc::new(move || slot.get()),
             )?)
         }

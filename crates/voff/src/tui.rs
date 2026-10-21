@@ -5073,6 +5073,7 @@ fn agent_usage_rows(app: &AppModel) -> Vec<AgentUsageRow> {
                     "claude_cli" => "Claude CLI",
                     "ollama" => "Ollama",
                     "openai" => "OpenAI API",
+                    "anthropic" => "Claude API",
                     other => other,
                 }
                 .to_owned(),

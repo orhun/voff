@@ -18,6 +18,7 @@ Requires [Rust 1.92+](https://www.rust-lang.org/tools/install) and one provider:
 - Claude CLI (`claude`)
 - [Ollama](https://ollama.com/)
 - An OpenAI API key
+- An Anthropic API key
 
 From the repository root:
 
@@ -120,7 +121,7 @@ build_from_description = "Create a team for the user's project description."
 | -------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `workspace`                            | Workspace directory. Relative to the TOML file. A command-line directory takes precedence.    |
 | `agent[].name`                         | Unique agent name. The first agent is the team lead.                                          |
-| `agent[].provider`                     | `codex_cli`, `claude_cli`, `ollama`, or `openai`. `codex`, `claude`, and `open_ai` also work. |
+| `agent[].provider`                     | `codex_cli`, `claude_cli`, `ollama`, `openai`, or `anthropic`. `codex`, `claude`, `open_ai`, and `claude_api` also work. |
 | `agent[].model`                        | Model name. Defaults to the provider's default model.                                         |
 | `agent[].prompt`                       | Agent instructions. `system_prompt` is an alias.                                              |
 | `agent[].reports_to`                   | Reporting agent. Defaults to the lead.                                                        |
@@ -128,7 +129,7 @@ build_from_description = "Create a team for the user's project description."
 | `setup_prompts.scan_workspace`         | Prompt used to suggest a team from a workspace.                                               |
 | `setup_prompts.build_from_description` | Prompt used to build a team from your description.                                            |
 
-Credentials are not stored in the TOML file. Use the provider CLI login, an environment variable, or the in-app prompt. OpenAI credentials entered in the app are saved in the local database.
+Credentials are not stored in the TOML file. Use the provider CLI login, an environment variable, or the in-app prompt. OpenAI and Anthropic credentials entered in the app are saved in the local database. Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` to use a cloud API provider.
 
 Voff saves generated teams to `.voff/config.toml`. Edit the file by hand or load one with `--config`.
 

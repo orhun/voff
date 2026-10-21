@@ -669,6 +669,7 @@ fn agent_card(agent: &AgentProfile, snapshot: &TeamSnapshot<'_>, agent_color: Co
             "claude_cli" => "Claude CLI",
             "ollama" => "Ollama · local",
             "openai" => "OpenAI API",
+            "anthropic" => "Claude API",
             _ => provider_kind,
         }
         .into(),
@@ -723,7 +724,23 @@ pub(super) fn estimate_cost(provider: &str, model_id: &str, usage: TokenUsage) -
     // standard Codex rates for GPT-6 Luna, in USD per million tokens.
     let codex_rate = (provider == "codex_cli" && model_id.eq_ignore_ascii_case("gpt-6-luna"))
         .then_some((0.10, 0.01, 0.50));
+    // Standard first-party Claude API rates, USD per million tokens. Haiku
+    // 5.5 has a higher input rate for prompts above 100k tokens.
+    let anthropic_rate = if provider == "anthropic" {
+        match model_id {
+            "claude-fable-5-1" => Some((10.0, 0.25, 50.0)),
+            "claude-opus-5-5" => Some((4.0, 0.20, 20.0)),
+            "claude-sonnet-5-5" => Some((2.0, 0.10, 10.0)),
+            "claude-haiku-5-5" if usage.input_tokens > 100_000 => Some((0.50, 0.05, 2.50)),
+            "claude-haiku-5-5" => Some((0.10, 0.01, 0.50)),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (input_rate, cached_input_rate, output_rate) = if let Some(rates) = codex_rate {
+        rates
+    } else if let Some(rates) = anthropic_rate {
         rates
     } else {
         let catalog = ProviderIndex::embedded();

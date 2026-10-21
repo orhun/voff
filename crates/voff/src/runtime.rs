@@ -32,6 +32,7 @@ pub enum ProviderConfig {
     Mock,
     Ollama { base_url: String, model: String },
     Openai { model: String, api_key_env: String },
+    Anthropic { model: String, api_key_env: String },
     CodexCli { model: String },
     ClaudeCli { model: String },
 }
@@ -215,7 +216,8 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), RuntimeError> {
                 Ok(())
             }
         }
-        ProviderConfig::Openai { model, api_key_env } => {
+        ProviderConfig::Openai { model, api_key_env }
+        | ProviderConfig::Anthropic { model, api_key_env } => {
             if model.trim().is_empty()
                 || api_key_env.is_empty()
                 || !api_key_env
@@ -223,7 +225,7 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), RuntimeError> {
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
             {
                 Err(RuntimeError::Invalid(
-                    "invalid OpenAI model or credential reference",
+                    "invalid cloud model or credential reference",
                 ))
             } else {
                 Ok(())
