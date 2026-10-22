@@ -8,7 +8,7 @@ license.workspace = true
 voff-core.workspace = true
 voff-provider.workspace = true
 voff-storage.workspace = true
-voff-tools = { path = "../voff-tools", version = "=0.1.0-beta.1" }
+voff-tools = { path = "../voff-tools", version = "=0.1.0" }
 chrono.workspace = true
 serde.workspace = true
 serde_json = "1"
@@ -16,7 +16,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-voff-prompts = { version = "0.1.0-beta.1", path = "../voff-prompts" }
+voff-prompts = { version = "0.1.0", path = "../voff-prompts" }
 [dev-dependencies]
 async-trait.workspace = true
 voff-provider = { workspace = true, features = ["test-support"] }

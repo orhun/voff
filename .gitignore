@@ -1,7 +1,4 @@
 /target
 .env
 .DS_Store
-.voff/*.db
-.voff/*.db-shm
-.voff/*.db-wal
-.voff/logs/
+.voff/

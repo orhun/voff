@@ -6,40 +6,59 @@
   <a href="https://github.com/orhun/voff/releases"><img src="https://img.shields.io/github/v/release/orhun/voff?include_prereleases&style=flat&labelColor=1C1C1D&color=FA5D00&logo=github&logoColor=white" alt="GitHub release"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.92%2B?style=flat&labelColor=1C1C1D&color=FA5D00&logo=rust&logoColor=white" alt="Rust 1.92 or newer"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0?style=flat&labelColor=1C1C1D&color=FA5D00" alt="MIT or Apache 2.0 license"></a>
+  <br>
+  <a href="https://crates.io/crates/voff"><img src="https://img.shields.io/crates/v/voff?style=flat&labelColor=1C1C1D&color=FA5D00&logo=Rust&logoColor=white" alt="Crate release"></a>
+  <a href="https://github.com/orhun/voff/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/orhun/voff/ci.yml?branch=main&style=flat&labelColor=1C1C1D&color=FA5D00&logo=GitHub%20Actions&logoColor=white&label=CI" alt="Continuous Integration"></a>
 </p>
 
-voff runs coding agents as a team. A lead assigns tasks, agents do the work, and you can review changes and commands before they run. Tasks and activity are saved locally.
+Watch tasks move from plan to implementation with coordinated coding agents! 🦴
 
-## Getting started
+1. Create a team of agents automatically based on your project.
+2. Assign a task and have agents implement it in parallel.
+3. Watch the workflow unfold live!
 
-Requires [Rust 1.92+](https://www.rust-lang.org/tools/install) and one provider:
+<details>
+  <summary>Table of Contents</summary>
 
-- Codex CLI (`codex`)
-- Claude CLI (`claude`)
-- [Ollama](https://ollama.com/)
-- An OpenAI API key
-- An Anthropic API key
+<!-- vim-markdown-toc GFM -->
 
-From the repository root:
+- [Quickstart](#quickstart)
+- [Features](#features)
+  - [How it works](#how-it-works)
+    - [Why use a team workflow?](#why-use-a-team-workflow)
+- [Usage](#usage)
+  - [Key bindings](#key-bindings)
+  - [Available tools](#available-tools)
+- [Configuration](#configuration)
+- [Logo](#logo)
+- [License](#license)
+- [Copyright](#copyright)
 
-```sh
-cargo install --path crates/voff
-cd ~/path/to/project
-voff
+<!-- vim-markdown-toc -->
+
+</details>
+
+## Quickstart
+
+If you have Rust/Cargo installed:
+
+```
+cargo install voff
 ```
 
-Choose a provider and model. Then scan the project or describe the team you want. Team settings go in `.voff/config.toml`; task history goes in `.voff/voff.db`.
+Then simply run `voff` in your project directory!
 
-You can also start voff for a specific directory or load a team configuration directly:
+Other installation methods:
 
-```sh
-voff ~/path/to/project
-voff --config .voff/config.toml
-```
+- Arch Linux: `pacman -S voff`
 
-Voff loads `.voff/config.toml` automatically when it exists.
+## Features
 
-## How it works
+- Mix providers and models from **Codex**, **Claude**, and **Ollama** in one team.
+- Delegate through nested teams and run independent tasks in parallel.
+- Track token usage and per-agent cost estimates.
+
+### How it works
 
 ```mermaid
 flowchart LR
@@ -50,40 +69,51 @@ flowchart LR
     Lead -. saves tasks and activity .-> State[(Local state)]
 ```
 
-File access and commands stay within the workspace. File changes and local commands need approval. Commands run without a shell and have time and output limits.
+#### Why use a team workflow?
 
-## Why use a team workflow?
+**Q:** Why not just ask a single agent to do everything?  
+**A:** A team splits independent work across agents and runs it in parallel. The lead checks each result against its acceptance criteria, requests fixes where needed, and integrates the verified work. **Voff gives you a coordinated, visible workflow with built in reviews.**
 
-Voff keeps planning, implementation, and checks visible:
+## Usage
 
-- Split work into tasks and assign them to named agents.
-- Run independent tasks in parallel; send results to the lead for review.
-- Review file changes and local commands before approval.
-- Use different providers for different agents.
-- Reopen the project with its saved team and task history.
+Run `voff --setup [PROJECT_DIR]` to start team setup again for an existing project. It ignores the saved team and keeps the project's task history.
 
-## Available tools
+### Key bindings
+
+| Key               | Action                          |
+| ----------------- | ------------------------------- |
+| `1` / `2` / `Tab` | Switch between tabs             |
+| `Enter`           | Send a task to the lead         |
+| `t`               | Focus the team map or task pane |
+| `a`               | Add an agent                    |
+| `o`               | Open the selected agent's tab   |
+| `j` / `k`         | Browse agents                   |
+| `?`               | Open Help                       |
+
+Key hints appear in the interface. Press `?` to see all shortcuts.
+
+### Available tools
 
 Available tools depend on the agent:
 
-| Tool             | What it does                                                                                                        | Limits and review |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------- |
-| Tool             | Use                                                                                                                 |
-| ---              | ---                                                                                                                 |
-| `file.read`      | Read workspace text files in 1,200-character pages. Sensitive paths are blocked.                                    |
-| `search.text`    | Search workspace files with a bounded result count.                                                                 |
-| `file.patch`     | Propose a file change. Approval is required to apply it.                                                            |
-| `process.test`   | Propose a local command. It runs without a shell, from the workspace, with a five-minute timeout and capped output. |
-| `task.delegate`  | Assign tasks to enabled direct reports.                                                                             |
-| `review.request` | Ask an enabled agent to review task evidence.                                                                       |
-| `task.complete`  | Report completion with evidence. A patch alone is not enough.                                                       |
-| `task.blocked`   | Report a blocker.                                                                                                   |
+| Tool             | What it does                    |
+| ---------------- | ------------------------------- |
+| `file.read`      | Read project files              |
+| `search.text`    | Search project text             |
+| `file.patch`     | Propose a file edit             |
+| `process.test`   | Propose a local command         |
+| `task.delegate`  | Assign work to team agents      |
+| `review.request` | Request an agent review         |
+| `task.complete`  | Report completion with evidence |
+| `task.blocked`   | Report why work cannot continue |
 
-Commands cannot request network access, installation, publication, deployment, or destructive actions.
+Commands cannot request network access, installation, publication, deployment or destructive actions.
 
-## Team configuration
+## Configuration
 
-Teams use TOML. The first agent is the lead. Other agents report to the lead unless `reports_to` names another agent.
+After setup, Voff saves the team to `.voff/config.toml` and this file can be edited to customize the team.
+
+The following is an example configuration:
 
 ```toml
 workspace = ".."
@@ -115,38 +145,21 @@ scan_workspace = "Inspect this project and suggest a useful agent team."
 build_from_description = "Create a team for the user's project description."
 ```
 
-### Configuration fields
+## Logo
 
-| Field                                  | Meaning                                                                                                                  |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `workspace`                            | Workspace directory. Relative to the TOML file. A command-line directory takes precedence.                               |
-| `agent[].name`                         | Unique agent name. The first agent is the team lead.                                                                     |
-| `agent[].provider`                     | `codex_cli`, `claude_cli`, `ollama`, `openai`, or `anthropic`. `codex`, `claude`, `open_ai`, and `claude_api` also work. |
-| `agent[].model`                        | Model name. Defaults to the provider's default model.                                                                    |
-| `agent[].prompt`                       | Agent instructions. `system_prompt` is an alias.                                                                         |
-| `agent[].reports_to`                   | Reporting agent. Defaults to the lead.                                                                                   |
-| `agent[].max_output_tokens`            | Response limit. Defaults to `16384`; range is `1`–`1000000`.                                                             |
-| `setup_prompts.scan_workspace`         | Prompt used to suggest a team from a workspace.                                                                          |
-| `setup_prompts.build_from_description` | Prompt used to build a team from your description.                                                                       |
+Meet **Pasha** 🧡 Voff's mascot and unofficial moral supporter.
 
-Credentials are not stored in the TOML file. Use the provider CLI login, an environment variable, or the in-app prompt. OpenAI and Anthropic credentials entered in the app are saved in the local database. Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` to use a cloud API provider.
-
-Voff saves generated teams to `.voff/config.toml`. Edit the file by hand or load one with `--config`.
-
-## Navigation
-
-| Key                 | Action                                          |
-| ------------------- | ----------------------------------------------- |
-| `1` / `2`           | Open Team / Tasks                               |
-| `Tab` / `Shift+Tab` | Switch tabs                                     |
-| `Enter`             | Write a task                                    |
-| `t`                 | Switch focus between the team map and task pane |
-| `h`                 | Show or hide the task pane                      |
-| `u`                 | View token usage and cost estimates             |
-| `w`                 | Choose another workspace                        |
-
-In Team, press `a` to add an agent and `o` to open its tab. Select an agent to edit its settings. Press `?` for help.
+<img src="crates/voff/assets/pasha.png" width="360" alt="Pasha, Voff's mascot">
 
 ## License
 
-Licensed under either the [MIT license](LICENSE-MIT) or [Apache License, Version 2.0](LICENSE-APACHE), at your option 🐶
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat&logo=GitHub&labelColor=1D272B&color=819188&logoColor=white)](./LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat&logo=GitHub&labelColor=1D272B&color=819188&logoColor=white)](./LICENSE-APACHE)
+
+Licensed under either of [Apache License Version 2.0](./LICENSE-APACHE) or [The MIT License](./LICENSE-MIT) at your option 🐶
+
+🦀 ノ( º \_ º ノ) - respect crables!
+
+## Copyright
+
+Copyright © 2026, [Orhun Parmaksız](mailto:orhunparmaksiz@gmail.com)

@@ -12,7 +12,7 @@ voff-core.workspace = true
 voff-provider.workspace = true
 voff-storage.workspace = true
 voff-engine.workspace = true
-voff-tools = { path = "../voff-tools", version = "=0.1.0-beta.1" }
+voff-tools = { path = "../voff-tools", version = "=0.1.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
@@ -36,7 +36,7 @@ textwrap = { version = "0.16.4", default-features = false, features = ["unicode-
 unicode-width = "0.2.2"
 tokio-util.workspace = true
 tui-piechart = "1.1.0"
-voff-prompts = { version = "0.1.0-beta.1", path = "../voff-prompts" }
+voff-prompts = { version = "0.1.0", path = "../voff-prompts" }
 [lints]
 workspace = true
 [dev-dependencies]

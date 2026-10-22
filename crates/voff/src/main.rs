@@ -46,8 +46,11 @@ fn main() -> Result<()> {
 )]
 struct Cli {
     /// Load agents and workspace settings from a TOML file.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "setup")]
     config: Option<PathBuf>,
+    /// Start the setup flow over for the selected workspace.
+    #[arg(long, conflicts_with = "config")]
+    setup: bool,
     /// Workspace directory (defaults to the current directory).
     workspace: Option<PathBuf>,
 }
@@ -60,6 +63,12 @@ struct FileConfig {
     setup_prompts: onboarding::SetupPrompts,
     #[serde(default)]
     agent: Vec<FileAgent>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SetupPromptsConfig {
+    setup_prompts: onboarding::SetupPrompts,
 }
 
 #[derive(Deserialize)]
@@ -112,7 +121,7 @@ fn default_output_tokens() -> u64 {
 
 async fn application(cli: Cli) -> Result<()> {
     let explicit_config = cli.config.is_some();
-    let auto_config = if explicit_config {
+    let auto_config = if explicit_config || cli.setup {
         None
     } else {
         let candidate = cli.workspace.clone().unwrap_or(std::env::current_dir()?);
@@ -151,6 +160,9 @@ async fn application(cli: Cli) -> Result<()> {
                 configured_workspace,
                 setup_prompts,
             )
+        } else if cli.setup {
+            let setup_workspace = requested_workspace(cli.workspace.clone(), None)?;
+            (None, None, load_workspace_setup_prompts(&setup_workspace)?)
         } else {
             (None, None, onboarding::SetupPrompts::default())
         };
@@ -173,15 +185,22 @@ async fn application(cli: Cli) -> Result<()> {
             goal: None,
             popup_size: None,
         };
-        let saved_draft = saved
-            .as_deref()
-            .map(|saved| {
-                serde_json::from_str::<SetupDraft>(saved)
-                    .context("saved team is invalid; workspace database needs repair")
-            })
-            .transpose()?;
+        let saved_draft = if cli.setup {
+            None
+        } else {
+            saved
+                .as_deref()
+                .map(|saved| {
+                    serde_json::from_str::<SetupDraft>(saved)
+                        .context("saved team is invalid; workspace database needs repair")
+                })
+                .transpose()?
+        };
         let use_file_setup = explicit_config
-            || (pending_startup.is_none() && file_setup.is_some() && saved_draft.is_none());
+            || (!cli.setup
+                && pending_startup.is_none()
+                && file_setup.is_some()
+                && saved_draft.is_none());
         let draft = if use_file_setup {
             let Some(file_setup) = &file_setup else {
                 unreachable!("file setup selected only when present")
@@ -192,6 +211,7 @@ async fn application(cli: Cli) -> Result<()> {
         } else if let Some(draft) = saved_draft.as_ref() {
             draft.clone()
         } else if state_existed
+            && !cli.setup
             && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
         {
             let (draft, notice) =
@@ -221,7 +241,9 @@ async fn application(cli: Cli) -> Result<()> {
             if selected_workspace != launch_directory {
                 drop(repository);
                 launch_directory = selected_workspace;
-                if !explicit_config {
+                if !explicit_config && cli.setup {
+                    setup_prompts = load_workspace_setup_prompts(&launch_directory)?;
+                } else if !explicit_config {
                     (file_setup, setup_prompts) = load_workspace_setup_config(&launch_directory)?;
                 }
                 choice.set_workspace(launch_directory.clone());
@@ -313,6 +335,23 @@ fn load_workspace_setup_config(
         .with_context(|| format!("invalid TOML config {}", path.display()))?;
     let setup_prompts = parsed.setup_prompts.clone();
     Ok((setup_from_file(parsed)?, setup_prompts))
+}
+
+fn load_workspace_setup_prompts(workspace: &Path) -> Result<onboarding::SetupPrompts> {
+    let current = workspace.join(".voff/config.toml");
+    let legacy = workspace.join("voff.toml");
+    let path = if current.is_file() {
+        current
+    } else if legacy.is_file() {
+        legacy
+    } else {
+        return Ok(onboarding::SetupPrompts::default());
+    };
+    let source = fs::read_to_string(&path)
+        .with_context(|| format!("could not read config {}", path.display()))?;
+    let parsed: SetupPromptsConfig = toml::from_str(&source)
+        .with_context(|| format!("invalid setup prompts in config {}", path.display()))?;
+    Ok(parsed.setup_prompts)
 }
 
 fn setup_from_file(config: FileConfig) -> Result<Option<SetupDraft>> {
@@ -1303,6 +1342,51 @@ mod tests {
             ],
             working_directory: std::env::current_dir().unwrap(),
         }
+    }
+
+    #[test]
+    fn setup_flag_accepts_a_workspace_path() {
+        let cli = Cli::try_parse_from(["voff", "--setup", "/tmp/project"]).unwrap();
+        assert!(cli.setup);
+        assert_eq!(cli.workspace.as_deref(), Some(Path::new("/tmp/project")));
+    }
+
+    #[test]
+    fn setup_flag_cannot_be_combined_with_an_explicit_config() {
+        assert!(Cli::try_parse_from(["voff", "--setup", "--config", "team.toml"]).is_err());
+    }
+
+    #[test]
+    fn setup_mode_loads_custom_setup_prompts_without_reusing_saved_agents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = workspace.path().join(".voff");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[[agent]]\nname = 'Old Lead'\nprovider = 'invalid'\n\
+             [setup_prompts]\nscan_workspace = 'custom scan'\n\
+             build_from_description = 'custom build'\n",
+        )
+        .unwrap();
+
+        let prompts = load_workspace_setup_prompts(workspace.path()).unwrap();
+
+        assert_eq!(prompts.scan_workspace, "custom scan");
+        assert_eq!(prompts.build_from_description, "custom build");
+    }
+
+    #[test]
+    fn setup_mode_rejects_malformed_setup_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = workspace.path().join(".voff");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[setup_prompts]\nscan_workspace = 42\n",
+        )
+        .unwrap();
+
+        assert!(load_workspace_setup_prompts(workspace.path()).is_err());
     }
 
     #[test]

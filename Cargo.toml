@@ -3,16 +3,16 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0-beta.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-voff-core = { path = "crates/voff-core", version = "=0.1.0-beta.1" }
-voff-provider = { path = "crates/voff-provider", version = "=0.1.0-beta.1" }
-voff-storage = { path = "crates/voff-storage", version = "=0.1.0-beta.1" }
-voff-engine = { path = "crates/voff-engine", version = "=0.1.0-beta.1" }
+voff-core = { path = "crates/voff-core", version = "=0.1.0" }
+voff-provider = { path = "crates/voff-provider", version = "=0.1.0" }
+voff-storage = { path = "crates/voff-storage", version = "=0.1.0" }
+voff-engine = { path = "crates/voff-engine", version = "=0.1.0" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
