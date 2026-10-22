@@ -17,6 +17,10 @@ Watch tasks move from plan to implementation with coordinated coding agents! ðŸ¦
 2. Assign a task and have agents implement it in parallel.
 3. Watch the workflow unfold live!
 
+<p align="center">
+  <img src="crates/voff/assets/demo.gif" alt="Voff demo">
+</p>
+
 <details>
   <summary>Table of Contents</summary>
 
