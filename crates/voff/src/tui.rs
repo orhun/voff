@@ -649,7 +649,7 @@ impl AppModel {
                     self.credential_error = None;
                     self.composer_active = false;
                 } else {
-                    self.warn("This provider has no API token to edit. Check the agent's provider settings or local CLI login.");
+                    self.notice("This provider has no API token to edit. Check the agent's provider settings or local CLI login.");
                 }
             }
             Action::ToggleEvents => {
@@ -890,11 +890,11 @@ impl AppModel {
             return;
         }
         if self.team_edit_blocked() {
-            self.warn("Finish or cancel pending work before editing the team.");
+            self.notice("Finish or cancel pending work before editing the team.");
             return;
         }
         let Some(draft) = &self.team_setup else {
-            self.warn("This team cannot be edited safely.");
+            self.notice("This team cannot be edited safely.");
             return;
         };
         let index = self
@@ -905,13 +905,13 @@ impl AppModel {
             return;
         };
         if Some(agent.id) == self.team_lead || index == 0 {
-            self.warn("The Team Lead cannot be deleted.");
+            self.notice("The Team Lead cannot be deleted.");
         } else if draft
             .developers
             .iter()
             .any(|developer| developer.reports_to == Some(index))
         {
-            self.warn("Reassign this agent's direct reports before deleting it.");
+            self.notice("Reassign this agent's direct reports before deleting it.");
         } else if draft.developers.get(index).is_some() {
             self.pending_delete = Some(agent.id);
             self.composer_active = false;
@@ -962,7 +962,7 @@ impl AppModel {
                 .any(|developer| developer.reports_to == Some(index))
             || self.team_edit_blocked()
         {
-            self.warn("The team changed; deletion was cancelled.");
+            self.notice("The team changed; deletion was cancelled.");
             return true;
         }
         let removed = draft.developers.remove(index).name;
@@ -981,7 +981,7 @@ impl AppModel {
 
     fn open_workspace_picker(&mut self) {
         if self.team_edit_blocked() {
-            self.warn("Finish or cancel pending work before changing workspaces.");
+            self.notice("Finish or cancel pending work before changing workspaces.");
             return;
         }
         self.workspace_editor = Some(crate::onboarding::Wizard::workspace(&self.workspace_root));
@@ -997,11 +997,11 @@ impl AppModel {
                 .any(|approval| approval.decision == ApprovalDecision::Pending)
             || !self.lead_reviews.is_empty()
         {
-            self.warn("Finish or cancel pending work before editing the team.");
+            self.notice("Finish or cancel pending work before editing the team.");
             return;
         }
         let Some(mut draft) = self.team_setup.clone() else {
-            self.warn("This custom team cannot be represented safely in guided setup.");
+            self.notice("This custom team cannot be represented safely in guided setup.");
             return;
         };
         for (developer, agent) in draft.developers.iter_mut().zip(&self.agents) {
@@ -1187,10 +1187,10 @@ impl AppModel {
                 KeyCode::Enter => {
                     let message = self.composer.lines().join("\n").trim().to_owned();
                     if message.is_empty() {
-                        self.warn("Describe a task first.");
+                        self.notice("Describe a task first.");
                         ComposerEvent::Consumed
                     } else if message.len() > 8_000 {
-                        self.warn("Keep messages under 8,000 bytes.");
+                        self.notice("Keep messages under 8,000 bytes.");
                         ComposerEvent::Consumed
                     } else {
                         self.remember_composer_prompt(&message);
@@ -1427,7 +1427,7 @@ impl AppModel {
                                     false,
                                 );
                             } else {
-                                self.warn(&review);
+                                self.notice(&review);
                             }
                         }
                         CanonicalEventKind::RevisionRequested { .. } => {
@@ -1456,9 +1456,14 @@ impl AppModel {
                         CanonicalEventKind::ApplicationIssue(message) => {
                             self.application_notice = Some(sanitize(message));
                         }
-                        CanonicalEventKind::ProviderWarning(message) => {
+                        // Routine tool-success progress stays in task activity instead of
+                        // interrupting with a toast for each file read, patch, or check.
+                        CanonicalEventKind::ProviderWarning(message)
+                            if !is_routine_provider_progress(message) =>
+                        {
                             self.warn(&format!("Provider warning: {}", sanitize(message)));
                         }
+                        CanonicalEventKind::ProviderWarning(_) => {}
                         _ => {}
                     }
                 }
@@ -1508,13 +1513,14 @@ impl AppModel {
         accent: Color,
         persistent: bool,
     ) -> Option<u64> {
-        let mut lines = vec![Line::from(Span::styled(
-            title.to_owned(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ))];
-        lines.extend(message.lines().map(|line| Line::from(line.to_owned())));
-        let content = Text::from(lines);
+        let content = Text::from(
+            message
+                .lines()
+                .map(|line| Line::from(line.to_owned()))
+                .collect::<Vec<_>>(),
+        );
         let notification = Notification::new(content)
+            .title(title.to_owned())
             .level(level)
             .anchor(Anchor::TopRight)
             .margin(3)
@@ -1527,11 +1533,7 @@ impl AppModel {
             .max_size(SizeConstraint::Absolute(48), SizeConstraint::Absolute(5))
             .style(theme::surface())
             .border_style(Style::default().fg(accent))
-            .title_style(
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
             .build();
         let id = notification
             .ok()
@@ -1549,14 +1551,12 @@ impl AppModel {
         id
     }
 
+    fn notice(&mut self, message: &str) {
+        let _ = self.notify("Notice", message, Level::Info, theme::AQUA, false);
+    }
+
     fn warn(&mut self, message: &str) {
-        let _ = self.notify(
-            "Action unavailable",
-            message,
-            Level::Warn,
-            theme::YELLOW,
-            false,
-        );
+        let _ = self.notify("Warning", message, Level::Warn, theme::YELLOW, false);
     }
 
     fn notify_task_status(&mut self, task: &Task) {
@@ -1902,6 +1902,11 @@ impl AppModel {
                         exit_code: Some(0), ..
                     }
                     | CanonicalEventKind::TaskResultPublished { .. } => theme::GREEN,
+                    CanonicalEventKind::ProviderWarning(message)
+                        if is_routine_provider_progress(message) =>
+                    {
+                        theme::AQUA
+                    }
                     CanonicalEventKind::LeadReviewFinished {
                         approved: false, ..
                     }
@@ -2134,6 +2139,9 @@ fn activity_headline(kind: &CanonicalEventKind) -> Option<&'static str> {
         CanonicalEventKind::ProviderFailed(_) | CanonicalEventKind::PatchConflict { .. } => {
             Some("! Problem")
         }
+        CanonicalEventKind::ProviderWarning(message) if is_routine_provider_progress(message) => {
+            Some("↻ Progress")
+        }
         CanonicalEventKind::ProviderWarning(_) | CanonicalEventKind::ProviderRetrying { .. } => {
             Some("! Provider update")
         }
@@ -2183,6 +2191,7 @@ fn format_event(kind: &CanonicalEventKind) -> String {
         } => format!("usage: {input_tokens} in / {output_tokens} out"),
         CanonicalEventKind::ProviderCompleted => "provider completed".into(),
         CanonicalEventKind::ProviderFailed(e) => format!("provider failed: {}", sanitize(e)),
+        CanonicalEventKind::ProviderWarning(e) if is_routine_provider_progress(e) => sanitize(e),
         CanonicalEventKind::ProviderWarning(e) => format!("provider warning: {}", sanitize(e)),
         CanonicalEventKind::ApplicationIssue(e) => {
             format!("application needs attention: {}", sanitize(e))
@@ -2370,6 +2379,15 @@ fn event_text_color(text: &str) -> Color {
     } else {
         theme::TEXT
     }
+}
+
+fn is_routine_provider_progress(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains(" succeeded; continuing ")
+        || message.starts_with("continuing by regenerating the incomplete response")
+        || message.starts_with("verification was delegated to the approved qualified report")
+        || message.starts_with("single delegated task dispatched")
+        || message.starts_with("shared contract dispatched")
 }
 
 fn event_viewer_lines(app: &AppModel) -> Vec<Line<'static>> {
@@ -2938,7 +2956,7 @@ async fn terminal_loop<R: Repository + 'static>(
                                     if model.panel == Panel::Tasks || model.task_pane_focused =>
                                 {
                                     if model.retry_starting {
-                                        model.warn("A task re-run is already being prepared.");
+                                        model.notice("A task re-run is already being prepared.");
                                     } else if let Some(task) = model.selected_task().cloned() {
                                         if task.status.can_retry() {
                                             model.retry_starting = true;
@@ -2980,13 +2998,13 @@ async fn terminal_loop<R: Repository + 'static>(
                                                 }
                                             });
                                         } else {
-                                            model.warn(&format!(
+                                            model.notice(&format!(
                                                 "A {:?} task cannot be re-run; cancel it first if it is active.",
                                                 task.status
                                             ));
                                         }
                                     } else {
-                                        model.warn("Select a task to re-run.");
+                                        model.notice("Select a task to re-run.");
                                     }
                                 }
                                 Action::Cancel => {
@@ -7249,6 +7267,82 @@ mod tests {
 
         app.apply_event(EngineEvent::TaskUpdated(task));
         assert!(!app.notifications.has_notification());
+    }
+
+    #[test]
+    fn informational_notices_use_the_aqua_theme() {
+        let mut app = AppModel::new(SessionId::new());
+        app.notice("Describe a task first.");
+        app.notifications.tick(Duration::from_millis(500));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let position = (0..buffer.area.height)
+            .find_map(|y| {
+                (0..=buffer.area.width.saturating_sub(6))
+                    .find(|&x| {
+                        (0..6)
+                            .map(|offset| buffer[(x + offset, y)].symbol())
+                            .collect::<String>()
+                            == "Notice"
+                    })
+                    .map(|x| (x, y))
+            })
+            .expect("notice title should be rendered");
+
+        assert_eq!(buffer[position].fg, theme::AQUA);
+        let rendered = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Describe a task first."), "{rendered}");
+        assert!(!rendered.contains("Action unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn routine_tool_progress_stays_in_activity_without_warning_toasts() {
+        let mut app = AppModel::new(SessionId::new());
+        let task = Task::root(
+            AgentId::new(),
+            "Review the todo example",
+            vec![],
+            Default::default(),
+        );
+
+        for action in ["file.read", "file.patch", "process.test"] {
+            app.apply_event(EngineEvent::Canonical(CanonicalEvent {
+                id: voff_core::EventId::new(),
+                session_id: app.session,
+                task_id: Some(task.id),
+                created_at: chrono::Utc::now(),
+                kind: CanonicalEventKind::ProviderWarning(format!(
+                    "{action} succeeded; continuing work. Acceptance and integration are still pending."
+                )),
+            }));
+        }
+
+        assert!(!app.notifications.has_notification());
+        assert_eq!(app.scoped_events.len(), 3);
+        assert!(app.scoped_events.iter().all(|event| {
+            event.headline == Some("↻ Progress")
+                && event.accent == theme::AQUA
+                && event.text.contains("succeeded; continuing")
+        }));
+        assert!(
+            app.events
+                .iter()
+                .all(|event| !event.starts_with("provider warning:"))
+        );
+
+        app.apply_event(EngineEvent::Canonical(CanonicalEvent {
+            id: voff_core::EventId::new(),
+            session_id: app.session,
+            task_id: Some(task.id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::ProviderWarning(
+                "Provider returned a transient diagnostic.".into(),
+            ),
+        }));
+        assert!(app.notifications.has_notification());
     }
 
     #[test]
