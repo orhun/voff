@@ -2769,13 +2769,13 @@ fn render_starfield(frame: &mut ratatui::Frame<'_>, area: Rect, background: Colo
         for x in (area.x + 2..area.right().saturating_sub(2)).step_by(9) {
             let seed =
                 u64::from(x).wrapping_mul(73_856_093) ^ u64::from(y).wrapping_mul(19_349_663);
-            if seed % 6 != 0 {
+            if seed % 3 != 0 {
                 continue;
             }
             let phase = (elapsed + u128::from(seed % 12_000)) % 12_000;
             let (symbol, color) = match phase {
-                0..=749 => ("✦", Color::Rgb(112, 53, 26)),
-                750..=1_499 => ("✧", Color::Rgb(68, 36, 22)),
+                0..=1_499 => ("✦", Color::Rgb(178, 81, 30)),
+                1_500..=2_499 => ("✧", Color::Rgb(116, 59, 31)),
                 _ => continue,
             };
             frame.render_widget(
