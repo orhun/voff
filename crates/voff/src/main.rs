@@ -1326,11 +1326,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_system_prompt_is_rejected_before_runtime_setup() {
+    fn empty_agent_prompt_is_allowed_for_generated_setup() {
         let mut setup = draft();
         setup.developers[1].reports_to = Some(0);
         setup.developers[1].system_prompt.clear();
-        assert!(config_from_setup(&setup).is_err());
+        let config = config_from_setup(&setup).unwrap();
+        assert!(config.agents[1].system_prompt.is_empty());
     }
 
     #[test]

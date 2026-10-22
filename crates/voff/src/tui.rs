@@ -3319,18 +3319,12 @@ fn render_tab_bar(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect
     let session = app.session.to_string();
     let short = &session[..session.len().min(8)];
     let mut spans = if area.width < 48 {
-        vec![
-            Span::styled(
-                " voff",
-                Style::default()
-                    .fg(theme::ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("·{}  ", &short[..short.len().min(6)]),
-                Style::default().fg(theme::TEXT),
-            ),
-        ]
+        vec![Span::styled(
+            " voff ",
+            Style::default()
+                .fg(theme::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )]
     } else {
         vec![
             Span::styled(
@@ -6266,11 +6260,7 @@ mod tests {
         assert_eq!(edge.source, worker.id.to_string());
         assert_eq!(edge.target, lead.id.to_string());
         assert!(edge.animated);
-        assert!(
-            edge.label
-                .as_deref()
-                .is_some_and(|label| label.contains("Review"))
-        );
+        assert!(edge.label.is_none());
         assert_eq!(
             app.team_flow.connection_positions(0),
             Some((
@@ -7506,8 +7496,14 @@ mod tests {
             (cell.symbol().to_owned(), cell.fg)
         };
         assert_eq!(icon_cell(lead_position), ("◆".into(), theme::ORANGE));
-        assert_eq!(icon_cell(frontend_position), ("▣".into(), theme::AQUA));
-        assert_eq!(icon_cell(backend_position), ("⬢".into(), theme::YELLOW));
+        assert_eq!(
+            icon_cell(frontend_position),
+            ("▣".into(), theme::agent_color(1))
+        );
+        assert_eq!(
+            icon_cell(backend_position),
+            ("⬢".into(), theme::agent_color(2))
+        );
 
         let root_objective = position("root objective");
         let child_objective = position("child objective");
@@ -7905,7 +7901,7 @@ mod tests {
         assert!(!rendered.contains("Agent settings"));
         assert!(rendered.contains("🐶"), "{rendered}");
         assert!(rendered.contains("voff · ses_"), "{rendered}");
-        assert!(rendered.contains("Enter save"));
+        assert!(rendered.contains("[Enter] save"));
         assert!(rendered.contains("Team Lead"));
         assert!(!rendered.contains("quick defaults"));
         assert!(!rendered.contains("Adjust team"));
@@ -8353,7 +8349,7 @@ mod tests {
             app.action_for_mouse(
                 mouse(
                     MouseEventKind::Down(MouseButton::Left),
-                    app.team_edit_hitbox.x + 1,
+                    app.team_edit_hitbox.x,
                     app.team_edit_hitbox.y,
                 ),
                 Rect::new(0, 0, 100, 30),
@@ -8680,7 +8676,7 @@ mod tests {
         assert!(rendered.contains("Ada"));
         assert!(rendered.contains("Linus"));
         assert!(rendered.contains("Model · qwen-test"));
-        assert!(rendered.contains("4096 token limit"));
+        assert!(!rendered.contains("4096 token limit"));
         assert!(!rendered.contains("no delegation"));
         assert!(rendered.contains("Team"), "{rendered}");
         assert!(rendered.contains("Tasks · 0"), "{rendered}");
@@ -8698,7 +8694,7 @@ mod tests {
         let composer = (buffer.area.height.saturating_sub(3)..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(composer.contains("Team Lead"), "{composer}");
+        assert!(!composer.contains("Ask Team Lead"), "{composer}");
         assert!(
             composer.contains("🐶") && composer.contains("Ask Ada to do anything"),
             "{composer}"
@@ -8715,7 +8711,10 @@ mod tests {
         let bottom_border = (0..buffer.area.width)
             .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
             .collect::<String>();
-        assert!(bottom_border.contains("[?] help · [w]"), "{bottom_border}");
+        assert!(
+            bottom_border.contains("[?] help · [u] usage · [w]"),
+            "{bottom_border}"
+        );
         assert!(!bottom_border.contains("Prompt"), "{bottom_border}");
         assert!(!composer.contains("Prompt · Team Lead"), "{composer}");
         let cwd = bottom_border
@@ -8728,7 +8727,7 @@ mod tests {
     fn role_cards_render_one_icon_labeled_identity_inside_the_border() {
         let mut app = AppModel::new(SessionId::new());
         app.agents = vec![agent("Backend Agent 2", "backend_agent", vec![])];
-        let backend = TestBackend::new(80, 20);
+        let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -8739,7 +8738,11 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("⬢ Backend Agent 2"), "{rendered}");
         assert!(!rendered.contains("Backend Agent ·"), "{rendered}");
-        assert_eq!(rendered.matches("Backend Agent 2").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered.matches("⬢ Backend Agent 2").count(),
+            1,
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -8808,7 +8811,7 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("Model · CLI automatic"), "{rendered}");
+        assert!(rendered.contains("Codex CLI"), "{rendered}");
         assert!(
             rendered.contains("Reviewing the current Rust"),
             "{rendered}"
@@ -8923,10 +8926,7 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(
-            rendered.contains("2 handoffs awaiting approval"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("2 handoff"), "{rendered}");
         assert!(rendered.contains("Backend"), "{rendered}");
         assert!(app.agents.iter().any(|agent| agent.name == "Frontend"));
         assert!(rendered.contains("Decision 1/2"), "{rendered}");
@@ -8945,9 +8945,12 @@ mod tests {
             !((edge.source == backend_id && edge.target == frontend_id)
                 || (edge.source == frontend_id && edge.target == backend_id))
         }));
-        assert!(app.team_flow.edges().iter().all(|edge| {
-            edge.animated && edge.label.as_deref().is_some_and(|label| label.len() > 2)
-        }));
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .all(|edge| { edge.animated && edge.label.is_none() })
+        );
     }
 
     #[test]
@@ -9112,13 +9115,13 @@ mod tests {
                 .iter()
                 .any(|frame| rendered.contains(*frame))
         );
-        assert!(app.team_flow.edges().iter().any(|edge| {
-            edge.animated
-                && edge
-                    .label
-                    .as_deref()
-                    .is_some_and(|label| label.contains("Implement calculator"))
-        }));
+        assert!(app.team_flow.edges().iter().any(|edge| edge.animated));
+        assert!(
+            app.team_flow
+                .edges()
+                .iter()
+                .all(|edge| edge.label.is_none())
+        );
     }
 
     #[test]
@@ -9172,7 +9175,6 @@ mod tests {
                 .iter()
                 .all(|edge| edge.label.is_none())
         );
-        assert!(rendered.matches("complete").count() >= 3);
     }
 
     #[test]

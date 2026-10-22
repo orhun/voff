@@ -51,6 +51,7 @@ fn extra_arguments_are_rejected_without_opening_a_workspace() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("usage: voff"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Usage:") && stderr.contains("voff"));
     assert!(!workspace.path().join(".voff").exists());
 }

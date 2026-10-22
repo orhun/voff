@@ -117,17 +117,17 @@ build_from_description = "Create a team for the user's project description."
 
 ### Configuration fields
 
-| Field                                  | Meaning                                                                                       |
-| -------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `workspace`                            | Workspace directory. Relative to the TOML file. A command-line directory takes precedence.    |
-| `agent[].name`                         | Unique agent name. The first agent is the team lead.                                          |
+| Field                                  | Meaning                                                                                                                  |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `workspace`                            | Workspace directory. Relative to the TOML file. A command-line directory takes precedence.                               |
+| `agent[].name`                         | Unique agent name. The first agent is the team lead.                                                                     |
 | `agent[].provider`                     | `codex_cli`, `claude_cli`, `ollama`, `openai`, or `anthropic`. `codex`, `claude`, `open_ai`, and `claude_api` also work. |
-| `agent[].model`                        | Model name. Defaults to the provider's default model.                                         |
-| `agent[].prompt`                       | Agent instructions. `system_prompt` is an alias.                                              |
-| `agent[].reports_to`                   | Reporting agent. Defaults to the lead.                                                        |
-| `agent[].max_output_tokens`            | Response limit. Defaults to `16384`; range is `1`–`1000000`.                                  |
-| `setup_prompts.scan_workspace`         | Prompt used to suggest a team from a workspace.                                               |
-| `setup_prompts.build_from_description` | Prompt used to build a team from your description.                                            |
+| `agent[].model`                        | Model name. Defaults to the provider's default model.                                                                    |
+| `agent[].prompt`                       | Agent instructions. `system_prompt` is an alias.                                                                         |
+| `agent[].reports_to`                   | Reporting agent. Defaults to the lead.                                                                                   |
+| `agent[].max_output_tokens`            | Response limit. Defaults to `16384`; range is `1`–`1000000`.                                                             |
+| `setup_prompts.scan_workspace`         | Prompt used to suggest a team from a workspace.                                                                          |
+| `setup_prompts.build_from_description` | Prompt used to build a team from your description.                                                                       |
 
 Credentials are not stored in the TOML file. Use the provider CLI login, an environment variable, or the in-app prompt. OpenAI and Anthropic credentials entered in the app are saved in the local database. Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` to use a cloud API provider.
 
@@ -149,4 +149,4 @@ In Team, press `a` to add an agent and `o` to open its tab. Select an agent to e
 
 ## License
 
-Licensed under either the [MIT license](LICENSE-MIT) or [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+Licensed under either the [MIT license](LICENSE-MIT) or [Apache License, Version 2.0](LICENSE-APACHE), at your option 🐶

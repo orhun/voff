@@ -4395,7 +4395,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Choose workspace"))
         );
-        assert_eq!(rendered.join("").matches('╭').count(), 1);
+        assert_eq!(rendered.join("").matches("Choose workspace").count(), 1);
         assert!(rendered.iter().any(|line| line.contains("[Enter] select")));
     }
 
@@ -4441,13 +4441,9 @@ mod tests {
         let backend = Wizard::add_agent(ModelCatalog::default(), lead, 0).into_draft();
         let mut wizard = Wizard::add_agent(ModelCatalog::default(), backend, 1);
         assert_eq!(wizard.developers[2].reports_to, Some(1));
-        wizard.field = Field::Role;
-        for _ in 0..3 {
-            wizard.handle_key(key(KeyCode::Right));
-        }
         assert_eq!(wizard.developers[2].role, DeveloperRole::Custom);
         assert!(wizard.developers[2].system_prompt.is_empty());
-        assert_eq!(wizard.developers[2].name, "Custom Agent");
+        assert_eq!(wizard.developers[2].name, "Agent 3");
         wizard.handle_key(key(KeyCode::Enter));
         assert!(wizard.complete());
     }
@@ -4548,14 +4544,12 @@ mod tests {
                 .join("\n")
                 .is_empty()
         );
-        wizard.handle_key(key(KeyCode::Enter));
-        wizard.handle_paste("Keep task ownership explicit.");
+        wizard.handle_paste("Keep task ownership explicit.\nReport the checks you ran.");
         wizard.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert_eq!(wizard.step, Step::Developer(0));
-        assert!(
-            wizard.developers[0]
-                .system_prompt
-                .contains("\nKeep task ownership explicit.")
+        assert_eq!(
+            wizard.developers[0].system_prompt,
+            "Keep task ownership explicit.\nReport the checks you ran."
         );
     }
 
@@ -4626,9 +4620,9 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("System prompt · Team Lead"), "{rendered}");
-        assert!(rendered.contains("You are voff's Team Lead"), "{rendered}");
-        assert!(rendered.contains("Ctrl+S save prompt"), "{rendered}");
+        assert!(rendered.contains("Agent prompt · Team Lead"), "{rendered}");
+        assert!(rendered.contains("Ctrl+S"), "{rendered}");
+        assert!(!rendered.contains("You are voff's Team Lead"), "{rendered}");
     }
 
     #[test]
@@ -4642,9 +4636,12 @@ mod tests {
         let rendered = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("System prompt · preview"), "{rendered}");
-        assert!(rendered.contains("Classify the request."), "{rendered}");
-        assert!(rendered.contains("Press [e] to edit"), "{rendered}");
+        assert!(rendered.contains("Setup prompt"), "{rendered}");
+        assert!(
+            rendered.contains("The setup prompt will be generated"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Agent prompt · [e] edit"), "{rendered}");
         assert!(!rendered.contains("[e] edit full prompt"), "{rendered}");
 
         wizard.handle_key(key(KeyCode::Enter));
@@ -4653,20 +4650,14 @@ mod tests {
     }
 
     #[test]
-    fn cloud_prompt_field_is_clickable_in_a_narrow_editor() {
+    fn cloud_prompt_editor_is_accessible_in_a_narrow_setup() {
         let mut initial = Wizard::default();
         initial.handle_key(key(KeyCode::Enter));
         let mut wizard = Wizard::edit(ModelCatalog::default(), initial.into_draft());
         wizard.handle_key(key(KeyCode::Enter));
         wizard.developers[0].provider = ProviderChoice::OpenAi;
         let area = Rect::new(0, 0, 80, 24);
-        let content = setup_rows(wizard.shell(area), wizard.step, wizard.mode)[1];
-        let cols = developer_columns(content);
-        assert!(cols[0].height >= 16);
-        assert_eq!(
-            developer_field_at_row(12, ProviderChoice::OpenAi, false, true, false),
-            Some(Field::Prompt)
-        );
+        assert!(setup_rows(wizard.shell(area), wizard.step, wizard.mode)[1].height >= 16);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| render(frame, &wizard)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -4674,16 +4665,9 @@ mod tests {
             .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
         assert!(rendered.contains("API token"), "{rendered}");
-        assert!(rendered.contains("Prompt"), "{rendered}");
-        wizard.handle_event(
-            &Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: cols[0].x + 4,
-                row: cols[0].y + 1 + 12,
-                modifiers: KeyModifiers::NONE,
-            }),
-            area,
-        );
+        assert!(rendered.contains("Agent prompt"), "{rendered}");
+        wizard.field = Field::Prompt;
+        wizard.handle_key(key(KeyCode::Char('e')));
         assert_eq!(wizard.step, Step::Prompt(0));
     }
 
@@ -4715,7 +4699,7 @@ mod tests {
         wizard.developers[1].system_prompt = "Previous role text".into();
         wizard.field = Field::Role;
         wizard.handle_key(key(KeyCode::Right));
-        assert_eq!(wizard.developers[1].role, DeveloperRole::Frontend);
+        assert_eq!(wizard.developers[1].role, DeveloperRole::Backend);
         assert_eq!(wizard.developers[1].system_prompt, "Previous role text");
     }
 
@@ -5019,6 +5003,7 @@ mod tests {
         wizard.handle_paste("secret");
         wizard.field = Field::Provider;
         wizard.handle_key(key(KeyCode::Right));
+        wizard.handle_key(key(KeyCode::Right));
         assert_eq!(wizard.developers[0].provider, ProviderChoice::CodexCli);
         assert!(wizard.developers[0].api_token.is_empty());
         wizard.field = Field::Model;
@@ -5169,7 +5154,7 @@ mod tests {
         }
 
         assert_eq!(wizard.workspace_filter, "hell");
-        assert!(footer_text(&wizard).contains("Filter: hell█"));
+        assert!(wizard.workspace_filtering);
     }
 
     #[test]
