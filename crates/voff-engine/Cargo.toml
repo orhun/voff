@@ -1,5 +1,6 @@
 [package]
 name = "voff-engine"
+description = "Task orchestration engine for Voff coding agent workflows."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

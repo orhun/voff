@@ -1,5 +1,6 @@
 [package]
 name = "voff-prompts"
+description = "Built-in prompts for Voff coding agent workflows."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

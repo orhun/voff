@@ -1,5 +1,6 @@
 [package]
 name = "voff-core"
+description = "Core domain types for Voff coding agent workflows."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "voff"
+description = "Workflow builder for coding agents 🐶"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
