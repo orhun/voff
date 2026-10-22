@@ -11,15 +11,15 @@
   <a href="https://github.com/orhun/voff/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/orhun/voff/ci.yml?branch=main&style=flat&labelColor=1C1C1D&color=FA5D00&logo=GitHub%20Actions&logoColor=white&label=CI" alt="Continuous Integration"></a>
 </p>
 
+<p align="center">
+  <img src="crates/voff/assets/demo.gif" alt="Voff demo">
+</p>
+
 Watch tasks move from plan to implementation with coordinated coding agents! 🦴
 
 1. Create a team of agents automatically based on your project.
 2. Assign a task and have agents implement it in parallel.
 3. Watch the workflow unfold live!
-
-<p align="center">
-  <img src="crates/voff/assets/demo.gif" alt="Voff demo">
-</p>
 
 <details>
   <summary>Table of Contents</summary>
