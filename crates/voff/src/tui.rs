@@ -8083,7 +8083,7 @@ mod tests {
         assert_eq!(buffer[heading].fg, theme::ORANGE);
         assert!(matches!(
             buffer[(content.x, content.y)].bg,
-            ratatui::style::Color::Reset | ratatui::style::Color::Rgb(_, _, _)
+            ratatui::style::Color::Reset | ratatui::style::Color::Indexed(_)
         ));
     }
 
