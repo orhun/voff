@@ -240,11 +240,79 @@ pub struct OutputContinuation {
     pub conversation: bool,
 }
 #[derive(Deserialize)]
-struct PatchArguments {
+#[serde(deny_unknown_fields)]
+struct SinglePatchArguments {
     path: PathBuf,
     replacement: String,
     #[serde(default)]
     artifact_id: Option<ArtifactId>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchBatchArguments {
+    patches: Vec<SinglePatchArguments>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PatchArguments {
+    Single(SinglePatchArguments),
+    Batch(PatchBatchArguments),
+}
+impl PatchArguments {
+    fn into_patches(self) -> Vec<SinglePatchArguments> {
+        match self {
+            Self::Single(patch) => vec![patch],
+            Self::Batch(batch) => batch.patches,
+        }
+    }
+    fn paths(&self) -> Vec<&Path> {
+        match self {
+            Self::Single(patch) => vec![&patch.path],
+            Self::Batch(batch) => batch
+                .patches
+                .iter()
+                .map(|patch| patch.path.as_path())
+                .collect(),
+        }
+    }
+    fn has_placeholder(&self) -> bool {
+        self.paths_and_replacements().iter().any(|replacement| {
+            replacement.contains("[rest of file]") || replacement.contains("... rest of file")
+        })
+    }
+    fn paths_and_replacements(&self) -> Vec<&str> {
+        match self {
+            Self::Single(patch) => vec![&patch.replacement],
+            Self::Batch(batch) => batch
+                .patches
+                .iter()
+                .map(|patch| patch.replacement.as_str())
+                .collect(),
+        }
+    }
+}
+fn validate_patch_batch(patches: &PatchArguments) -> Result<(), EngineError> {
+    let paths = patches.paths();
+    if paths.is_empty()
+        || paths.len() > 12
+        || matches!(patches, PatchArguments::Batch(_)) && paths.len() < 2
+    {
+        return Err(EngineError::InvalidDelegationPlan(
+            "file.patch requires between one and twelve files".into(),
+        ));
+    }
+    let paths = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
+    if paths.iter().enumerate().any(|(index, path)| {
+        paths
+            .iter()
+            .skip(index + 1)
+            .any(|other| path == other || path.starts_with(other) || other.starts_with(path))
+    }) {
+        return Err(EngineError::InvalidDelegationPlan(
+            "file.patch paths must be unique and cannot contain one another".into(),
+        ));
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -359,7 +427,12 @@ fn inspection_is_repeat(
         let Ok(patch) = serde_json::from_str::<PatchArguments>(&approval.reason) else {
             continue;
         };
-        if kind == "file_read" && patch.path.display().to_string() != location {
+        if kind == "file_read"
+            && !patch
+                .paths()
+                .iter()
+                .any(|path| path.display().to_string() == location)
+        {
             continue;
         }
         if approval_times
@@ -379,6 +452,7 @@ struct BlockedReport {
 }
 /// One explicit, approval-gated child task in an application-supplied plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationProposal {
     /// Exact display name of an enabled target in the current formation.
     pub target_agent: String,
@@ -393,6 +467,7 @@ pub struct DelegationProposal {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DelegationBatch {
     proposals: Vec<DelegationProposal>,
 }
@@ -1013,6 +1088,7 @@ impl<R: Repository + 'static> Engine<R> {
             }
             work.turns += 1;
             self.repo.save_task(task.clone()).await?;
+            self.maybe_report_stalled_work(&task).await?;
         }
         let cancel = CancellationToken::new();
         self.cancellations.lock().await.insert(id, cancel.clone());
@@ -1144,10 +1220,14 @@ impl<R: Repository + 'static> Engine<R> {
             )
         };
         let owner_prompt = if task.work.is_some() && mode == RunMode::Work {
+            let required_validator =
+                integrated::dedicated_validation_target(&task, &agent, &delegation_targets)
+                    .map(|target| target.name.as_str());
             integrated::configure_tools(
                 &mut tools,
                 &delegation_target_names,
                 task.limits.max_children,
+                required_validator,
             );
             format!(
                 "{owner_prompt}\n\n{}\n{}",
@@ -1176,7 +1256,7 @@ impl<R: Repository + 'static> Engine<R> {
                 .filter(|approval| {
                     approval.task_id == previous && approval.decision == ApprovalDecision::Denied
                 })
-                .map(|approval| format!("{}: {}", approval.action, approval.reason))
+                .map(|approval| compact_denied_action(&approval.action, &approval.reason))
                 .collect::<Vec<_>>()
                 .join("\n");
             let feedback = self
@@ -1193,6 +1273,8 @@ impl<R: Repository + 'static> Engine<R> {
                     } => Some(reason),
                     _ => None,
                 })
+                .rev()
+                .take(2)
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
@@ -1390,8 +1472,32 @@ impl<R: Repository + 'static> Engine<R> {
                     ));
                 }
                 if task.work.is_some() && call.name == "task.delegate" {
-                    self.validate_integrated_plan(&task, &agent, &call.arguments_json)
-                        .await?;
+                    match self
+                        .validate_integrated_plan(&task, &agent, &call.arguments_json)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error @ EngineError::InvalidDelegationPlan(_))
+                        | Err(error @ EngineError::InvalidToolArguments(_)) => {
+                            let feedback = format!(
+                                "Voff rejected this task.delegate plan: {error}. No tasks were dispatched. Revise the plan to match the tool schema and workflow requirements, then submit a complete valid plan."
+                            );
+                            self.publish_artifact(Artifact {
+                                id: ArtifactId::new(),
+                                producer: id,
+                                kind: "workflow_feedback".into(),
+                                location: "task.delegate".into(),
+                                digest: String::new(),
+                                preview: feedback.clone(),
+                            })
+                            .await?;
+                            self.record(Some(id), CanonicalEventKind::ProviderWarning(feedback))
+                                .await?;
+                            self.transition(id, TaskStatus::Ready).await?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
                     side_effects += 1;
                     continue;
                 }
@@ -1505,7 +1611,8 @@ impl<R: Repository + 'static> Engine<R> {
                         inspections += 1;
                     }
                     "file.patch" => {
-                        let _: PatchArguments = serde_json::from_str(&call.arguments_json)?;
+                        let patches = serde_json::from_str::<PatchArguments>(&call.arguments_json)?;
+                        validate_patch_batch(&patches)?;
                         side_effects += 1;
                     }
                     "process.test" => {
@@ -1826,12 +1933,8 @@ impl<R: Repository + 'static> Engine<R> {
                         "file.patch" => {
                             let args: PatchArguments =
                                 serde_json::from_str(&request.arguments_json)?;
-                            if !integrated::task_owns_path(&task, &args.path) {
-                                return Err(ToolError::OutsideWorkspace.into());
-                            }
-                            if args.replacement.contains("[rest of file]")
-                                || args.replacement.contains("... rest of file")
-                            {
+                            validate_patch_batch(&args)?;
+                            if args.has_placeholder() {
                                 self.record(
                                     Some(id),
                                     CanonicalEventKind::ProviderFailed(
@@ -1843,18 +1946,40 @@ impl<R: Repository + 'static> Engine<R> {
                                 waiting_approval = true;
                                 continue;
                             }
-                            let proposal = self
+                            let workspace = self
                                 .workspace
                                 .as_ref()
-                                .ok_or(EngineError::WorkflowNotConfigured)?
-                                .propose_replacement(id, &args.path, args.replacement)?;
-                            request.arguments_json = serde_json::json!({
-                                "path": proposal.path,
-                                "replacement": proposal.replacement,
-                                "artifact_id": proposal.artifact_id
-                            })
+                                .ok_or(EngineError::WorkflowNotConfigured)?;
+                            let mut proposals = Vec::new();
+                            for patch in args.into_patches() {
+                                if !integrated::task_owns_path(&task, &patch.path) {
+                                    return Err(ToolError::OutsideWorkspace.into());
+                                }
+                                proposals.push(workspace.propose_replacement(
+                                    id,
+                                    &patch.path,
+                                    patch.replacement,
+                                )?);
+                            }
+                            for proposal in &proposals {
+                                self.publish_artifact(proposal.artifact()).await?;
+                            }
+                            request.arguments_json = if proposals.len() == 1 {
+                                serde_json::json!({
+                                    "path": proposals[0].path,
+                                    "replacement": proposals[0].replacement,
+                                    "artifact_id": proposals[0].artifact_id
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "patches": proposals.iter().map(|proposal| serde_json::json!({
+                                        "path": proposal.path,
+                                        "replacement": proposal.replacement,
+                                        "artifact_id": proposal.artifact_id
+                                    })).collect::<Vec<_>>()
+                                })
+                            }
                             .to_string();
-                            self.publish_artifact(proposal.artifact()).await?;
                         }
                         "process.test" => {
                             let args: TestArguments =
@@ -1907,6 +2032,83 @@ impl<R: Repository + 'static> Engine<R> {
         }
         Ok(())
     }
+
+    async fn maybe_report_stalled_work(&self, task: &Task) -> Result<(), EngineError> {
+        const STALLED_TURNS: usize = 5;
+        if task.work.is_none() {
+            return Ok(());
+        }
+        let events = self.repo.events(self.session).await?;
+        let approvals = self.repo.approvals(self.session).await?;
+        let approved_patches = approvals
+            .iter()
+            .filter(|approval| {
+                approval.task_id == task.id
+                    && approval.action == "file.patch"
+                    && approval.decision == ApprovalDecision::ApprovedOnce
+            })
+            .map(|approval| approval.id)
+            .collect::<HashSet<_>>();
+        let last_progress = events
+            .iter()
+            .filter(|event| event.task_id == Some(task.id))
+            .filter_map(|event| match event.kind {
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                } if approved_patches.contains(&approval_id) => Some(event.created_at),
+                CanonicalEventKind::ProcessFinished { .. } => Some(event.created_at),
+                _ => None,
+            })
+            .max();
+        let turns_since_progress = events
+            .iter()
+            .filter(|event| {
+                event.task_id == Some(task.id)
+                    && matches!(event.kind, CanonicalEventKind::ProviderStarted)
+                    && last_progress.is_none_or(|progress| event.created_at > progress)
+            })
+            .count();
+        if turns_since_progress < STALLED_TURNS {
+            return Ok(());
+        }
+        let artifacts = self.repo.artifacts().await?;
+        let artifact_times = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                CanonicalEventKind::ArtifactPublished { artifact_id, .. } => {
+                    Some((artifact_id, event.created_at))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let already_warned = artifacts.iter().any(|artifact| {
+            artifact.producer == task.id
+                && artifact.kind == "workflow_feedback"
+                && artifact.location == "workflow.stall"
+                && artifact_times
+                    .get(&artifact.id)
+                    .is_some_and(|created| last_progress.is_none_or(|progress| *created > progress))
+        });
+        if already_warned {
+            return Ok(());
+        }
+        let feedback = format!(
+            "This task has used {turns_since_progress} provider turns without an approved patch or verification result. Consolidate remaining edits into one coherent patch batch, run the required verification after the edits, and avoid repeating unchanged reads or proposals."
+        );
+        self.publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: task.id,
+            kind: "workflow_feedback".into(),
+            location: "workflow.stall".into(),
+            digest: String::new(),
+            preview: feedback.clone(),
+        })
+        .await?;
+        self.record(Some(task.id), CanonicalEventKind::ProviderWarning(feedback))
+            .await?;
+        Ok(())
+    }
     pub async fn request_approval(
         &self,
         task_id: TaskId,
@@ -1939,10 +2141,7 @@ impl<R: Repository + 'static> Engine<R> {
             Some(task_id),
             CanonicalEventKind::ApprovalRequested {
                 approval_id: approval.id,
-                summary: format!(
-                    "{} in {} — {}",
-                    approval.action, approval.working_directory, approval.reason
-                ),
+                summary: approval_event_summary(&approval),
             },
         )
         .await?;
@@ -2155,40 +2354,42 @@ impl<R: Repository + 'static> Engine<R> {
             }
             "file.patch" => {
                 let args: PatchArguments = serde_json::from_str(&approval.reason)?;
+                validate_patch_batch(&args)?;
                 let task = self
                     .repo
                     .task(approval.task_id)
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
-                if !integrated::task_owns_path(&task, &args.path) {
-                    return Err(ToolError::OutsideWorkspace.into());
+                let artifacts = self.repo.artifacts().await?;
+                let mut proposals = Vec::new();
+                for args in args.into_patches() {
+                    if !integrated::task_owns_path(&task, &args.path) {
+                        return Err(ToolError::OutsideWorkspace.into());
+                    }
+                    let artifact = artifacts
+                        .iter()
+                        .find(|artifact| {
+                            artifact.producer == approval.task_id
+                                && artifact.kind == "patch"
+                                && args.artifact_id.map_or_else(
+                                    || artifact.location == args.path.display().to_string(),
+                                    |id| artifact.id == id,
+                                )
+                        })
+                        .ok_or(EngineError::TaskNotFound)?;
+                    proposals.push(PatchProposal {
+                        artifact_id: artifact.id,
+                        task_id: approval.task_id,
+                        path: args.path,
+                        base_digest: artifact.digest.clone(),
+                        replacement: args.replacement,
+                        preview: artifact.preview.clone(),
+                    });
                 }
-                let artifact = self
-                    .repo
-                    .artifacts()
-                    .await?
-                    .into_iter()
-                    .find(|a| {
-                        a.producer == approval.task_id
-                            && a.kind == "patch"
-                            && args.artifact_id.map_or_else(
-                                || a.location == args.path.display().to_string(),
-                                |id| a.id == id,
-                            )
-                    })
-                    .ok_or(EngineError::TaskNotFound)?;
-                let proposal = PatchProposal {
-                    artifact_id: artifact.id,
-                    task_id: approval.task_id,
-                    path: args.path,
-                    base_digest: artifact.digest,
-                    replacement: args.replacement,
-                    preview: artifact.preview,
-                };
                 self.workspace
                     .as_ref()
                     .ok_or(EngineError::WorkflowNotConfigured)?
-                    .apply_patch(&proposal, true)?;
+                    .apply_patch_batch(&proposals, true)?;
                 Ok(())
             }
             "file.read" => {
@@ -2355,18 +2556,23 @@ impl<R: Repository + 'static> Engine<R> {
             let children = tasks
                 .iter()
                 .filter(|task| task.parent == Some(id))
+                .filter(|task| {
+                    !tasks
+                        .iter()
+                        .any(|candidate| candidate.retry_of == Some(task.id))
+                })
                 .collect::<Vec<_>>();
             if !children.is_empty() {
-                if !children
+                let incomplete_child = children
                     .iter()
-                    .any(|child| child.work.as_ref().is_some_and(|work| work.integration))
-                    || children.iter().any(|child| {
-                        latest_attempt(&tasks, child.id)
-                            .is_none_or(|task| task.status != TaskStatus::Completed)
-                    })
-                {
+                    .any(|child| child.status != TaskStatus::Completed);
+                let missing_integration = children.len() > 1
+                    && !children
+                        .iter()
+                        .any(|child| child.work.as_ref().is_some_and(|work| work.integration));
+                if incomplete_child || missing_integration {
                     return Err(EngineError::InvalidDelegationPlan(
-                        "parent requires completed implementations and integration".into(),
+                        "parent requires completed delegated work and, for multiple workstreams, an integration task".into(),
                     ));
                 }
             } else {
@@ -3089,6 +3295,68 @@ fn revision_context(feedback: &str, proposals: &str) -> String {
     )
 }
 
+fn compact_denied_action(action: &str, reason: &str) -> String {
+    match action {
+        "file.patch" => serde_json::from_str::<PatchArguments>(reason)
+            .ok()
+            .map(|patches| {
+                format!(
+                    "file.patch: proposed paths {} (prior patch bodies omitted; inspect current workspace state)",
+                    patches
+                        .paths()
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .unwrap_or_else(|| "file.patch: prior patch proposal omitted".into()),
+        "task.complete" => serde_json::from_str::<serde_json::Value>(reason)
+            .ok()
+            .map(|value| {
+                let summary = value
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("prior completion proposal");
+                format!("task.complete: {}", summary.chars().take(500).collect::<String>())
+            })
+            .unwrap_or_else(|| "task.complete: prior completion proposal omitted".into()),
+        "process.test" => serde_json::from_str::<TestArguments>(reason)
+            .ok()
+            .map(|test| {
+                format!(
+                    "process.test: verification={} · {}",
+                    test.verification.unwrap_or(false),
+                    test.purpose.unwrap_or_else(|| "purpose omitted".into())
+                )
+            })
+            .unwrap_or_else(|| "process.test: prior command details omitted".into()),
+        _ => format!("{action}: prior arguments omitted"),
+    }
+}
+
+fn approval_event_summary(approval: &Approval) -> String {
+    if approval.action == "file.patch"
+        && let Ok(patches) = serde_json::from_str::<PatchArguments>(&approval.reason)
+    {
+        let paths = patches
+            .paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        return format!(
+            "file.patch in {} · {} file(s): {}",
+            approval.working_directory,
+            paths.len(),
+            paths.join(", ")
+        );
+    }
+    format!(
+        "{} in {} — {}",
+        approval.action, approval.working_directory, approval.reason
+    )
+}
+
 fn delegation_roster(targets: &[AgentProfile]) -> String {
     targets
         .iter()
@@ -3112,7 +3380,45 @@ fn tool_definitions(
     names.iter().filter_map(|name| match name.as_str() {
         "file.read" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::FILE_READ.into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["path","offset"],"additionalProperties":false}"#.into() }),
         "search.text" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::SEARCH_TEXT.into(), input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"],"additionalProperties":false}"#.into() }),
-        "file.patch" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::FILE_PATCH.into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
+        "file.patch" => Some(ToolDefinition {
+            name: name.clone(),
+            description: tool_descriptions::FILE_PATCH.into(),
+            input_schema: serde_json::json!({
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "replacement": {"type": "string"}
+                        },
+                        "required": ["path", "replacement"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "patches": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 12,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "replacement": {"type": "string"}
+                                    },
+                                    "required": ["path", "replacement"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["patches"],
+                        "additionalProperties": false
+                    }
+                ]
+            })
+            .to_string(),
+        }),
         "process.test" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::PROCESS_TEST.into(), input_schema: r#"{"type":"object","properties":{"program":{"type":"string","minLength":1,"maxLength":128},"args":{"type":"array","items":{"type":"string","maxLength":4096},"maxItems":64},"purpose":{"type":"string","minLength":1,"maxLength":500},"verification":{"type":"boolean"}},"required":["program","args","purpose","verification"],"additionalProperties":false}"#.into() }),
         "task.delegate" if !allowed_targets.is_empty() && max_delegations > 0 => Some(delegation_plan_tool(name, allowed_targets, max_delegations)),
         "review.request" if !allowed_targets.is_empty() => Some(delegation_tool(name, tool_descriptions::REVIEW, allowed_targets)),

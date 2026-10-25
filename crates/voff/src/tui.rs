@@ -3923,6 +3923,21 @@ fn conversation_result_repeats_output(app: &AppModel, event: &ScopedEvent) -> bo
     })
 }
 
+fn task_retry_root(task: &Task, tasks: &[Task]) -> voff_core::TaskId {
+    let mut current = task;
+    let mut seen = HashSet::new();
+    while seen.insert(current.id) {
+        let Some(previous) = current.retry_of else {
+            return current.id;
+        };
+        let Some(parent) = tasks.iter().find(|candidate| candidate.id == previous) else {
+            return current.id;
+        };
+        current = parent;
+    }
+    current.id
+}
+
 fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let (icon, status, color) = task_status_visual(task.status);
@@ -4065,7 +4080,23 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             },
             theme::AQUA,
         );
-        lines.push(Line::from(format!(" Turn {}/32", work.turns)));
+        let retry_root = task_retry_root(task, &app.tasks);
+        let retry_chain = app
+            .tasks
+            .iter()
+            .filter(|candidate| task_retry_root(candidate, &app.tasks) == retry_root)
+            .map(|candidate| candidate.id)
+            .collect::<HashSet<_>>();
+        let retries = retry_chain.len().saturating_sub(1);
+        let approvals = app
+            .approvals
+            .iter()
+            .filter(|approval| retry_chain.contains(&approval.task_id))
+            .count();
+        lines.push(Line::from(format!(
+            " Turn {}/32 · {approvals} approvals · {retries} retries",
+            work.turns
+        )));
         if !work.contract.is_empty() {
             push_section(&mut lines, "SHARED CONTRACT", theme::AQUA);
             push_text_lines(
@@ -5950,6 +5981,25 @@ fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, appro
     );
 }
 
+fn approval_patch_artifact_ids(reason: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(reason) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if let Some(id) = value.get("artifact_id").and_then(serde_json::Value::as_str) {
+        ids.push(id.to_owned());
+    }
+    if let Some(patches) = value.get("patches").and_then(serde_json::Value::as_array) {
+        ids.extend(patches.iter().filter_map(|patch| {
+            patch
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }));
+    }
+    ids
+}
+
 fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
     if !app.approval_details {
         render_compact_approval(frame, app, approval);
@@ -6025,14 +6075,43 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
                 lines.push(Line::from(format!("    • {}", sanitize(&criterion))));
             }
         }
+    } else if approval.action == "file.patch" {
+        let patch_ids = approval_patch_artifact_ids(&approval.reason);
+        if patch_ids.is_empty() {
+            push_text_lines(&mut lines, &sanitize(&approval.reason), "  ");
+        } else {
+            let paths = app
+                .artifacts
+                .iter()
+                .filter(|artifact| patch_ids.contains(&artifact.id.to_string()))
+                .map(|artifact| artifact.location.as_str())
+                .collect::<Vec<_>>();
+            lines.push(Line::from(format!(
+                "  Proposed files: {}",
+                paths.join(", ")
+            )));
+        }
     } else {
         push_text_lines(&mut lines, &sanitize(&approval.reason), "  ");
     }
-    if let Some(artifact) = app
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.producer == approval.task_id)
-    {
+    let patch_ids = if approval.action == "file.patch" {
+        approval_patch_artifact_ids(&approval.reason)
+    } else {
+        Vec::new()
+    };
+    let previews = if patch_ids.is_empty() {
+        app.artifacts
+            .iter()
+            .find(|artifact| artifact.producer == approval.task_id)
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        app.artifacts
+            .iter()
+            .filter(|artifact| patch_ids.contains(&artifact.id.to_string()))
+            .collect::<Vec<_>>()
+    };
+    for artifact in previews {
         lines.push(Line::from(""));
         popup_section_into(&mut lines, "PREVIEW");
         lines.push(Line::from(Span::styled(

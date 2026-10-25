@@ -84,6 +84,7 @@ pub fn compact_command_output(command: &str, output: &str, max_bytes: usize) -> 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -114,6 +115,8 @@ pub enum ToolError {
     PatchConflict,
     #[error("patch was not explicitly approved")]
     ApprovalRequired,
+    #[error("patch batch must contain one to twelve unique paths")]
+    InvalidPatchBatch,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PatchProposal {
@@ -304,6 +307,42 @@ impl ScopedWorkspace {
             path: proposal.path.clone(),
             source,
         })?;
+        Ok(())
+    }
+    /// Apply one explicitly approved, bounded patch set after checking every
+    /// base digest first. Duplicate paths are rejected to avoid ambiguous edits.
+    pub fn apply_patch_batch(
+        &self,
+        proposals: &[PatchProposal],
+        approved: bool,
+    ) -> Result<(), ToolError> {
+        if !approved {
+            return Err(ToolError::ApprovalRequired);
+        }
+        if proposals.is_empty() || proposals.len() > 12 {
+            return Err(ToolError::InvalidPatchBatch);
+        }
+        let mut paths = HashSet::new();
+        for proposal in proposals {
+            if !paths.insert(&proposal.path) {
+                return Err(ToolError::InvalidPatchBatch);
+            }
+            let path = self.resolve_for_write(&proposal.path)?;
+            let current_digest = if path.exists() {
+                digest(&fs::read(path).map_err(|source| ToolError::PathIo {
+                    path: proposal.path.clone(),
+                    source,
+                })?)
+            } else {
+                ABSENT_FILE_DIGEST.into()
+            };
+            if current_digest != proposal.base_digest {
+                return Err(ToolError::PatchConflict);
+            }
+        }
+        for proposal in proposals {
+            self.apply_patch(proposal, true)?;
+        }
         Ok(())
     }
     pub fn search_text(&self, query: &str, limit: usize) -> Result<Vec<SearchMatch>, ToolError> {

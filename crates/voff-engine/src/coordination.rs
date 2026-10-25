@@ -220,10 +220,16 @@ impl<R: Repository + 'static> Engine<R> {
                         Some(task.id),
                         CanonicalEventKind::RevisionRequested {
                             approval_id: approval.id,
-                            feedback: verdict.reason,
+                            feedback: verdict.reason.clone(),
                         },
                     )
                     .await?;
+                    if approval.action == "task.complete"
+                        && verdict.reason.starts_with("EVIDENCE_ONLY:")
+                    {
+                        self.resume_evidence_revision(&task, &approval, &verdict.reason)
+                            .await?;
+                    }
                 }
             }
         }
@@ -436,6 +442,43 @@ impl<R: Repository + 'static> Engine<R> {
         Ok(true)
     }
 
+    async fn resume_evidence_revision(
+        &self,
+        task: &Task,
+        approval: &Approval,
+        feedback: &str,
+    ) -> Result<(), EngineError> {
+        let Some(current) = self.repo.task(task.id).await? else {
+            return Err(EngineError::TaskNotFound);
+        };
+        if current.status != TaskStatus::Blocked || approval.action != "task.complete" {
+            return Ok(());
+        }
+        self.publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: task.id,
+            kind: "workflow_feedback".into(),
+            location: "task.complete.evidence".into(),
+            digest: String::new(),
+            preview: format!(
+                "The completion report was denied for missing evidence only. Address this reviewer feedback in the current task attempt, then submit completion evidence again:\n{}",
+                feedback.chars().take(4_000).collect::<String>()
+            ),
+        })
+        .await?;
+        self.transition(task.id, TaskStatus::Ready).await?;
+        self.events
+            .send(EngineEvent::TaskUpdated(
+                self.repo
+                    .task(task.id)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?,
+            ))
+            .await
+            .map_err(|_| EngineError::ChannelClosed)?;
+        Ok(())
+    }
+
     async fn schedule_repair(&self, task: &Task, guidance: &str) -> Result<(), EngineError> {
         let _approval_guard = self.approval_lock.lock().await;
         if self.repo.events(self.session).await?.iter().any(|event| {
@@ -467,11 +510,21 @@ impl<R: Repository + 'static> Engine<R> {
             let mut value: serde_json::Value = serde_json::from_str(json)?;
             if let Some(object) = value.as_object_mut() {
                 object.remove("artifact_id"); // Engine correlation, not a change to the action.
+                if let Some(patches) = object
+                    .get_mut("patches")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for patch in patches {
+                        if let Some(patch) = patch.as_object_mut() {
+                            patch.remove("artifact_id");
+                        }
+                    }
+                }
             }
             Ok(value)
         }
         let proposed = arguments(&approval.reason)?;
-        let mut previous = task.retry_of;
+        let mut previous = Some(task.id);
         for _ in 0..tasks.len() {
             let Some(id) = previous else {
                 break;
@@ -497,7 +550,8 @@ impl<R: Repository + 'static> Engine<R> {
                                     && feedback.starts_with("EVIDENCE_ONLY:")
                             )
                     });
-                    return Ok(!evidence_only || !has_new_review_evidence(&artifacts, task.id, id));
+                    return Ok(!evidence_only
+                        || !has_new_review_evidence(&artifacts, &events, task.id, id, denied.id));
                 }
             }
             previous = tasks
@@ -742,11 +796,42 @@ impl<R: Repository + 'static> Engine<R> {
 
 fn has_new_review_evidence(
     artifacts: &[Artifact],
+    events: &[CanonicalEvent],
     current_attempt: TaskId,
     denied_attempt: TaskId,
+    denied_approval: ApprovalId,
 ) -> bool {
     let is_review_evidence =
         |artifact: &&Artifact| matches!(artifact.kind.as_str(), "file_read" | "test_report");
+    if current_attempt == denied_attempt {
+        let denied_at = events.iter().find_map(|event| {
+            (event.task_id == Some(denied_attempt)
+                && matches!(
+                    event.kind,
+                    CanonicalEventKind::ApprovalDecided {
+                        approval_id,
+                        decision: ApprovalDecision::Denied
+                    } if approval_id == denied_approval
+                ))
+            .then_some(event.created_at)
+        });
+        let Some(denied_at) = denied_at else {
+            return false;
+        };
+        let newer_artifacts = events
+            .iter()
+            .filter(|event| event.created_at > denied_at)
+            .filter_map(|event| match event.kind {
+                CanonicalEventKind::ArtifactPublished { artifact_id, .. } => Some(artifact_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        return artifacts.iter().any(|artifact| {
+            artifact.producer == current_attempt
+                && matches!(artifact.kind.as_str(), "file_read" | "test_report")
+                && newer_artifacts.contains(&artifact.id)
+        });
+    }
     let prior = artifacts
         .iter()
         .filter(|artifact| artifact.producer == denied_attempt)
