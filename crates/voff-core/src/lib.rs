@@ -154,6 +154,10 @@ impl TaskStatus {
 pub struct WorkProgress {
     /// Shared interface contract supplied to every implementation and integrator.
     pub contract: String,
+    /// Workspace-relative files or directories this task may modify. Empty for
+    /// legacy and unscoped work, which the scheduler runs serially.
+    #[serde(default)]
+    pub owned_paths: Vec<std::path::PathBuf>,
     /// Integration work must wait for its implementation prerequisites.
     pub integration: bool,
     /// Persisted model-turn count, bounded across restarts.
@@ -221,7 +225,8 @@ impl Task {
                 TaskStatus::Running | TaskStatus::Cancelled
             ) | (
                 TaskStatus::Running,
-                TaskStatus::WaitingApproval
+                TaskStatus::Ready
+                    | TaskStatus::WaitingApproval
                     | TaskStatus::Blocked
                     | TaskStatus::Completed
                     | TaskStatus::Failed
@@ -428,6 +433,7 @@ impl TaskGraph {
             retry_of: None,
             work: p.work.as_ref().map(|work| WorkProgress {
                 contract: work.contract.clone(),
+                owned_paths: work.owned_paths.clone(),
                 integration: false,
                 turns: 0,
             }),

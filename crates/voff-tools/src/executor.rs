@@ -49,7 +49,9 @@ pub struct ProcessResult {
 }
 #[derive(Debug, Error)]
 pub enum ExecutorError {
-    #[error("process invocation is invalid or uses a shell")]
+    #[error("process invocation is invalid: {0}")]
+    InvalidInvocation(&'static str),
+    #[error("shell execution is denied")]
     Denied,
     #[error("working directory is outside the workspace")]
     OutsideWorkspace,
@@ -179,18 +181,31 @@ pub fn validate_process_argv(program: &str, args: &[String]) -> Result<(), Execu
             | "pwsh"
             | "nu"
     );
-    let total_argument_bytes = args.iter().map(String::len).sum::<usize>();
-    let valid_args = args.len() <= MAX_ARGUMENTS
-        && total_argument_bytes <= MAX_TOTAL_ARGUMENT_BYTES
-        && args.iter().all(|arg| {
-            arg.len() <= MAX_ARGUMENT_BYTES
-                && !arg
-                    .chars()
-                    .any(|character| matches!(character, '\0' | '\n' | '\r'))
-        });
-
-    if !valid_program || shell || !valid_args {
+    if !valid_program || shell {
         return Err(ExecutorError::Denied);
+    }
+    if args.len() > MAX_ARGUMENTS {
+        return Err(ExecutorError::InvalidInvocation(
+            "too many arguments (maximum is 64)",
+        ));
+    }
+    if args.iter().map(String::len).sum::<usize>() > MAX_TOTAL_ARGUMENT_BYTES {
+        return Err(ExecutorError::InvalidInvocation(
+            "arguments exceed the 16 KiB total limit",
+        ));
+    }
+    if args.iter().any(|arg| arg.len() > MAX_ARGUMENT_BYTES) {
+        return Err(ExecutorError::InvalidInvocation(
+            "an argument exceeds the 4 KiB limit",
+        ));
+    }
+    if args.iter().any(|arg| {
+        arg.chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    }) {
+        return Err(ExecutorError::InvalidInvocation(
+            "arguments cannot contain NUL or newline characters",
+        ));
     }
     Ok(())
 }
@@ -352,7 +367,11 @@ mod tests {
             .execute(
                 &CommandSpec {
                     program: "cargo".into(),
-                    args: vec!["check".into()],
+                    args: vec![
+                        "check".into(),
+                        "--target-dir".into(),
+                        d.path().join("target").display().to_string(),
+                    ],
                     cwd: d.path().into(),
                     timeout_seconds: 30,
                     output_limit: 16 * 1024,
@@ -361,7 +380,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.exit_code, Some(0), "{}", result.output);
     }
 
     #[test]
@@ -386,5 +405,19 @@ mod tests {
             };
             assert_eq!(executor.validate(&spec).is_ok(), allowed, "{spec:?}");
         }
+    }
+
+    #[test]
+    fn malformed_arguments_are_distinct_from_shell_denials() {
+        assert!(matches!(
+            validate_process_argv("python3", &["-c".into(), "print(1)\nprint(2)".into()]),
+            Err(ExecutorError::InvalidInvocation(
+                "arguments cannot contain NUL or newline characters"
+            ))
+        ));
+        assert!(matches!(
+            validate_process_argv("sh", &["-c".into(), "echo unsafe".into()]),
+            Err(ExecutorError::Denied)
+        ));
     }
 }

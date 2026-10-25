@@ -6,6 +6,81 @@ pub use executor::{
     validate_process_argv,
 };
 
+/// Reduce repetitive command output before it is added to model context.
+/// The original report remains stored as the artifact preview.
+#[must_use]
+pub fn compact_command_output(command: &str, output: &str, max_bytes: usize) -> String {
+    let command = command.to_ascii_lowercase();
+    let is_test_command = [
+        "cargo test",
+        "cargo nextest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "pytest",
+        "go test",
+        "vitest",
+        "jest",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+
+    let mut lines = Vec::new();
+    let mut passed = 0usize;
+    let mut previous = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let is_passed_test = is_test_command
+            && ((lower.starts_with("test ") && lower.ends_with(" ... ok"))
+                || (lower.starts_with("ok ") && lower.contains("#")));
+        if is_passed_test {
+            passed = passed.saturating_add(1);
+            continue;
+        }
+        if trimmed.is_empty() {
+            if previous == Some("") {
+                continue;
+            }
+            previous = Some("");
+            lines.push(String::new());
+            continue;
+        }
+        if previous == Some(trimmed) {
+            continue;
+        }
+        previous = Some(trimmed);
+        lines.push(line.to_owned());
+    }
+    if passed > 0 {
+        lines.push(format!("[compacted: {passed} passing test lines]"));
+    }
+
+    let compacted = lines.join("\n");
+    if compacted.len() <= max_bytes {
+        return compacted;
+    }
+    let marker = "\n[output compacted to fit context]\n";
+    if max_bytes <= marker.len() {
+        return compacted.chars().take(max_bytes).collect();
+    }
+    let content_bytes = max_bytes - marker.len();
+    let head_bytes = content_bytes / 3;
+    let tail_bytes = content_bytes - head_bytes;
+    let head = compacted
+        .char_indices()
+        .take_while(|(index, _)| *index < head_bytes)
+        .map(|(_, character)| character)
+        .collect::<String>();
+    let tail_start = compacted.len().saturating_sub(tail_bytes);
+    let tail = compacted
+        .char_indices()
+        .skip_while(|(index, _)| *index < tail_start)
+        .map(|(_, character)| character)
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
+}
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,6 +89,8 @@ use std::{
 };
 use thiserror::Error;
 use voff_core::{ArtifactId, TaskId};
+
+const READ_PAGE_CHAR_LIMIT: usize = 6_000;
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("workspace path is outside the authorized root")]
@@ -156,11 +233,15 @@ impl ScopedWorkspace {
         match self.read_text(relative) {
             Ok(text) => {
                 let total = text.chars().count();
-                let page: String = text.chars().skip(offset).take(1200).collect();
+                let page: String = text
+                    .chars()
+                    .skip(offset)
+                    .take(READ_PAGE_CHAR_LIMIT)
+                    .collect();
                 Ok(format!("Characters {offset}..{} of {total}.\n{page}", offset.saturating_add(page.chars().count())))
             }
             Err(ToolError::PathIo { source, .. } | ToolError::Io(source)) if source.kind() == std::io::ErrorKind::NotFound =>
-                Ok("File does not exist. No changes made; creating it requires an approved file.patch.".into()),
+                Ok("File does not exist. No changes made. If the task needs this file, create it with an approved file.patch; do not reread this unchanged path.".into()),
             Err(error) => Err(error),
         }
     }
@@ -230,12 +311,15 @@ impl ScopedWorkspace {
             return Err(ToolError::InvalidLimit);
         }
         let mut files = Vec::new();
-        collect(&self.root, &mut files, 10_000)?;
+        collect(&self.root, &mut files, 2_000)?;
         let mut found = Vec::new();
         for path in files {
             let relative = path
                 .strip_prefix(&self.root)
                 .map_err(|_| ToolError::OutsideWorkspace)?;
+            if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 256 * 1024) {
+                continue;
+            }
             let Ok(text) = self.read_text(relative) else {
                 continue;
             };
@@ -255,11 +339,62 @@ impl ScopedWorkspace {
         Ok(found)
     }
     pub fn context_bundle(&self, max_files: usize, max_bytes: usize) -> Result<String, ToolError> {
+        self.context_bundle_for_paths(&[], true, max_files, max_bytes)
+    }
+    /// Include project overview files and code inside the requested workspace scopes.
+    pub fn context_bundle_for_paths(
+        &self,
+        scopes: &[PathBuf],
+        include_overview: bool,
+        max_files: usize,
+        max_bytes: usize,
+    ) -> Result<String, ToolError> {
         let mut files = Vec::new();
-        collect(&self.root, &mut files, max_files)?;
+        if scopes.is_empty() && include_overview {
+            collect(&self.root, &mut files, max_files)?;
+        } else if !scopes.is_empty() {
+            if include_overview {
+                for name in ["Cargo.toml", "README.md", "AGENTS.md", "package.json"] {
+                    let path = self.root.join(name);
+                    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                        files.push(path);
+                    }
+                }
+            }
+            for scope in scopes {
+                Self::validate_relative(scope)?;
+                let path = self.root.join(scope);
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                let canonical = path.canonicalize().map_err(|source| ToolError::PathIo {
+                    path: scope.clone(),
+                    source,
+                })?;
+                if !canonical.starts_with(&self.root) {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    let remaining = max_files.saturating_sub(files.len());
+                    collect(&canonical, &mut files, remaining)?;
+                } else if metadata.is_file() {
+                    files.push(canonical);
+                }
+            }
+        }
         files.sort();
+        files.dedup();
         files.truncate(max_files);
-        let mut output = String::from("WORKSPACE FILES (untrusted project content):\n");
+        let mut output = if scopes.is_empty() && !include_overview {
+            String::from(
+                "No cached task-specific workspace files. Use file.read or search.text for current evidence.\n",
+            )
+        } else {
+            String::from("WORKSPACE FILES (untrusted project content):\n")
+        };
         for path in &files {
             if let Ok(relative) = path.strip_prefix(&self.root) {
                 output.push_str(&format!("- {}\n", relative.display()));

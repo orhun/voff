@@ -1,5 +1,6 @@
 //! Bounded coordinator reviews. Model verdicts cannot enlarge runtime grants.
 use super::*;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use voff_prompts::{
     tool_descriptions,
     workflow::{self as prompts, REVIEW_POLICY},
@@ -8,6 +9,7 @@ const REVIEW_TIMEOUT_SECONDS: u64 = 300;
 const REVIEW_RETRY_DELAY_SECONDS: i64 = 30;
 const MAX_TEMPORARY_REVIEW_ATTEMPTS: usize = 2;
 const MAX_AUTOMATIC_ATTEMPTS: u16 = 3;
+const MAX_PARALLEL_REVIEWS: usize = 4;
 const TEMPORARY_REVIEW_PREFIX: &str = "Reporting-agent review temporarily unavailable";
 
 #[derive(Deserialize)]
@@ -52,6 +54,8 @@ impl<R: Repository + 'static> Engine<R> {
         let _lead = self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
         let mut approvals = self.repo.approvals(self.session).await?;
         approvals.sort_by_key(|approval| approval.created_at);
+        let mut review_jobs = Vec::new();
+        let mut verdicts = Vec::new();
         for approval in approvals
             .iter()
             .filter(|a| a.decision == ApprovalDecision::Pending && a.action != "provider.continue")
@@ -125,38 +129,56 @@ impl<R: Repository + 'static> Engine<R> {
                     .await?;
                 continue;
             }
-            let verdict = if started {
-                Verdict { approve: false, reason: "Interrupted review; proposal denied without execution. Re-run the task to obtain a fresh review.".into(), validated: false, transient: false }
-            } else {
-                self.record(
-                    Some(task.id),
-                    CanonicalEventKind::LeadReviewStarted {
-                        lead: reviewer,
-                        approval_id: Some(approval.id),
-                    },
-                )
-                .await?;
-                let evidence = self
-                    .repo
-                    .artifacts()
-                    .await?
-                    .into_iter()
-                    .filter(|a| a.producer == task.id)
-                    .map(|a| a.preview)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.review_verdict_as(
-                    &task,
-                    &prompts::exact_action_review(
-                        &approval.action,
-                        &approval.working_directory,
-                        &approval.reason,
-                        &evidence,
-                    ),
+            if started {
+                verdicts.push((
+                    approval,
+                    task,
                     reviewer,
-                )
+                    Verdict {
+                        approve: false,
+                        reason: "Interrupted review; proposal denied without execution. Re-run the task to obtain a fresh review.".into(),
+                        validated: false,
+                        transient: false,
+                    },
+                ));
+                continue;
+            }
+            self.record(
+                Some(task.id),
+                CanonicalEventKind::LeadReviewStarted {
+                    lead: reviewer,
+                    approval_id: Some(approval.id),
+                },
+            )
+            .await?;
+            let evidence = self
+                .repo
+                .artifacts()
                 .await?
-            };
+                .into_iter()
+                .filter(|artifact| artifact.producer == task.id)
+                .map(|artifact| artifact.preview)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let context = prompts::exact_action_review(
+                &approval.action,
+                &approval.working_directory,
+                &approval.reason,
+                &evidence,
+            );
+            review_jobs.push((approval, task, reviewer, context));
+        }
+        let mut reviewed = stream::iter(review_jobs.into_iter().map(
+            |(approval, task, reviewer, context)| async move {
+                let verdict = self.review_verdict_as(&task, &context, reviewer).await?;
+                Ok::<_, EngineError>((approval, task, reviewer, verdict))
+            },
+        ))
+        .buffer_unordered(MAX_PARALLEL_REVIEWS)
+        .try_collect::<Vec<_>>()
+        .await?;
+        verdicts.append(&mut reviewed);
+        for (approval, task, reviewer, verdict) in verdicts {
             self.record(
                 Some(task.id),
                 CanonicalEventKind::LeadReviewFinished {
@@ -440,6 +462,7 @@ impl<R: Repository + 'static> Engine<R> {
         let tasks = self.repo.tasks().await?;
         let approvals = self.repo.approvals(self.session).await?;
         let artifacts = self.repo.artifacts().await?;
+        let events = self.repo.events(self.session).await?;
         fn arguments(json: &str) -> Result<serde_json::Value, serde_json::Error> {
             let mut value: serde_json::Value = serde_json::from_str(json)?;
             if let Some(object) = value.as_object_mut() {
@@ -459,13 +482,22 @@ impl<R: Repository + 'static> Engine<R> {
                     && candidate.decision == ApprovalDecision::Denied
             }) {
                 if arguments(&denied.reason)? == proposed {
-                    // Identical action arguments are normally stopped after a
-                    // denial. A retry may, however, add evidence that resolves
-                    // an evidence-only finding. Let the reporting agent review
-                    // that action afresh; new evidence never authorizes it by
-                    // itself. Ignore patch artifacts, which every proposal
-                    // creates and which do not address the prior finding.
-                    return Ok(!has_new_review_evidence(&artifacts, task.id, id));
+                    // New artifacts can only reopen an identical action when
+                    // the reviewer explicitly marked its finding evidence-only.
+                    // This prevents unrelated retry evidence from reopening a
+                    // safety or scope rejection.
+                    let evidence_only = events.iter().any(|event| {
+                        event.task_id == Some(id)
+                            && matches!(
+                                &event.kind,
+                                CanonicalEventKind::RevisionRequested {
+                                    approval_id,
+                                    feedback,
+                                } if *approval_id == denied.id
+                                    && feedback.starts_with("EVIDENCE_ONLY:")
+                            )
+                    });
+                    return Ok(!evidence_only || !has_new_review_evidence(&artifacts, task.id, id));
                 }
             }
             previous = tasks
@@ -660,8 +692,12 @@ impl<R: Repository + 'static> Engine<R> {
         let recoverable = matches!(
             error,
             EngineError::Tool(
-                ToolError::PathIo { .. } | ToolError::Io(_) | ToolError::PatchConflict
+                ToolError::OutsideWorkspace
+                    | ToolError::PathIo { .. }
+                    | ToolError::Io(_)
+                    | ToolError::PatchConflict
             ) | EngineError::InvalidToolArguments(_)
+                | EngineError::Executor(ExecutorError::InvalidInvocation(_))
                 | EngineError::VerificationFailed { .. }
                 | EngineError::Provider(ProviderError {
                     kind: ProviderErrorKind::InvalidResponse,
@@ -788,7 +824,8 @@ mod tests {
         assert!(REVIEW_POLICY.contains("Reject shell execution"));
         assert!(REVIEW_POLICY.contains("command names are not pre-approved"));
         assert!(REVIEW_POLICY.contains("bounded local workspace command"));
-        assert!(REVIEW_POLICY.contains("A denial is final"));
+        assert!(REVIEW_POLICY.contains("EVIDENCE_ONLY:"));
+        assert!(REVIEW_POLICY.contains("never authorizes the action by itself"));
     }
 
     #[tokio::test]

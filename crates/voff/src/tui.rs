@@ -50,7 +50,7 @@ use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, SqliteRepository};
 
 use self::team_flow::{
     TeamFlow, TeamSnapshot, TokenUsage, compact_count, estimate_cost, format_usd, handoff_summary,
-    role_color, role_icon,
+    role_color, role_icon, task_timing_label,
 };
 use tui_piechart::{PieChart, PieSlice};
 
@@ -117,6 +117,7 @@ pub enum Action {
 
 #[derive(Clone, Debug)]
 struct ScopedEvent {
+    created_at: chrono::DateTime<chrono::Utc>,
     task_id: Option<voff_core::TaskId>,
     text: String,
     is_output: bool,
@@ -1467,7 +1468,7 @@ impl AppModel {
                         _ => {}
                     }
                 }
-                self.push_scoped_event(e.task_id, &e.kind)
+                self.push_scoped_event_at(e.task_id, &e.kind, e.created_at)
             }
             EngineEvent::ApprovalUpdated(approval) => {
                 if approval.decision != ApprovalDecision::Pending
@@ -1663,6 +1664,7 @@ impl AppModel {
             let mut output = text.to_owned();
             trim_tail(&mut output, MAX_LIVE_OUTPUT_BYTES);
             self.scoped_events.push(ScopedEvent {
+                created_at: chrono::Utc::now(),
                 task_id: Some(task_id),
                 text: output,
                 is_output: true,
@@ -1682,6 +1684,15 @@ impl AppModel {
     }
 
     fn push_scoped_event(&mut self, task_id: Option<voff_core::TaskId>, kind: &CanonicalEventKind) {
+        self.push_scoped_event_at(task_id, kind, chrono::Utc::now());
+    }
+
+    fn push_scoped_event_at(
+        &mut self,
+        task_id: Option<voff_core::TaskId>,
+        kind: &CanonicalEventKind,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let reviewer = task_id
             .and_then(|id| self.tasks.iter().find(|task| task.id == id))
             .and_then(|task| task.parent)
@@ -1802,6 +1813,7 @@ impl AppModel {
                 }
             } else {
                 self.scoped_events.push(ScopedEvent {
+                    created_at,
                     task_id,
                     text: clean,
                     is_output: true,
@@ -1819,6 +1831,7 @@ impl AppModel {
             }
         } else {
             self.scoped_events.push(ScopedEvent {
+                created_at,
                 task_id,
                 text: match kind {
                     CanonicalEventKind::RevisionRequested { feedback, .. } => {
@@ -3928,6 +3941,17 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    if let Some(timing) = task_timing_label(task) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} · {timing}",
+                task.created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+            ),
+            Style::default().fg(theme::MUTED),
+        )));
+    }
     if !app.expanded_output {
         push_text_lines(
             &mut lines,
@@ -4465,6 +4489,15 @@ fn conversation_lines(
                 .unwrap_or(&event.text)
                 .to_owned()
         };
+        if app.expanded_output {
+            title = format!(
+                "{} · {title}",
+                event
+                    .created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+            );
+        }
         let start = lines.len();
         push_activity_entry(
             &mut lines,
@@ -8988,11 +9021,13 @@ mod tests {
             DelegationProposal {
                 target_agent: backend_agent.name.clone(),
                 objective: "Create calculator API".into(),
+                owned_paths: vec!["backend".into()],
                 acceptance_criteria: vec!["API responds".into()],
             },
             DelegationProposal {
                 target_agent: frontend_agent.name.clone(),
                 objective: "Create calculator interface".into(),
+                owned_paths: vec!["frontend".into()],
                 acceptance_criteria: vec!["UI calls API".into()],
             },
         ];
@@ -9062,11 +9097,13 @@ mod tests {
             DelegationProposal {
                 target_agent: "Backend".into(),
                 objective: "Create calculator API".into(),
+                owned_paths: vec!["backend".into()],
                 acceptance_criteria: vec!["API responds".into()],
             },
             DelegationProposal {
                 target_agent: "Frontend".into(),
                 objective: "Create calculator interface".into(),
+                owned_paths: vec!["frontend".into()],
                 acceptance_criteria: vec!["UI calls API".into()],
             },
         ];

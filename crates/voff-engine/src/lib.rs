@@ -270,6 +270,110 @@ struct ReadArguments {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SearchArguments {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+fn default_search_limit() -> usize {
+    50
+}
+
+fn inspection_is_repeat(
+    task_id: TaskId,
+    request: &StructuredToolRequest,
+    artifacts: &[Artifact],
+    approvals: &[Approval],
+    events: &[CanonicalEvent],
+) -> Result<bool, EngineError> {
+    let (kind, location) = match request.name.as_str() {
+        "file.read" => {
+            let args: ReadArguments = serde_json::from_str(&request.arguments_json)?;
+            ("file_read", args.path.display().to_string())
+        }
+        "search.text" => {
+            let args: SearchArguments = serde_json::from_str(&request.arguments_json)?;
+            ("search_result", format!("search: {}", args.query))
+        }
+        _ => return Ok(false),
+    };
+    let artifact_times = events
+        .iter()
+        .filter(|event| event.task_id == Some(task_id))
+        .filter_map(|event| match event.kind {
+            CanonicalEventKind::ArtifactPublished { artifact_id, .. } => {
+                Some((artifact_id, event.created_at))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let approval_times = events
+        .iter()
+        .filter(|event| event.task_id == Some(task_id))
+        .filter_map(|event| match event.kind {
+            CanonicalEventKind::ApprovalDecided {
+                approval_id,
+                decision: ApprovalDecision::ApprovedOnce,
+            } => Some((approval_id, event.created_at)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let latest = artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.producer == task_id && artifact.kind == kind && artifact.location == location
+        })
+        .filter_map(|artifact| {
+            artifact_times
+                .get(&artifact.id)
+                .map(|created_at| (artifact, *created_at))
+        })
+        .max_by_key(|(_, created_at)| *created_at);
+    let Some((latest, latest_at)) = latest else {
+        return Ok(false);
+    };
+
+    if kind == "file_read" {
+        let args: ReadArguments = serde_json::from_str(&request.arguments_json)?;
+        let latest_offset = latest
+            .preview
+            .strip_prefix("Characters ")
+            .and_then(|header| header.split("..").next())
+            .and_then(|offset| offset.parse::<usize>().ok())
+            .or_else(|| {
+                latest
+                    .preview
+                    .starts_with("File does not exist.")
+                    .then_some(0)
+            });
+        if latest_offset != Some(args.offset) {
+            return Ok(false);
+        }
+    }
+
+    for approval in approvals.iter().filter(|approval| {
+        approval.task_id == task_id
+            && approval.action == "file.patch"
+            && approval.decision == ApprovalDecision::ApprovedOnce
+    }) {
+        let Ok(patch) = serde_json::from_str::<PatchArguments>(&approval.reason) else {
+            continue;
+        };
+        if kind == "file_read" && patch.path.display().to_string() != location {
+            continue;
+        }
+        if approval_times
+            .get(&approval.id)
+            .is_some_and(|created_at| *created_at > latest_at)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlockedReport {
     reason: String,
 }
@@ -280,6 +384,9 @@ pub struct DelegationProposal {
     pub target_agent: String,
     /// Bounded objective assigned to the child task.
     pub objective: String,
+    /// Disjoint workspace-relative write scope for a parallel implementation.
+    #[serde(default)]
+    pub owned_paths: Vec<std::path::PathBuf>,
     /// Evidence-oriented conditions the child must satisfy.
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
@@ -518,6 +625,7 @@ impl<R: Repository + 'static> Engine<R> {
         if self.verified_workflow && !conversational && !read_only {
             t.work = Some(WorkProgress {
                 contract: String::new(),
+                owned_paths: Vec::new(),
                 integration: false,
                 turns: 0,
             });
@@ -1130,12 +1238,7 @@ impl<R: Repository + 'static> Engine<R> {
                     id: MessageId::new(),
                     role: MessageRole::System,
                     content: {
-                        let context = self
-                            .workspace
-                            .as_ref()
-                            .map(|workspace| workspace.context_bundle(200, 64 * 1024))
-                            .transpose()?
-                            .or_else(|| self.workspace_context.clone());
+                        let context = self.workspace_context_for_task(&task).await?;
                         context.map_or_else(
                             || owner_prompt.clone(),
                             |context| {
@@ -1251,6 +1354,7 @@ impl<R: Repository + 'static> Engine<R> {
             other => other?,
         };
         let mut waiting_approval = false;
+        let mut inspected_workspace = false;
         let mut response_text = String::new();
         // Publish only after the complete provider response has succeeded.
         let _approval_guard = self.approval_lock.lock().await;
@@ -1260,6 +1364,21 @@ impl<R: Repository + 'static> Engine<R> {
         }
         let mut proposals = Vec::new();
         let mut side_effects = 0;
+        let mut inspections = 0;
+        let mut seen_inspections = HashSet::new();
+        let mut repeated_inspections = HashSet::new();
+        let has_inspections = response.iter().any(|event| {
+            matches!(event, ProviderEvent::ToolRequest(call) if matches!(call.name.as_str(), "file.read" | "search.text"))
+        });
+        let inspection_evidence = if has_inspections {
+            Some((
+                self.repo.artifacts().await?,
+                self.repo.approvals(self.session).await?,
+                self.repo.events(self.session).await?,
+            ))
+        } else {
+            None
+        };
         for event in &response {
             if let ProviderEvent::ToolRequest(call) = event {
                 if !(agent.tools.contains(&call.name)
@@ -1284,8 +1403,26 @@ impl<R: Repository + 'static> Engine<R> {
                         ));
                     }
                     "task.complete" if task.work.is_some() => {
-                        self.validate_completion(&task, &call.arguments_json)
+                        if let Err(error) =
+                            self.validate_completion(&task, &call.arguments_json).await
+                        {
+                            let feedback = format!(
+                                "Voff rejected this task.complete proposal: {error}. The task remains active. Continue the implementation, then submit one evidence entry for every acceptance criterion, using recorded artifact IDs and a concise explanation. Do not claim completion until verification and all criteria are satisfied."
+                            );
+                            self.publish_artifact(Artifact {
+                                id: ArtifactId::new(),
+                                producer: id,
+                                kind: "workflow_feedback".into(),
+                                location: "task.complete".into(),
+                                digest: String::new(),
+                                preview: feedback.clone(),
+                            })
                             .await?;
+                            self.record(Some(id), CanonicalEventKind::ProviderWarning(feedback))
+                                .await?;
+                            self.transition(id, TaskStatus::Ready).await?;
+                            return Ok(());
+                        }
                         side_effects += 1;
                     }
                     "task.blocked" if task.work.is_some() => {
@@ -1305,8 +1442,67 @@ impl<R: Repository + 'static> Engine<R> {
                         &call.arguments_json,
                     )?),
                     "file.read" => {
-                        let _: ReadArguments = serde_json::from_str(&call.arguments_json)?;
-                        side_effects += 1;
+                        let args: ReadArguments = serde_json::from_str(&call.arguments_json)?;
+                        let key = format!("{}:{}", args.path.display(), args.offset);
+                        if !seen_inspections.insert((call.name.clone(), key)) {
+                            return Err(EngineError::InvalidDelegationPlan(
+                                "batch each workspace inspection once; use its artifact instead of repeating the same read".into(),
+                            ));
+                        }
+                        let (artifacts, approvals, events) = inspection_evidence
+                            .as_ref()
+                            .expect("inspection evidence loaded");
+                        if inspection_is_repeat(id, call, artifacts, approvals, events)? {
+                            let feedback_key =
+                                format!("file.read:{}:{}", args.path.display(), args.offset);
+                            if artifacts.iter().any(|artifact| {
+                                artifact.producer == id
+                                    && artifact.kind == "workflow_feedback"
+                                    && artifact.location == feedback_key
+                            }) {
+                                return Err(EngineError::InvalidDelegationPlan(format!(
+                                    "repeated unchanged file.read for {} at offset {}; use the recorded artifact, or make an approved patch before rereading",
+                                    args.path.display(),
+                                    args.offset
+                                )));
+                            }
+                            repeated_inspections.insert((call.name.clone(), feedback_key));
+                        }
+                        inspections += 1;
+                    }
+                    "search.text" => {
+                        let args: SearchArguments = serde_json::from_str(&call.arguments_json)?;
+                        if args.query.trim().is_empty()
+                            || args.query.len() > 256
+                            || !(1..=100).contains(&args.limit)
+                        {
+                            return Err(EngineError::InvalidDelegationPlan(
+                                "search.text requires a query up to 256 bytes and a result limit from 1 to 100".into(),
+                            ));
+                        }
+                        if !seen_inspections.insert((call.name.clone(), args.query.clone())) {
+                            return Err(EngineError::InvalidDelegationPlan(
+                                "batch each workspace search once; reuse the search_result artifact".into(),
+                            ));
+                        }
+                        let (artifacts, approvals, events) = inspection_evidence
+                            .as_ref()
+                            .expect("inspection evidence loaded");
+                        if inspection_is_repeat(id, call, artifacts, approvals, events)? {
+                            let feedback_key = format!("search.text:{}", args.query);
+                            if artifacts.iter().any(|artifact| {
+                                artifact.producer == id
+                                    && artifact.kind == "workflow_feedback"
+                                    && artifact.location == feedback_key
+                            }) {
+                                return Err(EngineError::InvalidDelegationPlan(format!(
+                                    "repeated unchanged search.text query {:?}; reuse its recorded artifact or inspect after an approved patch",
+                                    args.query
+                                )));
+                            }
+                            repeated_inspections.insert((call.name.clone(), feedback_key));
+                        }
+                        inspections += 1;
                     }
                     "file.patch" => {
                         let _: PatchArguments = serde_json::from_str(&call.arguments_json)?;
@@ -1325,9 +1521,17 @@ impl<R: Repository + 'static> Engine<R> {
                 }
             }
         }
-        if side_effects > 1 || (side_effects > 0 && !proposals.is_empty()) {
+        if inspections > 8 {
             return Err(EngineError::InvalidDelegationPlan(
-                "one response must contain a delegation plan or one patch/test proposal".into(),
+                "one response may inspect at most eight workspace items".into(),
+            ));
+        }
+        if side_effects > 1
+            || (side_effects > 0 && (!proposals.is_empty() || inspections > 0))
+            || (inspections > 0 && !proposals.is_empty())
+        {
+            return Err(EngineError::InvalidDelegationPlan(
+                "one response must contain inspections, a delegation plan, or one patch/test proposal".into(),
             ));
         }
         if !proposals.is_empty() {
@@ -1512,17 +1716,108 @@ impl<R: Repository + 'static> Engine<R> {
                         waiting_approval = true;
                         continue;
                     }
-                    self.record(
-                        Some(id),
-                        CanonicalEventKind::ToolProposed {
-                            tool_call_id: request.id,
-                            name: request.name.clone(),
-                        },
-                    )
-                    .await?;
+                    if !matches!(request.name.as_str(), "file.read" | "search.text") {
+                        self.record(
+                            Some(id),
+                            CanonicalEventKind::ToolProposed {
+                                tool_call_id: request.id,
+                                name: request.name.clone(),
+                            },
+                        )
+                        .await?;
+                    }
                     match request.name.as_str() {
                         "file.read" if agent.tools.iter().any(|tool| tool == "file.read") => {
-                            let _: ReadArguments = serde_json::from_str(&request.arguments_json)?;
+                            let args: ReadArguments =
+                                serde_json::from_str(&request.arguments_json)?;
+                            let feedback_key =
+                                format!("file.read:{}:{}", args.path.display(), args.offset);
+                            if repeated_inspections
+                                .contains(&(request.name.clone(), feedback_key.clone()))
+                            {
+                                self.publish_artifact(Artifact {
+                                    id: ArtifactId::new(),
+                                    producer: id,
+                                    kind: "workflow_feedback".into(),
+                                    location: feedback_key,
+                                    digest: String::new(),
+                                    preview: "This unchanged path and offset are already recorded. Use the existing artifact; if the file is missing, create it with an approved file.patch. Do not inspect this path again unless a patch is approved.".into(),
+                                })
+                                .await?;
+                                inspected_workspace = true;
+                                continue;
+                            }
+                            let preview = self
+                                .workspace
+                                .as_ref()
+                                .ok_or(EngineError::WorkflowNotConfigured)?
+                                .read_page(&args.path, args.offset)?;
+                            self.publish_artifact(Artifact {
+                                id: ArtifactId::new(),
+                                producer: id,
+                                kind: "file_read".into(),
+                                location: args.path.display().to_string(),
+                                digest: String::new(),
+                                preview,
+                            })
+                            .await?;
+                            inspected_workspace = true;
+                            continue;
+                        }
+                        "search.text" if agent.tools.iter().any(|tool| tool == "search.text") => {
+                            let args: SearchArguments =
+                                serde_json::from_str(&request.arguments_json)?;
+                            let feedback_key = format!("search.text:{}", args.query);
+                            if repeated_inspections
+                                .contains(&(request.name.clone(), feedback_key.clone()))
+                            {
+                                self.publish_artifact(Artifact {
+                                    id: ArtifactId::new(),
+                                    producer: id,
+                                    kind: "workflow_feedback".into(),
+                                    location: feedback_key,
+                                    digest: String::new(),
+                                    preview: "This unchanged search is already recorded. Reuse its artifact and act on the existing evidence instead of repeating the query.".into(),
+                                })
+                                .await?;
+                                inspected_workspace = true;
+                                continue;
+                            }
+                            let workspace = self
+                                .workspace
+                                .as_ref()
+                                .ok_or(EngineError::WorkflowNotConfigured)?;
+                            let matches = workspace.search_text(&args.query, args.limit)?;
+                            let preview = if matches.is_empty() {
+                                format!("No matches for {:?}.", args.query)
+                            } else {
+                                matches
+                                    .into_iter()
+                                    .map(|matched| {
+                                        format!(
+                                            "{}:{}: {}",
+                                            matched.path.display(),
+                                            matched.line,
+                                            matched.text
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                                    .chars()
+                                    .take(8_000)
+                                    .collect()
+                            };
+                            self.publish_artifact(Artifact {
+                                id: ArtifactId::new(),
+                                producer: id,
+                                kind: "search_result".into(),
+                                location: format!("search: {}", args.query),
+                                digest: String::new(),
+                                preview,
+                            })
+                            .await?;
+                            inspected_workspace = true;
+                            continue;
                         }
                         "task.complete" if task.work.is_some() => {
                             self.validate_completion(&task, &request.arguments_json)
@@ -1531,6 +1826,9 @@ impl<R: Repository + 'static> Engine<R> {
                         "file.patch" => {
                             let args: PatchArguments =
                                 serde_json::from_str(&request.arguments_json)?;
+                            if !integrated::task_owns_path(&task, &args.path) {
+                                return Err(ToolError::OutsideWorkspace.into());
+                            }
                             if args.replacement.contains("[rest of file]")
                                 || args.replacement.contains("... rest of file")
                             {
@@ -1593,6 +1891,10 @@ impl<R: Repository + 'static> Engine<R> {
             self.record(Some(id), kind).await?;
         }
         if !waiting_approval {
+            if inspected_workspace {
+                self.transition(id, TaskStatus::Ready).await?;
+                return Ok(());
+            }
             if task.work.is_some() {
                 return Err(EngineError::InvalidDelegationPlan("work requires an approved task.complete with evidence; prose is not completion".into()));
             }
@@ -1775,6 +2077,7 @@ impl<R: Repository + 'static> Engine<R> {
                             let (summary, evidence) =
                                 self.validate_completion(&parent, &approval.reason).await?;
                             self.finish_task(parent.id, summary, evidence).await?;
+                            self.finalize_parent_tasks().await?;
                         } else {
                             let evidence = self
                                 .repo
@@ -1852,6 +2155,14 @@ impl<R: Repository + 'static> Engine<R> {
             }
             "file.patch" => {
                 let args: PatchArguments = serde_json::from_str(&approval.reason)?;
+                let task = self
+                    .repo
+                    .task(approval.task_id)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?;
+                if !integrated::task_owns_path(&task, &args.path) {
+                    return Err(ToolError::OutsideWorkspace.into());
+                }
                 let artifact = self
                     .repo
                     .artifacts()
@@ -2433,17 +2744,45 @@ impl<R: Repository + 'static> Engine<R> {
         if max_parallel == 0 {
             return Ok(vec![]);
         }
-        // Verified workers share a checkout: serialize their model/action turns
-        // until per-file claims or isolated worktrees are enforced.
-        let verified = self
-            .repo
-            .tasks()
-            .await?
+        let tasks = self.repo.tasks().await?;
+        let verified = tasks
             .iter()
             .any(|task| task.work.is_some() && !task.status.is_terminal());
-        let ready = self
-            .refresh_ready(if verified { 1 } else { max_parallel })
-            .await?;
+        let tasks_with_children = tasks
+            .iter()
+            .filter_map(|task| task.parent)
+            .collect::<HashSet<_>>();
+        let mut ready = self.refresh_ready(max_parallel).await?;
+        if verified {
+            let active_scopes = tasks
+                .iter()
+                .filter(|task| {
+                    !task.status.is_terminal()
+                        && !tasks_with_children.contains(&task.id)
+                        && task.work.as_ref().is_some_and(|work| !work.integration)
+                })
+                .filter_map(|task| task.work.as_ref().map(|work| work.owned_paths.as_slice()))
+                .collect::<Vec<_>>();
+            let scopes_are_disjoint = active_scopes.iter().all(|scope| !scope.is_empty())
+                && active_scopes.iter().enumerate().all(|(index, scope)| {
+                    active_scopes[index + 1..].iter().all(|other| {
+                        !scope.iter().any(|path| {
+                            other.iter().any(|other_path| {
+                                path.starts_with(other_path) || other_path.starts_with(path)
+                            })
+                        })
+                    })
+                });
+            let ready_are_scoped_implementations = !ready.is_empty()
+                && ready.iter().all(|task| {
+                    task.work
+                        .as_ref()
+                        .is_some_and(|work| !work.integration && !work.owned_paths.is_empty())
+                });
+            if !scopes_are_disjoint || !ready_are_scoped_implementations {
+                ready.truncate(1);
+            }
+        }
         let ids = ready.iter().map(|t| t.id).collect::<Vec<_>>();
         let mut set = tokio::task::JoinSet::new();
         for task in ready {
@@ -2674,10 +3013,15 @@ impl TestArguments {
     fn invocation(&self) -> Result<(String, Vec<String>, String, bool), EngineError> {
         if let Some(command) = &self.command {
             if self.program.is_some() || !self.args.is_empty() {
-                return Err(ExecutorError::Denied.into());
+                return Err(
+                    ExecutorError::InvalidInvocation("required fields are conflicting").into(),
+                );
             }
             let mut parts = command.split_ascii_whitespace();
-            let program = parts.next().ok_or(ExecutorError::Denied)?.to_owned();
+            let program = parts
+                .next()
+                .ok_or(ExecutorError::InvalidInvocation("program is required"))?
+                .to_owned();
             let args = parts.map(str::to_owned).collect();
             let purpose = self
                 .purpose
@@ -2686,7 +3030,10 @@ impl TestArguments {
             return Ok((program, args, purpose, true));
         }
 
-        let program = self.program.clone().ok_or(ExecutorError::Denied)?;
+        let program = self
+            .program
+            .clone()
+            .ok_or(ExecutorError::InvalidInvocation("program is required"))?;
         let purpose = self
             .purpose
             .as_deref()
@@ -2695,9 +3042,13 @@ impl TestArguments {
                     && purpose.len() <= 500
                     && !purpose.chars().any(char::is_control)
             })
-            .ok_or(ExecutorError::Denied)?
+            .ok_or(ExecutorError::InvalidInvocation(
+                "purpose is required and must not contain control characters",
+            ))?
             .to_owned();
-        let verification = self.verification.ok_or(ExecutorError::Denied)?;
+        let verification = self.verification.ok_or(ExecutorError::InvalidInvocation(
+            "verification flag is required",
+        ))?;
         Ok((program, self.args.clone(), purpose, verification))
     }
 }
@@ -2760,6 +3111,7 @@ fn tool_definitions(
 ) -> Vec<ToolDefinition> {
     names.iter().filter_map(|name| match name.as_str() {
         "file.read" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::FILE_READ.into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["path","offset"],"additionalProperties":false}"#.into() }),
+        "search.text" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::SEARCH_TEXT.into(), input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"],"additionalProperties":false}"#.into() }),
         "file.patch" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::FILE_PATCH.into(), input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"replacement":{"type":"string"}},"required":["path","replacement"]}"#.into() }),
         "process.test" => Some(ToolDefinition { name: name.clone(), description: tool_descriptions::PROCESS_TEST.into(), input_schema: r#"{"type":"object","properties":{"program":{"type":"string","minLength":1,"maxLength":128},"args":{"type":"array","items":{"type":"string","maxLength":4096},"maxItems":64},"purpose":{"type":"string","minLength":1,"maxLength":500},"verification":{"type":"boolean"}},"required":["program","args","purpose","verification"],"additionalProperties":false}"#.into() }),
         "task.delegate" if !allowed_targets.is_empty() && max_delegations > 0 => Some(delegation_plan_tool(name, allowed_targets, max_delegations)),
@@ -3142,6 +3494,7 @@ mod tests {
                 &[DelegationProposal {
                     target_agent: "Peer".into(),
                     objective: "bounded peer work".into(),
+                    owned_paths: Vec::new(),
                     acceptance_criteria: vec!["verified".into()],
                 }],
             )
@@ -3881,6 +4234,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_inspection_batches_read_and_search_without_approval_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "const NEEDLE: &str = \"needle\";\n",
+        )
+        .unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let session = SessionId::new();
+        let owner = AgentProfile {
+            id: AgentId::new(),
+            name: "Inspector".into(),
+            role: "developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: String::new(),
+            tools: vec!["file.read".into(), "search.text".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        repo.save_agent(owner.clone()).await.unwrap();
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "file.read".into(),
+                arguments_json: r#"{"path":"a.rs","offset":0}"#.into(),
+            })),
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "search.text".into(),
+                arguments_json: r#"{"query":"needle","limit":10}"#.into(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let task = engine
+            .create_task(owner.id, "inspect source", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        assert!(repo.approvals(session).await.unwrap().is_empty());
+        let artifacts = repo.artifacts().await.unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == "file_read" && artifact.preview.contains("NEEDLE")
+        }));
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == "search_result" && artifact.preview.contains("a.rs:1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn unchanged_workspace_reads_stop_instead_of_spending_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "const VALUE: u8 = 1;\n").unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let session = SessionId::new();
+        let owner = AgentProfile {
+            id: AgentId::new(),
+            name: "Inspector".into(),
+            role: "developer".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: String::new(),
+            tools: vec!["file.read".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        repo.save_agent(owner.clone()).await.unwrap();
+        let request = || {
+            ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "file.read".into(),
+                arguments_json: r#"{"path":"a.rs","offset":0}"#.into(),
+            })
+        };
+        let provider = MockProvider::new(vec![
+            MockStep::Event(request()),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let task = engine
+            .create_task(owner.id, "inspect source", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let repeated_provider = MockProvider::new(vec![
+            MockStep::Event(request()),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let repeated_engine = Engine::new(repo.clone(), Arc::new(repeated_provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        repeated_engine.run_task(task.id).await.unwrap();
+        let artifacts = repo.artifacts().await.unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == "workflow_feedback" && artifact.preview.contains("already recorded")
+        }));
+
+        let (tx, _rx) = mpsc::channel(64);
+        let repeated_again = MockProvider::new(vec![
+            MockStep::Event(request()),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let guarded_engine = Engine::new(repo.clone(), Arc::new(repeated_again), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let error = guarded_engine.run_task(task.id).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::InvalidDelegationPlan(message) if message.contains("repeated unchanged file.read")
+        ));
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(repo.artifacts().await.unwrap().len(), 2);
+        assert!(repo.approvals(session).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn approved_patch_allows_rereading_the_changed_path() {
+        let task_id = TaskId::new();
+        let session_id = SessionId::new();
+        let artifact_id = ArtifactId::new();
+        let approval_id = ApprovalId::new();
+        let now = chrono::Utc::now();
+        let artifact = Artifact {
+            id: artifact_id,
+            producer: task_id,
+            kind: "file_read".into(),
+            location: "a.rs".into(),
+            digest: String::new(),
+            preview: "Characters 0..1 of 1.\na".into(),
+        };
+        let approval = Approval {
+            id: approval_id,
+            task_id,
+            tool_call_id: ToolCallId::new(),
+            action: "file.patch".into(),
+            working_directory: ".".into(),
+            reason: r#"{"path":"a.rs","replacement":"b"}"#.into(),
+            decision: ApprovalDecision::ApprovedOnce,
+            created_at: now,
+        };
+        let events = vec![
+            CanonicalEvent {
+                id: EventId::new(),
+                session_id,
+                task_id: Some(task_id),
+                created_at: now,
+                kind: CanonicalEventKind::ArtifactPublished {
+                    artifact_id,
+                    kind: "file_read".into(),
+                },
+            },
+            CanonicalEvent {
+                id: EventId::new(),
+                session_id,
+                task_id: Some(task_id),
+                created_at: now + chrono::Duration::seconds(1),
+                kind: CanonicalEventKind::ApprovalDecided {
+                    approval_id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                },
+            },
+        ];
+        let request = StructuredToolRequest {
+            id: ToolCallId::new(),
+            name: "file.read".into(),
+            arguments_json: r#"{"path":"a.rs","offset":0}"#.into(),
+        };
+
+        assert!(
+            !inspection_is_repeat(task_id, &request, &[artifact], &[approval], &events).unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_patch_path_fails_instead_of_leaking_a_running_task() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Arc::new(InMemoryRepository::default());
@@ -3991,6 +4545,7 @@ mod tests {
             .unwrap();
         task.work = Some(WorkProgress {
             contract: "API contract".into(),
+            owned_paths: Vec::new(),
             integration: false,
             turns: 0,
         });
@@ -4251,11 +4806,13 @@ mod tests {
             DelegationProposal {
                 target_agent: backend.name.clone(),
                 objective: "build API".into(),
+                owned_paths: vec![PathBuf::from("backend")],
                 acceptance_criteria: vec!["API responds".into()],
             },
             DelegationProposal {
                 target_agent: frontend.name.clone(),
                 objective: "build UI".into(),
+                owned_paths: vec![PathBuf::from("frontend")],
                 acceptance_criteria: vec!["UI calls API".into()],
             },
         ];
