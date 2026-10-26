@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prose_or_patch_cannot_bypass_acceptance_and_turn_budget_survives_retry() {
+    async fn prose_or_patch_cannot_bypass_acceptance_and_turn_count_survives_retry() {
         let (engine, repo, mut task, _) = fixture().await;
         task.status = TaskStatus::Running;
         task.work.as_mut().unwrap().turns = 32;
@@ -577,19 +577,6 @@ mod tests {
         repo.save_task(task.clone()).await.unwrap();
         let retry = engine.retry_task(task.id).await.unwrap();
         assert_eq!(retry.work.as_ref().unwrap().turns, 32);
-        engine.mark_ready(retry.id).await.unwrap();
-        assert!(
-            engine
-                .run_task(retry.id)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("32-turn")
-        );
-        assert_eq!(
-            repo.task(retry.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
-        );
     }
 
     #[test]
@@ -1288,7 +1275,11 @@ impl<R: Repository + 'static> Engine<R> {
             if artifact.producer == task.id
                 && matches!(
                     artifact.kind.as_str(),
-                    "file_read" | "search_result" | "test_report" | "workflow_feedback"
+                    "file_read"
+                        | "search_result"
+                        | "test_report"
+                        | "workflow_feedback"
+                        | "task_checkpoint"
                 )
             {
                 latest.insert(
@@ -1310,7 +1301,11 @@ impl<R: Repository + 'static> Engine<R> {
                         == Some(&artifact.id)
                     && matches!(
                         artifact.kind.as_str(),
-                        "file_read" | "search_result" | "test_report" | "workflow_feedback"
+                        "file_read"
+                            | "search_result"
+                            | "test_report"
+                            | "workflow_feedback"
+                            | "task_checkpoint"
                     );
                 let preview = if !show_preview {
                     String::new()
@@ -1363,7 +1358,7 @@ impl<R: Repository + 'static> Engine<R> {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}/32. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. Re-run verification after any new patch. Recorded action counts across attempts:\n{approvals}\nArtifact index (patch bodies are omitted; workspace context contains the current files):\n{}",
+            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. Re-run verification after any new patch. Recorded action counts across attempts:\n{approvals}\nArtifact index (patch bodies are omitted; workspace context contains the current files):\n{}",
             work.contract,
             if owned_paths.is_empty() {
                 "all paths after dependencies"

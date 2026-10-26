@@ -1029,15 +1029,25 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?
                 .is_some_and(|task| task.status == TaskStatus::Running);
             if still_running {
-                self.record(
-                    Some(id),
-                    CanonicalEventKind::ProviderFailed(format!(
-                        "task execution failed before reaching a terminal state: {error}"
-                    )),
+                let recovery_review = self.route_work_error(id, error).await?;
+                if !recovery_review {
+                    self.record(
+                        Some(id),
+                        CanonicalEventKind::ProviderFailed(format!(
+                            "task execution failed before reaching a terminal state: {error}"
+                        )),
+                    )
+                    .await?;
+                }
+                self.transition(
+                    id,
+                    if recovery_review {
+                        TaskStatus::Blocked
+                    } else {
+                        TaskStatus::Failed
+                    },
                 )
                 .await?;
-                self.transition(id, TaskStatus::Failed).await?;
-                self.route_work_error(id, error).await?;
             }
         }
         result
@@ -1081,12 +1091,7 @@ impl<R: Repository + 'static> Engine<R> {
         }
         let mut task = self.transition(id, TaskStatus::Running).await?;
         if let Some(work) = &mut task.work {
-            if work.turns >= 32 {
-                return Err(EngineError::InvalidDelegationPlan(
-                    "32-turn work budget exhausted; inspect progress before retrying".into(),
-                ));
-            }
-            work.turns += 1;
+            work.turns = work.turns.saturating_add(1);
             self.repo.save_task(task.clone()).await?;
             self.maybe_report_stalled_work(&task).await?;
         }
@@ -1281,6 +1286,35 @@ impl<R: Repository + 'static> Engine<R> {
                 "{user_content}\n\n{}",
                 revision_context(&feedback, &proposals)
             )
+        } else {
+            user_content
+        };
+        let user_content = if task.retry_of.is_none() {
+            let artifacts = self.repo.artifacts().await?;
+            let events = self.repo.events(self.session).await?;
+            let feedback_times = events
+                .iter()
+                .filter_map(|event| match event.kind {
+                    CanonicalEventKind::ArtifactPublished { artifact_id, .. } => {
+                        Some((artifact_id, event.created_at))
+                    }
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>();
+            let feedback = artifacts
+                .into_iter()
+                .filter(|artifact| {
+                    artifact.producer == task.id
+                        && artifact.kind == "workflow_feedback"
+                        && artifact.location == "automatic-repair"
+                })
+                .max_by_key(|artifact| feedback_times.get(&artifact.id));
+            feedback.map_or(user_content.clone(), |artifact| {
+                format!(
+                    "{user_content}\n\nLatest automatic repair feedback:\n{}",
+                    artifact.preview
+                )
+            })
         } else {
             user_content
         };
@@ -2226,6 +2260,25 @@ impl<R: Repository + 'static> Engine<R> {
             let outcome = self.dispatch_approved(&approval).await;
             match outcome {
                 Ok(()) => {
+                    if parent.work.is_some()
+                        && matches!(
+                            approval.action.as_str(),
+                            "file.patch" | "process.test" | "file.read"
+                        )
+                    {
+                        if let Err(error) = self
+                            .publish_task_checkpoint(approval.task_id, &approval.action)
+                            .await
+                        {
+                            tracing::warn!(
+                                session_id = %self.session,
+                                task_id = %approval.task_id,
+                                action = %approval.action,
+                                %error,
+                                "could not persist task continuation checkpoint"
+                            );
+                        }
+                    }
                     let has_pending =
                         self.repo
                             .approvals(self.session)
@@ -2315,25 +2368,42 @@ impl<R: Repository + 'static> Engine<R> {
                         )
                         .await?;
                     }
-                    self.route_work_error(
+                    let recovery_review = self
+                        .route_work_error(
+                            approval.task_id,
+                            &EngineError::Tool(ToolError::PatchConflict),
+                        )
+                        .await?;
+                    self.transition(
                         approval.task_id,
-                        &EngineError::Tool(ToolError::PatchConflict),
+                        if recovery_review {
+                            TaskStatus::Blocked
+                        } else {
+                            TaskStatus::Failed
+                        },
                     )
                     .await?;
-                    self.transition(approval.task_id, TaskStatus::Blocked)
-                        .await?;
                 }
                 Err(error) => {
-                    self.record(
-                        Some(approval.task_id),
-                        CanonicalEventKind::ProviderFailed(format!(
-                            "approved tool failed: {error}"
-                        )),
+                    let recovery_review = self.route_work_error(approval.task_id, &error).await?;
+                    if !recovery_review {
+                        self.record(
+                            Some(approval.task_id),
+                            CanonicalEventKind::ProviderFailed(format!(
+                                "approved tool failed: {error}"
+                            )),
+                        )
+                        .await?;
+                    }
+                    self.transition(
+                        approval.task_id,
+                        if recovery_review {
+                            TaskStatus::Blocked
+                        } else {
+                            TaskStatus::Failed
+                        },
                     )
                     .await?;
-                    self.transition(approval.task_id, TaskStatus::Blocked)
-                        .await?;
-                    self.route_work_error(approval.task_id, &error).await?;
                 }
             }
         }
@@ -2769,18 +2839,13 @@ impl<R: Repository + 'static> Engine<R> {
                 );
                 self.record(
                     Some(parent.id),
-                    CanonicalEventKind::ProviderFailed(reason.clone()),
-                )
-                .await?;
-                self.record(
-                    Some(parent.id),
                     CanonicalEventKind::WorkRecoveryRequested {
                         reason,
                         retry_allowed: true,
                     },
                 )
                 .await?;
-                self.transition(parent.id, TaskStatus::Failed).await?;
+                self.transition(parent.id, TaskStatus::Blocked).await?;
             } else if children
                 .iter()
                 .all(|child| child.status == TaskStatus::Completed)
@@ -3007,7 +3072,12 @@ impl<R: Repository + 'static> Engine<R> {
                         .repo
                         .task(task_id)
                         .await?
-                        .is_some_and(|task| task.status.is_terminal());
+                        // Blocked work has been durably recorded and is ready
+                        // for the coordinator to review. It must not abort the
+                        // scheduler wave before that review can run.
+                        .is_some_and(|task| {
+                            task.status.is_terminal() || task.status == TaskStatus::Blocked
+                        });
                     if !settled && first_unsettled_error.is_none() {
                         first_unsettled_error = Some(error);
                     }
@@ -3078,6 +3148,31 @@ impl<R: Repository + 'static> Engine<R> {
             .await
             .map_err(|_| EngineError::ChannelClosed)
     }
+
+    async fn publish_task_checkpoint(
+        &self,
+        task_id: TaskId,
+        action: &str,
+    ) -> Result<(), EngineError> {
+        let description = match action {
+            "file.patch" => "An approved workspace patch was applied successfully.",
+            "process.test" => "An approved verification action completed successfully.",
+            "file.read" => "An approved workspace inspection was recorded.",
+            _ => return Ok(()),
+        };
+        self.publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: task_id,
+            kind: "task_checkpoint".into(),
+            location: "task-continuation".into(),
+            digest: String::new(),
+            preview: format!(
+                "{description} The workspace and approved changes are durable. Continue from the current files and recorded evidence; inspect only what is needed and keep subsequent changes incremental. This checkpoint contains no prompt or patch contents."
+            ),
+        })
+        .await
+    }
+
     pub async fn cancel_task(&self, id: TaskId) -> Result<Task, EngineError> {
         let _approval_guard = self.approval_lock.lock().await;
         let _start_guard = self.task_start_lock.lock().await;
@@ -3182,6 +3277,7 @@ impl<R: Repository + 'static> Engine<R> {
             CanonicalEventKind::RevisionStopped(_) => "revision_stopped",
             CanonicalEventKind::ApplicationIssue(_) => "application_needs_attention",
             CanonicalEventKind::TaskResultPublished { .. } => "result_published",
+            CanonicalEventKind::WorkRetrying { .. } => "work_retrying",
             CanonicalEventKind::TextDelta(_) => "response_text",
             _ => "task_event",
         };

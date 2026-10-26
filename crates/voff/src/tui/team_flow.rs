@@ -1375,17 +1375,18 @@ const fn task_status_presentation(status: TaskStatus) -> (&'static str, Color) {
         TaskStatus::WaitingApproval => ("approval", theme::YELLOW),
         TaskStatus::Ready => ("ready", theme::AQUA),
         TaskStatus::Queued => ("queued", theme::BLUE),
-        TaskStatus::Blocked => ("blocked", theme::RED),
+        TaskStatus::Blocked => ("blocked", theme::YELLOW),
         TaskStatus::Failed => ("failed", theme::RED),
         TaskStatus::Completed => ("complete", theme::GREEN),
-        TaskStatus::Cancelled => ("cancelled", theme::RED),
+        TaskStatus::Cancelled => ("cancelled", theme::MUTED),
     }
 }
 
 fn status_symbol(status: &str) -> &'static str {
     match status {
         "complete" => "✓",
-        "failed" | "blocked" => "!",
+        "failed" => "!",
+        "blocked" => "↻",
         "approval" => "?",
         _ => "○",
     }

@@ -40,13 +40,13 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
-    CanonicalEventKind, SessionId, Task, TaskStatus,
+    CanonicalEventKind, SessionId, Task, TaskResult, TaskStatus,
 };
 use voff_engine::{
     DelegationProposal, Engine, EngineEvent, OutputContinuation, is_conversational_request,
 };
 use voff_prompts::workflow::routed_agent_objective;
-use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, SqliteRepository};
+use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, RepositoryError, SqliteRepository};
 
 use self::team_flow::{
     TeamFlow, TeamSnapshot, TokenUsage, compact_count, estimate_cost, format_usd, handoff_summary,
@@ -1712,7 +1712,8 @@ impl AppModel {
         }) {
             match kind {
                 CanonicalEventKind::ProviderStarted
-                | CanonicalEventKind::ProviderRetrying { .. } => {
+                | CanonicalEventKind::ProviderRetrying { .. }
+                | CanonicalEventKind::WorkRetrying { .. } => {
                     self.agent_responses.insert(owner, String::new());
                 }
                 CanonicalEventKind::TextDelta(delta)
@@ -1846,6 +1847,7 @@ impl AppModel {
                         | CanonicalEventKind::LeadReviewStarted { .. }
                         | CanonicalEventKind::LeadReviewFinished { approved: true, .. }
                         | CanonicalEventKind::WorkRecoveryRequested { .. }
+                        | CanonicalEventKind::WorkRetrying { .. }
                 ),
                 headline: activity_headline(kind),
                 approval_id: match kind {
@@ -1880,7 +1882,8 @@ impl AppModel {
                 },
                 conversational: matches!(
                     kind,
-                    CanonicalEventKind::TaskDelegated { .. }
+                    CanonicalEventKind::TaskCreated
+                        | CanonicalEventKind::TaskDelegated { .. }
                         | CanonicalEventKind::ToolProposed { .. }
                         | CanonicalEventKind::LeadReviewStarted { .. }
                         | CanonicalEventKind::LeadReviewFinished { .. }
@@ -1922,12 +1925,19 @@ impl AppModel {
                     }
                     CanonicalEventKind::LeadReviewFinished {
                         approved: false, ..
-                    }
-                    | CanonicalEventKind::ProcessFinished { .. }
-                    | CanonicalEventKind::ProviderFailed(_) => theme::RED,
+                    } => theme::AQUA,
                     CanonicalEventKind::LeadReviewStarted { .. }
                     | CanonicalEventKind::RevisionRequested { .. }
+                    | CanonicalEventKind::WorkRecoveryRequested { .. }
+                    | CanonicalEventKind::WorkRetrying { .. }
+                    | CanonicalEventKind::ProviderFailed(_)
+                    | CanonicalEventKind::PatchConflict { .. }
                     | CanonicalEventKind::TaskDelegated { .. } => theme::AQUA,
+                    CanonicalEventKind::ApprovalDecided {
+                        decision: ApprovalDecision::Denied,
+                        ..
+                    }
+                    | CanonicalEventKind::ProcessFinished { .. } => theme::YELLOW,
                     _ => event_text_color(&format_event(kind)),
                 },
             });
@@ -2136,6 +2146,7 @@ fn action_for_event(value: Event) -> Action {
 
 fn activity_headline(kind: &CanonicalEventKind) -> Option<&'static str> {
     match kind {
+        CanonicalEventKind::TaskCreated => Some("Prompt"),
         CanonicalEventKind::TaskDelegated { .. } => Some("↳ Delegated"),
         CanonicalEventKind::DependencyAdded { .. } => Some("Waiting for another task"),
         CanonicalEventKind::LeadReviewStarted { .. } => Some("↶ Sent for review"),
@@ -2145,19 +2156,18 @@ fn activity_headline(kind: &CanonicalEventKind) -> Option<&'static str> {
         } => Some("↶ Changes requested"),
         CanonicalEventKind::RevisionRequested { .. } => Some("↳ Feedback returned"),
         CanonicalEventKind::TaskRetried { .. } => Some("↻ New attempt"),
-        CanonicalEventKind::WorkRecoveryRequested { .. } => Some("↶ Diagnosis requested"),
+        CanonicalEventKind::WorkRecoveryRequested { .. } => Some("↶ Reviewing recovery"),
+        CanonicalEventKind::WorkRetrying { .. } => Some("↻ Retrying task"),
         CanonicalEventKind::RevisionStopped(_) | CanonicalEventKind::ApplicationIssue(_) => {
             Some("! Needs attention")
         }
-        CanonicalEventKind::ProviderFailed(_) | CanonicalEventKind::PatchConflict { .. } => {
-            Some("! Problem")
-        }
+        CanonicalEventKind::ProviderFailed(_) => Some("Provider attempt ended"),
+        CanonicalEventKind::PatchConflict { .. } => Some("↶ Patch needs revision"),
         CanonicalEventKind::ProviderWarning(message) if is_routine_provider_progress(message) => {
             Some("↻ Progress")
         }
-        CanonicalEventKind::ProviderWarning(_) | CanonicalEventKind::ProviderRetrying { .. } => {
-            Some("! Provider update")
-        }
+        CanonicalEventKind::ProviderWarning(_) => Some("Provider update"),
+        CanonicalEventKind::ProviderRetrying { .. } => Some("↻ Retrying provider"),
         CanonicalEventKind::ToolProposed { .. } => Some("Action proposed"),
         CanonicalEventKind::ProcessFinished { .. } => Some("Check finished"),
         CanonicalEventKind::ArtifactPublished { .. } => Some("Artifact recorded"),
@@ -2210,7 +2220,10 @@ fn format_event(kind: &CanonicalEventKind) -> String {
             format!("application needs attention: {}", sanitize(e))
         }
         CanonicalEventKind::WorkRecoveryRequested { reason, .. } => {
-            format!("failure → Team Lead: {}", sanitize(reason))
+            format!("recovery review → Team Lead: {}", sanitize(reason))
+        }
+        CanonicalEventKind::WorkRetrying { attempt, .. } => {
+            format!("retrying task · automatic attempt {attempt}")
         }
         CanonicalEventKind::RevisionRequested { feedback, .. } => format!(
             "Team Lead → developer: revise and resubmit · {}",
@@ -2357,23 +2370,21 @@ fn event_text_color(text: &str) -> Color {
     let text = text.to_ascii_lowercase();
     if text.starts_with("team lead → approved") {
         theme::GREEN
-    } else if text.starts_with("team lead → rejected")
-        || text.starts_with("application needs attention")
+    } else if text.starts_with("application needs attention")
         || text.starts_with("revision blocked:")
     {
         theme::RED
-    } else if text.contains("→ team lead") || text.starts_with("team lead → developer:") {
+    } else if text.contains("→ team lead")
+        || text.starts_with("team lead → developer:")
+        || text.starts_with("team lead → rejected")
+    {
         theme::AQUA
     } else if text.starts_with("tool proposed:")
         || text.starts_with("approval requested:")
         || text.starts_with("approval:")
     {
         theme::YELLOW
-    } else if text.contains("failed")
-        || text.contains("conflict")
-        || text.contains("cancelled")
-        || text.contains("denied")
-    {
+    } else if text.contains("failed") || text.contains("conflict") {
         theme::RED
     } else if text.starts_with("provider completed")
         || text.starts_with("result:")
@@ -2501,6 +2512,7 @@ pub(crate) struct ConfiguredRun {
     pub startup_notice: Option<String>,
     pub startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
     pub startup_scan_pending: bool,
+    pub startup_task_id: Option<voff_core::TaskId>,
     pub setup_prompts: crate::onboarding::SetupPrompts,
     pub startup_goal: Option<String>,
     pub startup_popup_size: Option<(u16, u16)>,
@@ -2569,6 +2581,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
             max_parallel_tasks: config.max_parallel_tasks,
             credential_repository,
             startup_scan_provider,
+            startup_task_id: config.startup_task_id,
             startup_goal: config.startup_goal,
             setup_prompts: config.setup_prompts,
             startup_terminal_handoff: config.startup_terminal_handoff,
@@ -2615,6 +2628,7 @@ struct LoopConfig {
     max_parallel_tasks: usize,
     credential_repository: Arc<SqliteRepository>,
     startup_scan_provider: Option<Arc<dyn voff_provider::ModelProvider>>,
+    startup_task_id: Option<voff_core::TaskId>,
     startup_goal: Option<String>,
     setup_prompts: crate::onboarding::SetupPrompts,
     startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
@@ -2659,6 +2673,71 @@ where
     }
 }
 
+async fn finish_startup_task(
+    repository: &SqliteRepository,
+    session_id: SessionId,
+    task_id: voff_core::TaskId,
+    result: &Result<(crate::onboarding::SetupDraft, String), String>,
+) -> Result<(Task, Vec<CanonicalEvent>), RepositoryError> {
+    let mut task = repository
+        .task(task_id)
+        .await?
+        .ok_or(RepositoryError::NotFound)?;
+    let (status, summary) = match result {
+        Ok((_, summary)) => {
+            task.result = Some(TaskResult {
+                summary: summary.clone(),
+                evidence: Vec::new(),
+            });
+            (TaskStatus::Completed, Some(summary.as_str()))
+        }
+        Err(error) => (TaskStatus::Failed, Some(error.as_str())),
+    };
+    let previous = task.status;
+    repository.save_task(task).await?;
+    let mut recorded_events = Vec::new();
+    if let Some(summary) = summary.filter(|_| status == TaskStatus::Completed) {
+        let event = CanonicalEvent {
+            id: voff_core::EventId::new(),
+            session_id,
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::TaskResultPublished {
+                summary: summary.to_owned(),
+                evidence: Vec::new(),
+            },
+        };
+        repository.append_event(event.clone()).await?;
+        recorded_events.push(event);
+    }
+    if let Some(message) = summary.filter(|_| status == TaskStatus::Failed) {
+        let event = CanonicalEvent {
+            id: voff_core::EventId::new(),
+            session_id,
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::ProviderFailed(message.to_owned()),
+        };
+        repository.append_event(event.clone()).await?;
+        recorded_events.push(event);
+    }
+    let transition_event = CanonicalEvent {
+        id: voff_core::EventId::new(),
+        session_id,
+        task_id: Some(task_id),
+        created_at: chrono::Utc::now(),
+        kind: CanonicalEventKind::TaskTransition {
+            from: previous,
+            to: status,
+        },
+    };
+    let updated = repository
+        .transition_task_with_event(task_id, status, transition_event.clone())
+        .await?;
+    recorded_events.push(transition_event);
+    Ok((updated, recorded_events))
+}
+
 async fn terminal_loop<R: Repository + 'static>(
     model: &mut AppModel,
     engine: Arc<Engine<R>>,
@@ -2672,6 +2751,7 @@ async fn terminal_loop<R: Repository + 'static>(
         max_parallel_tasks,
         credential_repository,
         startup_scan_provider,
+        startup_task_id,
         startup_goal,
         setup_prompts,
         startup_terminal_handoff,
@@ -3119,6 +3199,17 @@ async fn terminal_loop<R: Repository + 'static>(
                 }
             }
             Some(result)=team_scan_rx.recv()=>{
+                if let Some(task_id) = startup_task_id {
+                    match finish_startup_task(&credential_repository, model.session, task_id, &result).await {
+                        Ok((task, events)) => {
+                            for event in events {
+                                model.apply_event(EngineEvent::Canonical(event));
+                            }
+                            model.apply_event(EngineEvent::TaskUpdated(task));
+                        }
+                        Err(error) => model.startup_scan_error = Some(format!("Could not save team builder task: {error}")),
+                    }
+                }
                 model.startup_scan_result = Some(result);
             }
             Some(message)=event_rx.recv()=>model.apply_event(message),
@@ -4504,6 +4595,8 @@ fn conversation_lines(
                     "Diagnosing the failed attempt.".into()
                 }
             }
+        } else if event.headline == Some("Prompt") {
+            sanitize(&task.objective)
         } else if let Some(related) = related {
             sanitize(&related.objective)
         } else if event.is_output {
@@ -5097,10 +5190,10 @@ fn task_status_visual(status: TaskStatus) -> (&'static str, &'static str, Color)
         TaskStatus::Ready => ("◇", "ready", theme::BLUE),
         TaskStatus::Running => ("▶", "running", theme::AQUA),
         TaskStatus::WaitingApproval => ("◆", "approval", theme::YELLOW),
-        TaskStatus::Blocked => ("!", "blocked", theme::RED),
+        TaskStatus::Blocked => ("↻", "blocked", theme::YELLOW),
         TaskStatus::Completed => ("✓", "completed", theme::GREEN),
         TaskStatus::Failed => ("×", "failed", theme::RED),
-        TaskStatus::Cancelled => ("–", "cancelled", theme::RED),
+        TaskStatus::Cancelled => ("–", "cancelled", theme::MUTED),
     }
 }
 
@@ -6424,6 +6517,55 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
+    #[tokio::test]
+    async fn startup_builder_task_records_result_and_failure() {
+        let repository = SqliteRepository::open_in_memory().await.unwrap();
+        let session_id = SessionId::new();
+        for (result, expected_status) in [
+            (
+                Ok((
+                    crate::onboarding::SetupDraft {
+                        developers: Vec::new(),
+                        working_directory: PathBuf::new(),
+                    },
+                    "Team generated".to_owned(),
+                )),
+                TaskStatus::Completed,
+            ),
+            (Err("provider unavailable".to_owned()), TaskStatus::Failed),
+        ] {
+            let mut task = Task::root(
+                AgentId::new(),
+                "team builder prompt",
+                vec![],
+                Default::default(),
+            );
+            task.transition(TaskStatus::Ready).unwrap();
+            task.transition(TaskStatus::Running).unwrap();
+            let task_id = task.id;
+            repository.save_task(task).await.unwrap();
+
+            finish_startup_task(&repository, session_id, task_id, &result)
+                .await
+                .unwrap();
+
+            let saved = repository.task(task_id).await.unwrap().unwrap();
+            assert_eq!(saved.status, expected_status);
+            assert_eq!(
+                saved.result.as_ref().map(|result| result.summary.as_str()),
+                (expected_status == TaskStatus::Completed).then_some("Team generated")
+            );
+            let events = repository.events(session_id).await.unwrap();
+            assert!(events.iter().any(|event| {
+                event.task_id == Some(task_id)
+                    && matches!(
+                        event.kind,
+                        CanonicalEventKind::TaskTransition { to, .. } if to == expected_status
+                    )
+            }));
+        }
+    }
+
     #[test]
     fn resize_redraws_immediately_and_preserves_input_with_help_open() {
         let mut app = AppModel::new(SessionId::new());
@@ -6671,6 +6813,8 @@ mod tests {
         let unrelated = Task::root(backend.id, "Other app", vec![], Default::default());
         app.agents = vec![lead, backend];
         app.tasks = vec![root.clone(), child.clone(), unrelated.clone()];
+        app.push_scoped_event(Some(root.id), &CanonicalEventKind::TaskCreated);
+        app.push_scoped_event(Some(child.id), &CanonicalEventKind::TaskCreated);
         app.push_scoped_event(
             Some(child.id),
             &CanonicalEventKind::TaskDelegated {
@@ -6705,6 +6849,10 @@ mod tests {
                 .join("\n")
         };
         let text = render(&app);
+        assert!(
+            text.contains("Build tracker") && text.contains("Build API"),
+            "{text}"
+        );
         assert!(
             text.find("─↳ Lead → Backend").unwrap() < text.find("Fix the failing check").unwrap()
         );

@@ -7,8 +7,6 @@ use voff_prompts::{
 };
 const REVIEW_TIMEOUT_SECONDS: u64 = 300;
 const REVIEW_RETRY_DELAY_SECONDS: i64 = 30;
-const MAX_TEMPORARY_REVIEW_ATTEMPTS: usize = 2;
-const MAX_AUTOMATIC_ATTEMPTS: u16 = 3;
 const MAX_PARALLEL_REVIEWS: usize = 4;
 const TEMPORARY_REVIEW_PREFIX: &str = "Reporting-agent review temporarily unavailable";
 
@@ -108,10 +106,8 @@ impl<R: Repository + 'static> Engine<R> {
                     &event.kind,
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
                         if reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                            && (transient_review_count(&events, task.id, Some(approval.id))
-                                >= MAX_TEMPORARY_REVIEW_ATTEMPTS
-                                || (chrono::Utc::now() - event.created_at).num_seconds()
-                                    < REVIEW_RETRY_DELAY_SECONDS)
+                            && (chrono::Utc::now() - event.created_at).num_seconds()
+                                < REVIEW_RETRY_DELAY_SECONDS
                 )
             });
             if retry_later {
@@ -240,6 +236,14 @@ impl<R: Repository + 'static> Engine<R> {
             .iter()
             .filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked))
         {
+            let cycle_started = events
+                .iter()
+                .filter(|event| {
+                    event.task_id == Some(task.id)
+                        && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+                })
+                .max_by_key(|event| event.created_at)
+                .map(|event| event.created_at);
             if events.iter().any(|event| {
                 event.task_id == Some(task.id)
                     && matches!(event.kind, CanonicalEventKind::TaskCancelled)
@@ -253,7 +257,9 @@ impl<R: Repository + 'static> Engine<R> {
                 continue;
             }
             let feedback = events.iter().rev().find_map(|event| {
-                if event.task_id != Some(task.id) {
+                if event.task_id != Some(task.id)
+                    || cycle_started.is_some_and(|started| event.created_at <= started)
+                {
                     return None;
                 }
                 match &event.kind {
@@ -262,7 +268,9 @@ impl<R: Repository + 'static> Engine<R> {
                 }
             });
             let failure = events.iter().rev().find_map(|event| {
-                if event.task_id != Some(task.id) {
+                if event.task_id != Some(task.id)
+                    || cycle_started.is_some_and(|started| event.created_at <= started)
+                {
                     return None;
                 }
                 if let CanonicalEventKind::WorkRecoveryRequested {
@@ -276,9 +284,7 @@ impl<R: Repository + 'static> Engine<R> {
                 }
             });
             if let Some(feedback) = feedback {
-                if self.retry_limit_reached(task, &events).await?
-                    || !children_have_completed_attempts(task.id, &tasks)
-                {
+                if !children_have_settled_attempts(task.id, &tasks) {
                     continue;
                 }
                 let guidance = format!("{}{feedback}", prompts::REJECTED_PROPOSAL_RETRY_PREFIX);
@@ -288,15 +294,14 @@ impl<R: Repository + 'static> Engine<R> {
             let Some((failure, retry_allowed)) = failure else {
                 continue;
             };
-            if self.retry_limit_reached(task, &events).await?
-                || !children_have_completed_attempts(task.id, &tasks)
-            {
+            if !children_have_settled_attempts(task.id, &tasks) {
                 continue;
             }
             let last_recovery_review = events
                 .iter()
                 .filter(|event| {
                     event.task_id == Some(task.id)
+                        && cycle_started.is_none_or(|started| event.created_at > started)
                         && matches!(
                             event.kind,
                             CanonicalEventKind::LeadReviewStarted {
@@ -310,12 +315,11 @@ impl<R: Repository + 'static> Engine<R> {
                 })
                 .max_by_key(|event| event.created_at);
             if last_recovery_review.is_some_and(|event| {
-                matches!(event.kind, CanonicalEventKind::LeadReviewStarted { .. })
-                    || matches!(
-                        &event.kind,
-                        CanonicalEventKind::LeadReviewFinished { reason, .. }
-                            if !reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                    )
+                matches!(
+                    &event.kind,
+                    CanonicalEventKind::LeadReviewFinished { reason, .. }
+                        if !reason.starts_with(TEMPORARY_REVIEW_PREFIX)
+                )
             }) {
                 continue;
             }
@@ -324,10 +328,8 @@ impl<R: Repository + 'static> Engine<R> {
                     &event.kind,
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
                         if reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                            && (transient_review_count(&events, task.id, None)
-                                >= MAX_TEMPORARY_REVIEW_ATTEMPTS
-                                || (chrono::Utc::now() - event.created_at).num_seconds()
-                                    < REVIEW_RETRY_DELAY_SECONDS)
+                            && (chrono::Utc::now() - event.created_at).num_seconds()
+                                < REVIEW_RETRY_DELAY_SECONDS
                 )
             }) {
                 continue;
@@ -370,12 +372,25 @@ impl<R: Repository + 'static> Engine<R> {
                 } else {
                     approvals.join("; ")
                 };
+                let owned_paths = task
+                    .work
+                    .as_ref()
+                    .map(|work| {
+                        work.owned_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|paths| !paths.is_empty())
+                    .unwrap_or_else(|| "all workspace paths assigned to this task".into());
                 prompts::recovery_capability_evidence(
                     &owner.name,
                     owner.enabled,
                     &owner.tools.join(", "),
                     &reports.join("; "),
                     &approval_summary,
+                    &owned_paths,
                 )
             } else {
                 prompts::RECOVERY_PROFILE_MISSING.into()
@@ -419,29 +434,6 @@ impl<R: Repository + 'static> Engine<R> {
         Ok(())
     }
 
-    async fn retry_limit_reached(
-        &self,
-        task: &Task,
-        events: &[CanonicalEvent],
-    ) -> Result<bool, EngineError> {
-        if task.attempt < MAX_AUTOMATIC_ATTEMPTS {
-            return Ok(false);
-        }
-        if !events.iter().any(|event| {
-            event.task_id == Some(task.id)
-                && matches!(event.kind, CanonicalEventKind::RevisionStopped(_))
-        }) {
-            self.record(
-                Some(task.id),
-                CanonicalEventKind::RevisionStopped(format!(
-                    "Automatic repair stopped after {MAX_AUTOMATIC_ATTEMPTS} attempts; inspect the latest failure before continuing."
-                )),
-            )
-            .await?;
-        }
-        Ok(true)
-    }
-
     async fn resume_evidence_revision(
         &self,
         task: &Task,
@@ -466,6 +458,15 @@ impl<R: Repository + 'static> Engine<R> {
             ),
         })
         .await?;
+        let attempt = next_work_retry_attempt(&self.repo.events(self.session).await?, task.id);
+        self.record(
+            Some(task.id),
+            CanonicalEventKind::WorkRetrying {
+                attempt,
+                owner: task.owner,
+            },
+        )
+        .await?;
         self.transition(task.id, TaskStatus::Ready).await?;
         self.events
             .send(EngineEvent::TaskUpdated(
@@ -487,13 +488,35 @@ impl<R: Repository + 'static> Engine<R> {
         }) {
             return Ok(());
         }
-        let retry = self
-            .retry_task_with_guidance(task.id, Some(guidance))
-            .await?;
-        self.events
-            .send(EngineEvent::TaskUpdated(retry))
-            .await
-            .map_err(|_| EngineError::ChannelClosed)?;
+        let Some(current) = self.repo.task(task.id).await? else {
+            return Err(EngineError::TaskNotFound);
+        };
+        if !matches!(current.status, TaskStatus::Blocked | TaskStatus::Failed) {
+            return Ok(());
+        }
+        let events = self.repo.events(self.session).await?;
+        let attempt = next_work_retry_attempt(&events, task.id);
+        self.publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: task.id,
+            kind: "workflow_feedback".into(),
+            location: "automatic-repair".into(),
+            digest: String::new(),
+            preview: format!(
+                "Automatic repair attempt {attempt}. Address the latest review or recovery feedback while continuing the original task:\n{}",
+                guidance.chars().take(4_000).collect::<String>()
+            ),
+        })
+        .await?;
+        self.record(
+            Some(task.id),
+            CanonicalEventKind::WorkRetrying {
+                attempt,
+                owner: current.owner,
+            },
+        )
+        .await?;
+        self.transition(task.id, TaskStatus::Ready).await?;
         Ok(())
     }
 
@@ -742,7 +765,15 @@ impl<R: Repository + 'static> Engine<R> {
         &self,
         id: TaskId,
         error: &EngineError,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
+        // A requested test command that is not installed is a task blocker,
+        // not an application failure. The lead can choose another check or
+        // delegate verification to an agent with a usable toolchain.
+        let missing_test_program = matches!(
+            error,
+            EngineError::Executor(ExecutorError::Io(source))
+                if source.kind() == std::io::ErrorKind::NotFound
+        );
         let recoverable = matches!(
             error,
             EngineError::Tool(
@@ -757,15 +788,16 @@ impl<R: Repository + 'static> Engine<R> {
                     kind: ProviderErrorKind::InvalidResponse,
                     ..
                 })
-        );
+        ) || missing_test_program;
         let diagnosable = matches!(
             error,
             EngineError::Tool(_)
                 | EngineError::InvalidDelegationPlan(_)
                 | EngineError::TeamLeadRequired
                 | EngineError::Executor(ExecutorError::Denied | ExecutorError::OutsideWorkspace)
-        );
-        if self.automatic_review && (recoverable || diagnosable) {
+        ) || missing_test_program;
+        let recovery_review = self.automatic_review && (recoverable || diagnosable);
+        if recovery_review {
             let reason = match error {
                 EngineError::Tool(ToolError::PathIo { path, source }) => {
                     format!("Could not prepare/write {}: {source}", path.display())
@@ -790,7 +822,7 @@ impl<R: Repository + 'static> Engine<R> {
         ) {
             self.record(Some(id), CanonicalEventKind::ApplicationIssue(format!("{error}. Check provider login, availability, and application limits; no automatic permission or token increase was made."))).await?;
         }
-        Ok(())
+        Ok(recovery_review)
     }
 }
 
@@ -852,35 +884,33 @@ fn has_new_review_evidence(
         })
 }
 
-fn transient_review_count(
-    events: &[CanonicalEvent],
-    task_id: TaskId,
-    approval_id: Option<ApprovalId>,
-) -> usize {
-    events
-        .iter()
-        .filter(|event| event.task_id == Some(task_id))
-        .filter(|event| {
-            matches!(
-                &event.kind,
-                CanonicalEventKind::LeadReviewFinished {
-                    approval_id: recorded_id,
-                    reason,
-                    ..
-                } if *recorded_id == approval_id && reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-            )
-        })
-        .count()
-}
-
-fn children_have_completed_attempts(task_id: TaskId, tasks: &[Task]) -> bool {
+fn children_have_settled_attempts(task_id: TaskId, tasks: &[Task]) -> bool {
     tasks
         .iter()
         .filter(|task| task.parent == Some(task_id))
         .all(|child| {
-            latest_attempt(tasks, child.id)
-                .is_some_and(|latest| latest.status == TaskStatus::Completed)
+            latest_attempt(tasks, child.id).is_some_and(|latest| {
+                !matches!(
+                    latest.status,
+                    TaskStatus::Queued
+                        | TaskStatus::Ready
+                        | TaskStatus::Running
+                        | TaskStatus::WaitingApproval
+                )
+            })
         })
+}
+
+fn next_work_retry_attempt(events: &[CanonicalEvent], task_id: TaskId) -> u32 {
+    events
+        .iter()
+        .filter(|event| {
+            event.task_id == Some(task_id)
+                && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+        })
+        .count()
+        .saturating_add(1)
+        .min(u32::MAX as usize) as u32
 }
 
 fn invalid_verdict() -> Verdict {

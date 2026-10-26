@@ -24,7 +24,7 @@ use std::{
 };
 use voff_core::{
     AgentId, AgentProfile, CanonicalEvent, CanonicalEventKind, EventId, FormationId, Session,
-    SessionId, TaskStatus,
+    SessionId, Task, TaskLimits, TaskStatus,
 };
 use voff_provider::{
     AnthropicProvider, LocalCliKind, LocalCliProvider, MockProvider, MockStep, OllamaProvider,
@@ -779,7 +779,7 @@ fn tools_for(role: DeveloperRole, team_lead: bool, has_specialists: bool) -> Vec
     } else {
         tools.retain(|tool| !matches!(tool.as_str(), "task.delegate" | "review.request"));
     }
-    if team_lead && !has_specialists {
+    if team_lead {
         for tool in ["file.patch", "process.test"] {
             if !tools.iter().any(|configured| configured == tool) {
                 tools.push(tool.into());
@@ -989,6 +989,38 @@ async fn run_session(
     };
     agent_profiles.sort_by_key(|agent| agent.id != owner);
     recover_interrupted(repo.as_ref(), session.id).await?;
+    let startup_task_id = if startup.scan_pending {
+        let prompt = if startup.goal.is_some() {
+            &startup.setup_prompts.build_from_description
+        } else {
+            &startup.setup_prompts.scan_workspace
+        };
+        let objective = startup.goal.as_ref().map_or_else(
+            || prompt.clone(),
+            |goal| format!("{prompt}\n\nRequested outcome:\n{goal}"),
+        );
+        let mut task = Task::root(
+            owner,
+            objective,
+            vec!["Generate and save a useful workspace team from project evidence".into()],
+            TaskLimits::default(),
+        );
+        task.transition(TaskStatus::Ready)?;
+        task.transition(TaskStatus::Running)?;
+        let task_id = task.id;
+        repo.save_task(task).await?;
+        repo.append_event(CanonicalEvent {
+            id: EventId::new(),
+            session_id: session.id,
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::TaskCreated,
+        })
+        .await?;
+        Some(task_id)
+    } else {
+        None
+    };
     let events = repo.events(session.id).await?;
     let task_ids = events
         .iter()
@@ -1049,6 +1081,7 @@ async fn run_session(
         team_setup,
         startup_notice,
         startup_scan_pending: startup.scan_pending,
+        startup_task_id,
         setup_prompts: startup.setup_prompts,
         startup_goal: startup.goal,
         startup_popup_size: startup.popup_size,
@@ -1092,10 +1125,18 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
     let events = repo.events(session).await?;
     // A persisted revision is queued work, not an interrupted parent request.
     for task in tasks.iter().filter(|task| task_ids.contains(&task.id)) {
+        let last_retry = events
+            .iter()
+            .filter(|event| {
+                event.task_id == Some(task.id)
+                    && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+            })
+            .max_by_key(|event| event.created_at)
+            .map(|event| event.created_at);
         let revision_waiting = task.status == TaskStatus::Blocked
-            && task.attempt < 3
             && events.iter().any(|event| {
                 event.task_id == Some(task.id)
+                    && last_retry.is_none_or(|retry| event.created_at > retry)
                     && matches!(event.kind, CanonicalEventKind::RevisionRequested { .. })
             })
             && !events.iter().any(|event| {
@@ -1105,9 +1146,45 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
                         CanonicalEventKind::TaskCancelled | CanonicalEventKind::RevisionStopped(_)
                     )
             });
+        // A blocked child with a retryable recovery request may be waiting for
+        // the lead's review. Keep its running ancestors alive across restart so
+        // the coordinator can finish that review and resume the same task.
+        let recovery_waiting = task.status == TaskStatus::Blocked
+            && events.iter().any(|request| {
+                request.task_id == Some(task.id)
+                    && last_retry.is_none_or(|retry| request.created_at > retry)
+                    && matches!(
+                        request.kind,
+                        CanonicalEventKind::WorkRecoveryRequested {
+                            retry_allowed: true,
+                            ..
+                        }
+                    )
+                    && events
+                        .iter()
+                        .filter(|event| {
+                            event.task_id == Some(task.id)
+                                && event.created_at > request.created_at
+                                && matches!(
+                                    event.kind,
+                                    CanonicalEventKind::LeadReviewFinished {
+                                        approval_id: None,
+                                        ..
+                                    }
+                                )
+                        })
+                        .max_by_key(|event| event.created_at)
+                        .is_none_or(|event| {
+                            matches!(
+                                &event.kind,
+                                CanonicalEventKind::LeadReviewFinished { reason, .. }
+                                    if reason.starts_with("Reporting-agent review temporarily unavailable")
+                            )
+                        })
+            });
         let retry_queued = (task.retry_of.is_some() || task.work.is_some())
             && matches!(task.status, TaskStatus::Queued | TaskStatus::Ready);
-        if revision_waiting || retry_queued {
+        if revision_waiting || recovery_waiting || retry_queued {
             let mut current = Some(task);
             while let Some(parent) = current.and_then(|task| task.parent) {
                 if !task_ids.contains(&parent) || !waiting_ancestors.insert(parent) {
@@ -1354,6 +1431,22 @@ mod tests {
     #[test]
     fn setup_flag_cannot_be_combined_with_an_explicit_config() {
         assert!(Cli::try_parse_from(["voff", "--setup", "--config", "team.toml"]).is_err());
+    }
+
+    #[test]
+    fn generated_team_lead_can_handle_small_work_without_delegating() {
+        let tools = tools_for(DeveloperRole::Lead, true, true);
+        for required in [
+            "file.patch",
+            "process.test",
+            "task.delegate",
+            "review.request",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool == required),
+                "missing {required}"
+            );
+        }
     }
 
     #[test]

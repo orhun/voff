@@ -111,8 +111,6 @@ Available tools depend on the agent:
 | `task.complete`  | Report completion with evidence |
 | `task.blocked`   | Report why work cannot continue |
 
-Commands cannot request network access, installation, publication, deployment or destructive actions.
-
 ## Configuration
 
 After setup, Voff saves the team to `.voff/config.toml` and this file can be edited to customize the team.

@@ -149,7 +149,7 @@ impl TaskStatus {
         self.is_terminal() || matches!(self, Self::Blocked)
     }
 }
-/// Durable contract and turn budget for evidence-gated implementation work.
+/// Durable contract and progress count for evidence-gated implementation work.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkProgress {
     /// Shared interface contract supplied to every implementation and integrator.
@@ -160,7 +160,7 @@ pub struct WorkProgress {
     pub owned_paths: Vec<std::path::PathBuf>,
     /// Integration work must wait for its implementation prerequisites.
     pub integration: bool,
-    /// Persisted model-turn count, bounded across restarts.
+    /// Persisted model-turn count for progress reporting.
     pub turns: u16,
 }
 
@@ -238,7 +238,7 @@ impl Task {
                     | TaskStatus::Cancelled
                     | TaskStatus::Blocked
                     | TaskStatus::Failed
-            ) | (TaskStatus::Blocked, TaskStatus::Ready)
+            ) | (TaskStatus::Blocked | TaskStatus::Failed, TaskStatus::Ready)
         );
         if !valid {
             return Err(DomainError::InvalidTransition {
@@ -264,6 +264,11 @@ pub enum CanonicalEventKind {
         previous: TaskId,
         retry: TaskId,
         attempt: u16,
+    },
+    /// Automatic repair resumes the existing task after review feedback.
+    WorkRetrying {
+        attempt: u32,
+        owner: AgentId,
     },
     TaskTransition {
         from: TaskStatus,
