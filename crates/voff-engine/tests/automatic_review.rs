@@ -232,6 +232,7 @@ async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
         .unwrap();
     task.work = Some(WorkProgress {
         contract: String::new(),
+        owned_paths: Vec::new(),
         integration: false,
         turns: 0,
     });
@@ -278,6 +279,52 @@ async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
     assert!(review_context.contains("task owner Lead (enabled: true)"));
     assert!(review_context.contains("configured Voff tools [file.patch]"));
     assert!(review_context.contains("Recorded proposals/approval decisions: none"));
+}
+
+#[tokio::test]
+async fn malformed_process_invocation_gets_one_reviewed_recovery_attempt() {
+    let malformed_check = call(
+        "process.test",
+        serde_json::json!({
+            "program":"python3",
+            "args":["-c", "print('one')\nprint('two')"],
+            "purpose":"Check the task output",
+            "verification":true
+        }),
+    );
+    let (engine, repo, provider, _dir, session, lead) =
+        setup(vec![malformed_check, verdict(true)], false).await;
+    let mut agent = repo.agent(lead).await.unwrap().unwrap();
+    agent.tools.push("process.test".into());
+    repo.save_agent(agent).await.unwrap();
+
+    let task = engine
+        .create_task(lead, "Build a small app", vec![])
+        .await
+        .unwrap();
+    engine.mark_ready(task.id).await.unwrap();
+    assert!(matches!(
+        engine.run_task(task.id).await,
+        Err(voff_engine::EngineError::Executor(
+            voff_tools::ExecutorError::InvalidInvocation(_)
+        ))
+    ));
+
+    let events = repo.events(session).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        CanonicalEventKind::WorkRecoveryRequested {
+            reason,
+            retry_allowed: true,
+        } if reason.contains("process invocation is invalid")
+    )));
+    engine.coordinate_pending().await.unwrap();
+
+    assert!(repo.tasks().await.unwrap().iter().any(|candidate| {
+        candidate.retry_of == Some(task.id) && candidate.status == TaskStatus::Queued
+    }));
+    assert_eq!(provider.requests.lock().await.len(), 2);
+    assert!(repo.approvals(session).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -480,9 +527,90 @@ async fn unchanged_denied_proposal_cannot_be_approved_on_a_retry() {
 }
 
 #[tokio::test]
+async fn unrelated_evidence_cannot_reopen_a_rejected_process_action() {
+    let inline_check = call(
+        "process.test",
+        serde_json::json!({
+            "program":"node",
+            "args":["-e", "console.log('inline test')"],
+            "purpose":"Check converter behavior",
+            "verification":true
+        }),
+    );
+    let (engine, repo, provider, _dir, session, lead) = setup(
+        vec![inline_check.clone(), verdict(false), inline_check],
+        false,
+    )
+    .await;
+    let mut agent = repo.agent(lead).await.unwrap().unwrap();
+    agent.tools.push("process.test".into());
+    repo.save_agent(agent).await.unwrap();
+
+    let root = engine
+        .create_task(lead, "Build and verify a converter", vec![])
+        .await
+        .unwrap();
+    engine.mark_ready(root.id).await.unwrap();
+    engine.run_task(root.id).await.unwrap();
+    engine.coordinate_pending().await.unwrap();
+    let retry = repo
+        .tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.retry_of == Some(root.id))
+        .expect("the first rejection should request a bounded correction");
+
+    engine
+        .publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: retry.id,
+            kind: "test_report".into(),
+            location: "node --check converter.js".into(),
+            digest: String::new(),
+            preview: "Syntax check passed".into(),
+        })
+        .await
+        .unwrap();
+    engine.mark_ready(retry.id).await.unwrap();
+    engine.run_task(retry.id).await.unwrap();
+    engine.coordinate_pending().await.unwrap();
+
+    let approvals = repo.approvals(session).await.unwrap();
+    assert_eq!(
+        approvals
+            .iter()
+            .filter(|approval| approval.action == "process.test")
+            .count(),
+        2
+    );
+    assert!(approvals.iter().all(|approval| {
+        approval.action != "process.test" || approval.decision == ApprovalDecision::Denied
+    }));
+    assert_eq!(provider.requests.lock().await.len(), 3);
+    assert!(
+        repo.events(session)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, CanonicalEventKind::RevisionStopped(_)))
+    );
+}
+
+#[tokio::test]
 async fn denied_proposal_gets_fresh_review_after_retry_adds_evidence() {
-    let (engine, repo, provider, dir, session, lead) =
-        setup(vec![patch(), verdict(false), patch(), verdict(true)], false).await;
+    let evidence_only_rejection = call(
+        "workflow.decide",
+        serde_json::json!({
+            "approve":false,
+            "reason":"EVIDENCE_ONLY: inspect the package manifest before approving this scoped patch."
+        }),
+    );
+    let (engine, repo, provider, dir, session, lead) = setup(
+        vec![patch(), evidence_only_rejection, patch(), verdict(true)],
+        false,
+    )
+    .await;
     let root = engine.create_task(lead, "Build", vec![]).await.unwrap();
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task(root.id).await.unwrap();

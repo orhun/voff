@@ -1,13 +1,13 @@
 //! Bounded coordinator reviews. Model verdicts cannot enlarge runtime grants.
 use super::*;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use voff_prompts::{
     tool_descriptions,
     workflow::{self as prompts, REVIEW_POLICY},
 };
 const REVIEW_TIMEOUT_SECONDS: u64 = 300;
 const REVIEW_RETRY_DELAY_SECONDS: i64 = 30;
-const MAX_TEMPORARY_REVIEW_ATTEMPTS: usize = 2;
-const MAX_AUTOMATIC_ATTEMPTS: u16 = 3;
+const MAX_PARALLEL_REVIEWS: usize = 4;
 const TEMPORARY_REVIEW_PREFIX: &str = "Reporting-agent review temporarily unavailable";
 
 #[derive(Deserialize)]
@@ -52,6 +52,8 @@ impl<R: Repository + 'static> Engine<R> {
         let _lead = self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
         let mut approvals = self.repo.approvals(self.session).await?;
         approvals.sort_by_key(|approval| approval.created_at);
+        let mut review_jobs = Vec::new();
+        let mut verdicts = Vec::new();
         for approval in approvals
             .iter()
             .filter(|a| a.decision == ApprovalDecision::Pending && a.action != "provider.continue")
@@ -104,10 +106,8 @@ impl<R: Repository + 'static> Engine<R> {
                     &event.kind,
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
                         if reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                            && (transient_review_count(&events, task.id, Some(approval.id))
-                                >= MAX_TEMPORARY_REVIEW_ATTEMPTS
-                                || (chrono::Utc::now() - event.created_at).num_seconds()
-                                    < REVIEW_RETRY_DELAY_SECONDS)
+                            && (chrono::Utc::now() - event.created_at).num_seconds()
+                                < REVIEW_RETRY_DELAY_SECONDS
                 )
             });
             if retry_later {
@@ -125,38 +125,56 @@ impl<R: Repository + 'static> Engine<R> {
                     .await?;
                 continue;
             }
-            let verdict = if started {
-                Verdict { approve: false, reason: "Interrupted review; proposal denied without execution. Re-run the task to obtain a fresh review.".into(), validated: false, transient: false }
-            } else {
-                self.record(
-                    Some(task.id),
-                    CanonicalEventKind::LeadReviewStarted {
-                        lead: reviewer,
-                        approval_id: Some(approval.id),
-                    },
-                )
-                .await?;
-                let evidence = self
-                    .repo
-                    .artifacts()
-                    .await?
-                    .into_iter()
-                    .filter(|a| a.producer == task.id)
-                    .map(|a| a.preview)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.review_verdict_as(
-                    &task,
-                    &prompts::exact_action_review(
-                        &approval.action,
-                        &approval.working_directory,
-                        &approval.reason,
-                        &evidence,
-                    ),
+            if started {
+                verdicts.push((
+                    approval,
+                    task,
                     reviewer,
-                )
+                    Verdict {
+                        approve: false,
+                        reason: "Interrupted review; proposal denied without execution. Re-run the task to obtain a fresh review.".into(),
+                        validated: false,
+                        transient: false,
+                    },
+                ));
+                continue;
+            }
+            self.record(
+                Some(task.id),
+                CanonicalEventKind::LeadReviewStarted {
+                    lead: reviewer,
+                    approval_id: Some(approval.id),
+                },
+            )
+            .await?;
+            let evidence = self
+                .repo
+                .artifacts()
                 .await?
-            };
+                .into_iter()
+                .filter(|artifact| artifact.producer == task.id)
+                .map(|artifact| artifact.preview)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let context = prompts::exact_action_review(
+                &approval.action,
+                &approval.working_directory,
+                &approval.reason,
+                &evidence,
+            );
+            review_jobs.push((approval, task, reviewer, context));
+        }
+        let mut reviewed = stream::iter(review_jobs.into_iter().map(
+            |(approval, task, reviewer, context)| async move {
+                let verdict = self.review_verdict_as(&task, &context, reviewer).await?;
+                Ok::<_, EngineError>((approval, task, reviewer, verdict))
+            },
+        ))
+        .buffer_unordered(MAX_PARALLEL_REVIEWS)
+        .try_collect::<Vec<_>>()
+        .await?;
+        verdicts.append(&mut reviewed);
+        for (approval, task, reviewer, verdict) in verdicts {
             self.record(
                 Some(task.id),
                 CanonicalEventKind::LeadReviewFinished {
@@ -198,10 +216,16 @@ impl<R: Repository + 'static> Engine<R> {
                         Some(task.id),
                         CanonicalEventKind::RevisionRequested {
                             approval_id: approval.id,
-                            feedback: verdict.reason,
+                            feedback: verdict.reason.clone(),
                         },
                     )
                     .await?;
+                    if approval.action == "task.complete"
+                        && verdict.reason.starts_with("EVIDENCE_ONLY:")
+                    {
+                        self.resume_evidence_revision(&task, &approval, &verdict.reason)
+                            .await?;
+                    }
                 }
             }
         }
@@ -212,6 +236,14 @@ impl<R: Repository + 'static> Engine<R> {
             .iter()
             .filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked))
         {
+            let cycle_started = events
+                .iter()
+                .filter(|event| {
+                    event.task_id == Some(task.id)
+                        && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+                })
+                .max_by_key(|event| event.created_at)
+                .map(|event| event.created_at);
             if events.iter().any(|event| {
                 event.task_id == Some(task.id)
                     && matches!(event.kind, CanonicalEventKind::TaskCancelled)
@@ -225,7 +257,9 @@ impl<R: Repository + 'static> Engine<R> {
                 continue;
             }
             let feedback = events.iter().rev().find_map(|event| {
-                if event.task_id != Some(task.id) {
+                if event.task_id != Some(task.id)
+                    || cycle_started.is_some_and(|started| event.created_at <= started)
+                {
                     return None;
                 }
                 match &event.kind {
@@ -234,7 +268,9 @@ impl<R: Repository + 'static> Engine<R> {
                 }
             });
             let failure = events.iter().rev().find_map(|event| {
-                if event.task_id != Some(task.id) {
+                if event.task_id != Some(task.id)
+                    || cycle_started.is_some_and(|started| event.created_at <= started)
+                {
                     return None;
                 }
                 if let CanonicalEventKind::WorkRecoveryRequested {
@@ -248,9 +284,7 @@ impl<R: Repository + 'static> Engine<R> {
                 }
             });
             if let Some(feedback) = feedback {
-                if self.retry_limit_reached(task, &events).await?
-                    || !children_have_completed_attempts(task.id, &tasks)
-                {
+                if !children_have_settled_attempts(task.id, &tasks) {
                     continue;
                 }
                 let guidance = format!("{}{feedback}", prompts::REJECTED_PROPOSAL_RETRY_PREFIX);
@@ -260,15 +294,14 @@ impl<R: Repository + 'static> Engine<R> {
             let Some((failure, retry_allowed)) = failure else {
                 continue;
             };
-            if self.retry_limit_reached(task, &events).await?
-                || !children_have_completed_attempts(task.id, &tasks)
-            {
+            if !children_have_settled_attempts(task.id, &tasks) {
                 continue;
             }
             let last_recovery_review = events
                 .iter()
                 .filter(|event| {
                     event.task_id == Some(task.id)
+                        && cycle_started.is_none_or(|started| event.created_at > started)
                         && matches!(
                             event.kind,
                             CanonicalEventKind::LeadReviewStarted {
@@ -282,12 +315,11 @@ impl<R: Repository + 'static> Engine<R> {
                 })
                 .max_by_key(|event| event.created_at);
             if last_recovery_review.is_some_and(|event| {
-                matches!(event.kind, CanonicalEventKind::LeadReviewStarted { .. })
-                    || matches!(
-                        &event.kind,
-                        CanonicalEventKind::LeadReviewFinished { reason, .. }
-                            if !reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                    )
+                matches!(
+                    &event.kind,
+                    CanonicalEventKind::LeadReviewFinished { reason, .. }
+                        if !reason.starts_with(TEMPORARY_REVIEW_PREFIX)
+                )
             }) {
                 continue;
             }
@@ -296,10 +328,8 @@ impl<R: Repository + 'static> Engine<R> {
                     &event.kind,
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
                         if reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                            && (transient_review_count(&events, task.id, None)
-                                >= MAX_TEMPORARY_REVIEW_ATTEMPTS
-                                || (chrono::Utc::now() - event.created_at).num_seconds()
-                                    < REVIEW_RETRY_DELAY_SECONDS)
+                            && (chrono::Utc::now() - event.created_at).num_seconds()
+                                < REVIEW_RETRY_DELAY_SECONDS
                 )
             }) {
                 continue;
@@ -342,12 +372,25 @@ impl<R: Repository + 'static> Engine<R> {
                 } else {
                     approvals.join("; ")
                 };
+                let owned_paths = task
+                    .work
+                    .as_ref()
+                    .map(|work| {
+                        work.owned_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|paths| !paths.is_empty())
+                    .unwrap_or_else(|| "all workspace paths assigned to this task".into());
                 prompts::recovery_capability_evidence(
                     &owner.name,
                     owner.enabled,
                     &owner.tools.join(", "),
                     &reports.join("; "),
                     &approval_summary,
+                    &owned_paths,
                 )
             } else {
                 prompts::RECOVERY_PROFILE_MISSING.into()
@@ -391,27 +434,50 @@ impl<R: Repository + 'static> Engine<R> {
         Ok(())
     }
 
-    async fn retry_limit_reached(
+    async fn resume_evidence_revision(
         &self,
         task: &Task,
-        events: &[CanonicalEvent],
-    ) -> Result<bool, EngineError> {
-        if task.attempt < MAX_AUTOMATIC_ATTEMPTS {
-            return Ok(false);
+        approval: &Approval,
+        feedback: &str,
+    ) -> Result<(), EngineError> {
+        let Some(current) = self.repo.task(task.id).await? else {
+            return Err(EngineError::TaskNotFound);
+        };
+        if current.status != TaskStatus::Blocked || approval.action != "task.complete" {
+            return Ok(());
         }
-        if !events.iter().any(|event| {
-            event.task_id == Some(task.id)
-                && matches!(event.kind, CanonicalEventKind::RevisionStopped(_))
-        }) {
-            self.record(
-                Some(task.id),
-                CanonicalEventKind::RevisionStopped(format!(
-                    "Automatic repair stopped after {MAX_AUTOMATIC_ATTEMPTS} attempts; inspect the latest failure before continuing."
-                )),
-            )
-            .await?;
-        }
-        Ok(true)
+        self.publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: task.id,
+            kind: "workflow_feedback".into(),
+            location: "task.complete.evidence".into(),
+            digest: String::new(),
+            preview: format!(
+                "The completion report was denied for missing evidence only. Address this reviewer feedback in the current task attempt, then submit completion evidence again:\n{}",
+                feedback.chars().take(4_000).collect::<String>()
+            ),
+        })
+        .await?;
+        let attempt = next_work_retry_attempt(&self.repo.events(self.session).await?, task.id);
+        self.record(
+            Some(task.id),
+            CanonicalEventKind::WorkRetrying {
+                attempt,
+                owner: task.owner,
+            },
+        )
+        .await?;
+        self.transition(task.id, TaskStatus::Ready).await?;
+        self.events
+            .send(EngineEvent::TaskUpdated(
+                self.repo
+                    .task(task.id)
+                    .await?
+                    .ok_or(EngineError::TaskNotFound)?,
+            ))
+            .await
+            .map_err(|_| EngineError::ChannelClosed)?;
+        Ok(())
     }
 
     async fn schedule_repair(&self, task: &Task, guidance: &str) -> Result<(), EngineError> {
@@ -422,13 +488,35 @@ impl<R: Repository + 'static> Engine<R> {
         }) {
             return Ok(());
         }
-        let retry = self
-            .retry_task_with_guidance(task.id, Some(guidance))
-            .await?;
-        self.events
-            .send(EngineEvent::TaskUpdated(retry))
-            .await
-            .map_err(|_| EngineError::ChannelClosed)?;
+        let Some(current) = self.repo.task(task.id).await? else {
+            return Err(EngineError::TaskNotFound);
+        };
+        if !matches!(current.status, TaskStatus::Blocked | TaskStatus::Failed) {
+            return Ok(());
+        }
+        let events = self.repo.events(self.session).await?;
+        let attempt = next_work_retry_attempt(&events, task.id);
+        self.publish_artifact(Artifact {
+            id: ArtifactId::new(),
+            producer: task.id,
+            kind: "workflow_feedback".into(),
+            location: "automatic-repair".into(),
+            digest: String::new(),
+            preview: format!(
+                "Automatic repair attempt {attempt}. Address the latest review or recovery feedback while continuing the original task:\n{}",
+                guidance.chars().take(4_000).collect::<String>()
+            ),
+        })
+        .await?;
+        self.record(
+            Some(task.id),
+            CanonicalEventKind::WorkRetrying {
+                attempt,
+                owner: current.owner,
+            },
+        )
+        .await?;
+        self.transition(task.id, TaskStatus::Ready).await?;
         Ok(())
     }
 
@@ -440,15 +528,26 @@ impl<R: Repository + 'static> Engine<R> {
         let tasks = self.repo.tasks().await?;
         let approvals = self.repo.approvals(self.session).await?;
         let artifacts = self.repo.artifacts().await?;
+        let events = self.repo.events(self.session).await?;
         fn arguments(json: &str) -> Result<serde_json::Value, serde_json::Error> {
             let mut value: serde_json::Value = serde_json::from_str(json)?;
             if let Some(object) = value.as_object_mut() {
                 object.remove("artifact_id"); // Engine correlation, not a change to the action.
+                if let Some(patches) = object
+                    .get_mut("patches")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for patch in patches {
+                        if let Some(patch) = patch.as_object_mut() {
+                            patch.remove("artifact_id");
+                        }
+                    }
+                }
             }
             Ok(value)
         }
         let proposed = arguments(&approval.reason)?;
-        let mut previous = task.retry_of;
+        let mut previous = Some(task.id);
         for _ in 0..tasks.len() {
             let Some(id) = previous else {
                 break;
@@ -459,13 +558,23 @@ impl<R: Repository + 'static> Engine<R> {
                     && candidate.decision == ApprovalDecision::Denied
             }) {
                 if arguments(&denied.reason)? == proposed {
-                    // Identical action arguments are normally stopped after a
-                    // denial. A retry may, however, add evidence that resolves
-                    // an evidence-only finding. Let the reporting agent review
-                    // that action afresh; new evidence never authorizes it by
-                    // itself. Ignore patch artifacts, which every proposal
-                    // creates and which do not address the prior finding.
-                    return Ok(!has_new_review_evidence(&artifacts, task.id, id));
+                    // New artifacts can only reopen an identical action when
+                    // the reviewer explicitly marked its finding evidence-only.
+                    // This prevents unrelated retry evidence from reopening a
+                    // safety or scope rejection.
+                    let evidence_only = events.iter().any(|event| {
+                        event.task_id == Some(id)
+                            && matches!(
+                                &event.kind,
+                                CanonicalEventKind::RevisionRequested {
+                                    approval_id,
+                                    feedback,
+                                } if *approval_id == denied.id
+                                    && feedback.starts_with("EVIDENCE_ONLY:")
+                            )
+                    });
+                    return Ok(!evidence_only
+                        || !has_new_review_evidence(&artifacts, &events, task.id, id, denied.id));
                 }
             }
             previous = tasks
@@ -656,26 +765,39 @@ impl<R: Repository + 'static> Engine<R> {
         &self,
         id: TaskId,
         error: &EngineError,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
+        // A requested test command that is not installed is a task blocker,
+        // not an application failure. The lead can choose another check or
+        // delegate verification to an agent with a usable toolchain.
+        let missing_test_program = matches!(
+            error,
+            EngineError::Executor(ExecutorError::Io(source))
+                if source.kind() == std::io::ErrorKind::NotFound
+        );
         let recoverable = matches!(
             error,
             EngineError::Tool(
-                ToolError::PathIo { .. } | ToolError::Io(_) | ToolError::PatchConflict
+                ToolError::OutsideWorkspace
+                    | ToolError::PathIo { .. }
+                    | ToolError::Io(_)
+                    | ToolError::PatchConflict
             ) | EngineError::InvalidToolArguments(_)
+                | EngineError::Executor(ExecutorError::InvalidInvocation(_))
                 | EngineError::VerificationFailed { .. }
                 | EngineError::Provider(ProviderError {
                     kind: ProviderErrorKind::InvalidResponse,
                     ..
                 })
-        );
+        ) || missing_test_program;
         let diagnosable = matches!(
             error,
             EngineError::Tool(_)
                 | EngineError::InvalidDelegationPlan(_)
                 | EngineError::TeamLeadRequired
                 | EngineError::Executor(ExecutorError::Denied | ExecutorError::OutsideWorkspace)
-        );
-        if self.automatic_review && (recoverable || diagnosable) {
+        ) || missing_test_program;
+        let recovery_review = self.automatic_review && (recoverable || diagnosable);
+        if recovery_review {
             let reason = match error {
                 EngineError::Tool(ToolError::PathIo { path, source }) => {
                     format!("Could not prepare/write {}: {source}", path.display())
@@ -700,17 +822,48 @@ impl<R: Repository + 'static> Engine<R> {
         ) {
             self.record(Some(id), CanonicalEventKind::ApplicationIssue(format!("{error}. Check provider login, availability, and application limits; no automatic permission or token increase was made."))).await?;
         }
-        Ok(())
+        Ok(recovery_review)
     }
 }
 
 fn has_new_review_evidence(
     artifacts: &[Artifact],
+    events: &[CanonicalEvent],
     current_attempt: TaskId,
     denied_attempt: TaskId,
+    denied_approval: ApprovalId,
 ) -> bool {
     let is_review_evidence =
         |artifact: &&Artifact| matches!(artifact.kind.as_str(), "file_read" | "test_report");
+    if current_attempt == denied_attempt {
+        let denied_at = events.iter().find_map(|event| {
+            (event.task_id == Some(denied_attempt)
+                && matches!(
+                    event.kind,
+                    CanonicalEventKind::ApprovalDecided {
+                        approval_id,
+                        decision: ApprovalDecision::Denied
+                    } if approval_id == denied_approval
+                ))
+            .then_some(event.created_at)
+        });
+        let Some(denied_at) = denied_at else {
+            return false;
+        };
+        let newer_artifacts = events
+            .iter()
+            .filter(|event| event.created_at > denied_at)
+            .filter_map(|event| match event.kind {
+                CanonicalEventKind::ArtifactPublished { artifact_id, .. } => Some(artifact_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        return artifacts.iter().any(|artifact| {
+            artifact.producer == current_attempt
+                && matches!(artifact.kind.as_str(), "file_read" | "test_report")
+                && newer_artifacts.contains(&artifact.id)
+        });
+    }
     let prior = artifacts
         .iter()
         .filter(|artifact| artifact.producer == denied_attempt)
@@ -731,35 +884,33 @@ fn has_new_review_evidence(
         })
 }
 
-fn transient_review_count(
-    events: &[CanonicalEvent],
-    task_id: TaskId,
-    approval_id: Option<ApprovalId>,
-) -> usize {
-    events
-        .iter()
-        .filter(|event| event.task_id == Some(task_id))
-        .filter(|event| {
-            matches!(
-                &event.kind,
-                CanonicalEventKind::LeadReviewFinished {
-                    approval_id: recorded_id,
-                    reason,
-                    ..
-                } if *recorded_id == approval_id && reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-            )
-        })
-        .count()
-}
-
-fn children_have_completed_attempts(task_id: TaskId, tasks: &[Task]) -> bool {
+fn children_have_settled_attempts(task_id: TaskId, tasks: &[Task]) -> bool {
     tasks
         .iter()
         .filter(|task| task.parent == Some(task_id))
         .all(|child| {
-            latest_attempt(tasks, child.id)
-                .is_some_and(|latest| latest.status == TaskStatus::Completed)
+            latest_attempt(tasks, child.id).is_some_and(|latest| {
+                !matches!(
+                    latest.status,
+                    TaskStatus::Queued
+                        | TaskStatus::Ready
+                        | TaskStatus::Running
+                        | TaskStatus::WaitingApproval
+                )
+            })
         })
+}
+
+fn next_work_retry_attempt(events: &[CanonicalEvent], task_id: TaskId) -> u32 {
+    events
+        .iter()
+        .filter(|event| {
+            event.task_id == Some(task_id)
+                && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+        })
+        .count()
+        .saturating_add(1)
+        .min(u32::MAX as usize) as u32
 }
 
 fn invalid_verdict() -> Verdict {
@@ -788,7 +939,8 @@ mod tests {
         assert!(REVIEW_POLICY.contains("Reject shell execution"));
         assert!(REVIEW_POLICY.contains("command names are not pre-approved"));
         assert!(REVIEW_POLICY.contains("bounded local workspace command"));
-        assert!(REVIEW_POLICY.contains("A denial is final"));
+        assert!(REVIEW_POLICY.contains("EVIDENCE_ONLY:"));
+        assert!(REVIEW_POLICY.contains("never authorizes the action by itself"));
     }
 
     #[tokio::test]

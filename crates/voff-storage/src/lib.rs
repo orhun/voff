@@ -361,7 +361,11 @@ impl SqliteRepository {
     async fn initialize(&self) -> Result<(), RepositoryError> {
         self.call(|connection| {
             connection
-                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+                // NORMAL avoids syncing the WAL on every small event commit.
+                // Transactions remain atomic; a power failure can lose recent commits.
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+                )
                 .map_err(db)?;
             connection
                 .execute_batch(include_str!("../schema.sql"))
@@ -800,6 +804,29 @@ mod tests {
             let r = SqliteRepository::open(&path).await.unwrap();
             assert_eq!(r.tasks().await.unwrap().len(), 1);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_uses_wal_with_normal_synchronous_mode() {
+        let path = std::env::temp_dir().join(format!("voff-sync-{}.db", uuid::Uuid::new_v4()));
+        let repository = SqliteRepository::open(&path).await.unwrap();
+        let (journal_mode, synchronous) = repository
+            .call(|connection| {
+                let journal_mode = connection
+                    .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                    .map_err(db)?;
+                let synchronous = connection
+                    .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                    .map_err(db)?;
+                Ok((journal_mode, synchronous))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 1);
+        drop(repository);
         let _ = std::fs::remove_file(path);
     }
 

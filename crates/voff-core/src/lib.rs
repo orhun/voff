@@ -149,14 +149,18 @@ impl TaskStatus {
         self.is_terminal() || matches!(self, Self::Blocked)
     }
 }
-/// Durable contract and turn budget for evidence-gated implementation work.
+/// Durable contract and progress count for evidence-gated implementation work.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkProgress {
     /// Shared interface contract supplied to every implementation and integrator.
     pub contract: String,
+    /// Workspace-relative files or directories this task may modify. Empty for
+    /// legacy and unscoped work, which the scheduler runs serially.
+    #[serde(default)]
+    pub owned_paths: Vec<std::path::PathBuf>,
     /// Integration work must wait for its implementation prerequisites.
     pub integration: bool,
-    /// Persisted model-turn count, bounded across restarts.
+    /// Persisted model-turn count for progress reporting.
     pub turns: u16,
 }
 
@@ -221,7 +225,8 @@ impl Task {
                 TaskStatus::Running | TaskStatus::Cancelled
             ) | (
                 TaskStatus::Running,
-                TaskStatus::WaitingApproval
+                TaskStatus::Ready
+                    | TaskStatus::WaitingApproval
                     | TaskStatus::Blocked
                     | TaskStatus::Completed
                     | TaskStatus::Failed
@@ -233,7 +238,7 @@ impl Task {
                     | TaskStatus::Cancelled
                     | TaskStatus::Blocked
                     | TaskStatus::Failed
-            ) | (TaskStatus::Blocked, TaskStatus::Ready)
+            ) | (TaskStatus::Blocked | TaskStatus::Failed, TaskStatus::Ready)
         );
         if !valid {
             return Err(DomainError::InvalidTransition {
@@ -259,6 +264,11 @@ pub enum CanonicalEventKind {
         previous: TaskId,
         retry: TaskId,
         attempt: u16,
+    },
+    /// Automatic repair resumes the existing task after review feedback.
+    WorkRetrying {
+        attempt: u32,
+        owner: AgentId,
     },
     TaskTransition {
         from: TaskStatus,
@@ -428,6 +438,7 @@ impl TaskGraph {
             retry_of: None,
             work: p.work.as_ref().map(|work| WorkProgress {
                 contract: work.contract.clone(),
+                owned_paths: work.owned_paths.clone(),
                 integration: false,
                 turns: 0,
             }),

@@ -40,17 +40,17 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
-    CanonicalEventKind, SessionId, Task, TaskStatus,
+    CanonicalEventKind, SessionId, Task, TaskResult, TaskStatus,
 };
 use voff_engine::{
     DelegationProposal, Engine, EngineEvent, OutputContinuation, is_conversational_request,
 };
 use voff_prompts::workflow::routed_agent_objective;
-use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, SqliteRepository};
+use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, RepositoryError, SqliteRepository};
 
 use self::team_flow::{
     TeamFlow, TeamSnapshot, TokenUsage, compact_count, estimate_cost, format_usd, handoff_summary,
-    role_color, role_icon,
+    role_color, role_icon, task_timing_label,
 };
 use tui_piechart::{PieChart, PieSlice};
 
@@ -117,6 +117,7 @@ pub enum Action {
 
 #[derive(Clone, Debug)]
 struct ScopedEvent {
+    created_at: chrono::DateTime<chrono::Utc>,
     task_id: Option<voff_core::TaskId>,
     text: String,
     is_output: bool,
@@ -1467,7 +1468,7 @@ impl AppModel {
                         _ => {}
                     }
                 }
-                self.push_scoped_event(e.task_id, &e.kind)
+                self.push_scoped_event_at(e.task_id, &e.kind, e.created_at)
             }
             EngineEvent::ApprovalUpdated(approval) => {
                 if approval.decision != ApprovalDecision::Pending
@@ -1663,6 +1664,7 @@ impl AppModel {
             let mut output = text.to_owned();
             trim_tail(&mut output, MAX_LIVE_OUTPUT_BYTES);
             self.scoped_events.push(ScopedEvent {
+                created_at: chrono::Utc::now(),
                 task_id: Some(task_id),
                 text: output,
                 is_output: true,
@@ -1682,6 +1684,15 @@ impl AppModel {
     }
 
     fn push_scoped_event(&mut self, task_id: Option<voff_core::TaskId>, kind: &CanonicalEventKind) {
+        self.push_scoped_event_at(task_id, kind, chrono::Utc::now());
+    }
+
+    fn push_scoped_event_at(
+        &mut self,
+        task_id: Option<voff_core::TaskId>,
+        kind: &CanonicalEventKind,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let reviewer = task_id
             .and_then(|id| self.tasks.iter().find(|task| task.id == id))
             .and_then(|task| task.parent)
@@ -1701,7 +1712,8 @@ impl AppModel {
         }) {
             match kind {
                 CanonicalEventKind::ProviderStarted
-                | CanonicalEventKind::ProviderRetrying { .. } => {
+                | CanonicalEventKind::ProviderRetrying { .. }
+                | CanonicalEventKind::WorkRetrying { .. } => {
                     self.agent_responses.insert(owner, String::new());
                 }
                 CanonicalEventKind::TextDelta(delta)
@@ -1802,6 +1814,7 @@ impl AppModel {
                 }
             } else {
                 self.scoped_events.push(ScopedEvent {
+                    created_at,
                     task_id,
                     text: clean,
                     is_output: true,
@@ -1819,6 +1832,7 @@ impl AppModel {
             }
         } else {
             self.scoped_events.push(ScopedEvent {
+                created_at,
                 task_id,
                 text: match kind {
                     CanonicalEventKind::RevisionRequested { feedback, .. } => {
@@ -1833,6 +1847,7 @@ impl AppModel {
                         | CanonicalEventKind::LeadReviewStarted { .. }
                         | CanonicalEventKind::LeadReviewFinished { approved: true, .. }
                         | CanonicalEventKind::WorkRecoveryRequested { .. }
+                        | CanonicalEventKind::WorkRetrying { .. }
                 ),
                 headline: activity_headline(kind),
                 approval_id: match kind {
@@ -1867,7 +1882,8 @@ impl AppModel {
                 },
                 conversational: matches!(
                     kind,
-                    CanonicalEventKind::TaskDelegated { .. }
+                    CanonicalEventKind::TaskCreated
+                        | CanonicalEventKind::TaskDelegated { .. }
                         | CanonicalEventKind::ToolProposed { .. }
                         | CanonicalEventKind::LeadReviewStarted { .. }
                         | CanonicalEventKind::LeadReviewFinished { .. }
@@ -1909,12 +1925,19 @@ impl AppModel {
                     }
                     CanonicalEventKind::LeadReviewFinished {
                         approved: false, ..
-                    }
-                    | CanonicalEventKind::ProcessFinished { .. }
-                    | CanonicalEventKind::ProviderFailed(_) => theme::RED,
+                    } => theme::AQUA,
                     CanonicalEventKind::LeadReviewStarted { .. }
                     | CanonicalEventKind::RevisionRequested { .. }
+                    | CanonicalEventKind::WorkRecoveryRequested { .. }
+                    | CanonicalEventKind::WorkRetrying { .. }
+                    | CanonicalEventKind::ProviderFailed(_)
+                    | CanonicalEventKind::PatchConflict { .. }
                     | CanonicalEventKind::TaskDelegated { .. } => theme::AQUA,
+                    CanonicalEventKind::ApprovalDecided {
+                        decision: ApprovalDecision::Denied,
+                        ..
+                    }
+                    | CanonicalEventKind::ProcessFinished { .. } => theme::YELLOW,
                     _ => event_text_color(&format_event(kind)),
                 },
             });
@@ -2123,6 +2146,7 @@ fn action_for_event(value: Event) -> Action {
 
 fn activity_headline(kind: &CanonicalEventKind) -> Option<&'static str> {
     match kind {
+        CanonicalEventKind::TaskCreated => Some("Prompt"),
         CanonicalEventKind::TaskDelegated { .. } => Some("↳ Delegated"),
         CanonicalEventKind::DependencyAdded { .. } => Some("Waiting for another task"),
         CanonicalEventKind::LeadReviewStarted { .. } => Some("↶ Sent for review"),
@@ -2132,19 +2156,18 @@ fn activity_headline(kind: &CanonicalEventKind) -> Option<&'static str> {
         } => Some("↶ Changes requested"),
         CanonicalEventKind::RevisionRequested { .. } => Some("↳ Feedback returned"),
         CanonicalEventKind::TaskRetried { .. } => Some("↻ New attempt"),
-        CanonicalEventKind::WorkRecoveryRequested { .. } => Some("↶ Diagnosis requested"),
+        CanonicalEventKind::WorkRecoveryRequested { .. } => Some("↶ Reviewing recovery"),
+        CanonicalEventKind::WorkRetrying { .. } => Some("↻ Retrying task"),
         CanonicalEventKind::RevisionStopped(_) | CanonicalEventKind::ApplicationIssue(_) => {
             Some("! Needs attention")
         }
-        CanonicalEventKind::ProviderFailed(_) | CanonicalEventKind::PatchConflict { .. } => {
-            Some("! Problem")
-        }
+        CanonicalEventKind::ProviderFailed(_) => Some("Provider attempt ended"),
+        CanonicalEventKind::PatchConflict { .. } => Some("↶ Patch needs revision"),
         CanonicalEventKind::ProviderWarning(message) if is_routine_provider_progress(message) => {
             Some("↻ Progress")
         }
-        CanonicalEventKind::ProviderWarning(_) | CanonicalEventKind::ProviderRetrying { .. } => {
-            Some("! Provider update")
-        }
+        CanonicalEventKind::ProviderWarning(_) => Some("Provider update"),
+        CanonicalEventKind::ProviderRetrying { .. } => Some("↻ Retrying provider"),
         CanonicalEventKind::ToolProposed { .. } => Some("Action proposed"),
         CanonicalEventKind::ProcessFinished { .. } => Some("Check finished"),
         CanonicalEventKind::ArtifactPublished { .. } => Some("Artifact recorded"),
@@ -2197,7 +2220,10 @@ fn format_event(kind: &CanonicalEventKind) -> String {
             format!("application needs attention: {}", sanitize(e))
         }
         CanonicalEventKind::WorkRecoveryRequested { reason, .. } => {
-            format!("failure → Team Lead: {}", sanitize(reason))
+            format!("recovery review → Team Lead: {}", sanitize(reason))
+        }
+        CanonicalEventKind::WorkRetrying { attempt, .. } => {
+            format!("retrying task · automatic attempt {attempt}")
         }
         CanonicalEventKind::RevisionRequested { feedback, .. } => format!(
             "Team Lead → developer: revise and resubmit · {}",
@@ -2344,23 +2370,21 @@ fn event_text_color(text: &str) -> Color {
     let text = text.to_ascii_lowercase();
     if text.starts_with("team lead → approved") {
         theme::GREEN
-    } else if text.starts_with("team lead → rejected")
-        || text.starts_with("application needs attention")
+    } else if text.starts_with("application needs attention")
         || text.starts_with("revision blocked:")
     {
         theme::RED
-    } else if text.contains("→ team lead") || text.starts_with("team lead → developer:") {
+    } else if text.contains("→ team lead")
+        || text.starts_with("team lead → developer:")
+        || text.starts_with("team lead → rejected")
+    {
         theme::AQUA
     } else if text.starts_with("tool proposed:")
         || text.starts_with("approval requested:")
         || text.starts_with("approval:")
     {
         theme::YELLOW
-    } else if text.contains("failed")
-        || text.contains("conflict")
-        || text.contains("cancelled")
-        || text.contains("denied")
-    {
+    } else if text.contains("failed") || text.contains("conflict") {
         theme::RED
     } else if text.starts_with("provider completed")
         || text.starts_with("result:")
@@ -2488,6 +2512,7 @@ pub(crate) struct ConfiguredRun {
     pub startup_notice: Option<String>,
     pub startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
     pub startup_scan_pending: bool,
+    pub startup_task_id: Option<voff_core::TaskId>,
     pub setup_prompts: crate::onboarding::SetupPrompts,
     pub startup_goal: Option<String>,
     pub startup_popup_size: Option<(u16, u16)>,
@@ -2556,6 +2581,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
             max_parallel_tasks: config.max_parallel_tasks,
             credential_repository,
             startup_scan_provider,
+            startup_task_id: config.startup_task_id,
             startup_goal: config.startup_goal,
             setup_prompts: config.setup_prompts,
             startup_terminal_handoff: config.startup_terminal_handoff,
@@ -2602,6 +2628,7 @@ struct LoopConfig {
     max_parallel_tasks: usize,
     credential_repository: Arc<SqliteRepository>,
     startup_scan_provider: Option<Arc<dyn voff_provider::ModelProvider>>,
+    startup_task_id: Option<voff_core::TaskId>,
     startup_goal: Option<String>,
     setup_prompts: crate::onboarding::SetupPrompts,
     startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
@@ -2646,6 +2673,71 @@ where
     }
 }
 
+async fn finish_startup_task(
+    repository: &SqliteRepository,
+    session_id: SessionId,
+    task_id: voff_core::TaskId,
+    result: &Result<(crate::onboarding::SetupDraft, String), String>,
+) -> Result<(Task, Vec<CanonicalEvent>), RepositoryError> {
+    let mut task = repository
+        .task(task_id)
+        .await?
+        .ok_or(RepositoryError::NotFound)?;
+    let (status, summary) = match result {
+        Ok((_, summary)) => {
+            task.result = Some(TaskResult {
+                summary: summary.clone(),
+                evidence: Vec::new(),
+            });
+            (TaskStatus::Completed, Some(summary.as_str()))
+        }
+        Err(error) => (TaskStatus::Failed, Some(error.as_str())),
+    };
+    let previous = task.status;
+    repository.save_task(task).await?;
+    let mut recorded_events = Vec::new();
+    if let Some(summary) = summary.filter(|_| status == TaskStatus::Completed) {
+        let event = CanonicalEvent {
+            id: voff_core::EventId::new(),
+            session_id,
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::TaskResultPublished {
+                summary: summary.to_owned(),
+                evidence: Vec::new(),
+            },
+        };
+        repository.append_event(event.clone()).await?;
+        recorded_events.push(event);
+    }
+    if let Some(message) = summary.filter(|_| status == TaskStatus::Failed) {
+        let event = CanonicalEvent {
+            id: voff_core::EventId::new(),
+            session_id,
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::ProviderFailed(message.to_owned()),
+        };
+        repository.append_event(event.clone()).await?;
+        recorded_events.push(event);
+    }
+    let transition_event = CanonicalEvent {
+        id: voff_core::EventId::new(),
+        session_id,
+        task_id: Some(task_id),
+        created_at: chrono::Utc::now(),
+        kind: CanonicalEventKind::TaskTransition {
+            from: previous,
+            to: status,
+        },
+    };
+    let updated = repository
+        .transition_task_with_event(task_id, status, transition_event.clone())
+        .await?;
+    recorded_events.push(transition_event);
+    Ok((updated, recorded_events))
+}
+
 async fn terminal_loop<R: Repository + 'static>(
     model: &mut AppModel,
     engine: Arc<Engine<R>>,
@@ -2659,6 +2751,7 @@ async fn terminal_loop<R: Repository + 'static>(
         max_parallel_tasks,
         credential_repository,
         startup_scan_provider,
+        startup_task_id,
         startup_goal,
         setup_prompts,
         startup_terminal_handoff,
@@ -3106,6 +3199,17 @@ async fn terminal_loop<R: Repository + 'static>(
                 }
             }
             Some(result)=team_scan_rx.recv()=>{
+                if let Some(task_id) = startup_task_id {
+                    match finish_startup_task(&credential_repository, model.session, task_id, &result).await {
+                        Ok((task, events)) => {
+                            for event in events {
+                                model.apply_event(EngineEvent::Canonical(event));
+                            }
+                            model.apply_event(EngineEvent::TaskUpdated(task));
+                        }
+                        Err(error) => model.startup_scan_error = Some(format!("Could not save team builder task: {error}")),
+                    }
+                }
                 model.startup_scan_result = Some(result);
             }
             Some(message)=event_rx.recv()=>model.apply_event(message),
@@ -3910,6 +4014,21 @@ fn conversation_result_repeats_output(app: &AppModel, event: &ScopedEvent) -> bo
     })
 }
 
+fn task_retry_root(task: &Task, tasks: &[Task]) -> voff_core::TaskId {
+    let mut current = task;
+    let mut seen = HashSet::new();
+    while seen.insert(current.id) {
+        let Some(previous) = current.retry_of else {
+            return current.id;
+        };
+        let Some(parent) = tasks.iter().find(|candidate| candidate.id == previous) else {
+            return current.id;
+        };
+        current = parent;
+    }
+    current.id
+}
+
 fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let (icon, status, color) = task_status_visual(task.status);
@@ -3928,6 +4047,17 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    if let Some(timing) = task_timing_label(task) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} · {timing}",
+                task.created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+            ),
+            Style::default().fg(theme::MUTED),
+        )));
+    }
     if !app.expanded_output {
         push_text_lines(
             &mut lines,
@@ -4041,7 +4171,23 @@ fn task_detail_lines(app: &AppModel, task: &Task) -> Vec<Line<'static>> {
             },
             theme::AQUA,
         );
-        lines.push(Line::from(format!(" Turn {}/32", work.turns)));
+        let retry_root = task_retry_root(task, &app.tasks);
+        let retry_chain = app
+            .tasks
+            .iter()
+            .filter(|candidate| task_retry_root(candidate, &app.tasks) == retry_root)
+            .map(|candidate| candidate.id)
+            .collect::<HashSet<_>>();
+        let retries = retry_chain.len().saturating_sub(1);
+        let approvals = app
+            .approvals
+            .iter()
+            .filter(|approval| retry_chain.contains(&approval.task_id))
+            .count();
+        lines.push(Line::from(format!(
+            " Turn {}/32 · {approvals} approvals · {retries} retries",
+            work.turns
+        )));
         if !work.contract.is_empty() {
             push_section(&mut lines, "SHARED CONTRACT", theme::AQUA);
             push_text_lines(
@@ -4449,6 +4595,8 @@ fn conversation_lines(
                     "Diagnosing the failed attempt.".into()
                 }
             }
+        } else if event.headline == Some("Prompt") {
+            sanitize(&task.objective)
         } else if let Some(related) = related {
             sanitize(&related.objective)
         } else if event.is_output {
@@ -4465,6 +4613,15 @@ fn conversation_lines(
                 .unwrap_or(&event.text)
                 .to_owned()
         };
+        if app.expanded_output {
+            title = format!(
+                "{} · {title}",
+                event
+                    .created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+            );
+        }
         let start = lines.len();
         push_activity_entry(
             &mut lines,
@@ -4767,6 +4924,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("j/k / click", "Browse / select"),
             help_binding("o / +", "Open agent tab"),
             help_binding("Ctrl+W", "Close tab"),
+            Line::from(""),
             help_section("TASKS & EVENTS"),
             help_binding("e / v", "Events / details"),
             help_binding("u", "Usage & cost"),
@@ -4781,7 +4939,6 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Enter / Shift+Enter", "Message / new line"),
             help_binding("↑ / ↓", "Prompt history"),
             help_binding("Ctrl+Z / Y", "Undo / redo"),
-            Line::from(""),
         ]
     } else {
         vec![
@@ -4795,6 +4952,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Click", "Select agent"),
             help_binding("o / +", "Open agent tab"),
             help_binding("Ctrl+W", "Close agent tab"),
+            Line::from(""),
             help_section("TASKS & EVENTS"),
             help_binding("e", "Events"),
             help_binding("u", "Usage & cost"),
@@ -4813,9 +4971,86 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Shift+Enter", "New line"),
             help_binding("↑ / ↓", "Prompt history"),
             help_binding("Ctrl+Z / Y", "Undo / redo"),
-            Line::from(""),
         ]
     }
+}
+
+fn help_column_binding(key: &str, action: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{key:<11}"),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(action.to_owned(), Style::default().fg(theme::TEXT)),
+    ])
+}
+
+fn help_columns(compact: bool) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let mut left = vec![help_section("NAVIGATION")];
+    let mut right = vec![help_section("TEAM & PROMPT")];
+    if compact {
+        left.extend([
+            help_column_binding("1 / 2", "Team / tasks"),
+            help_column_binding("i", "Inspect tasks"),
+            help_column_binding("Tab", "Switch tabs"),
+            help_column_binding("t / h", "Focus / toggle pane"),
+            help_column_binding("j/k", "Browse agents"),
+            help_column_binding("o / +", "Open agent tab"),
+            help_column_binding("Ctrl+W", "Close tab"),
+            Line::from(""),
+            help_section("TASKS & EVENTS"),
+            help_column_binding("e / v", "Events / details"),
+            help_column_binding("u", "Usage & cost"),
+            help_column_binding("PgUp/Dn", "Scroll inspector"),
+            help_column_binding("r / x", "Retry / cancel"),
+        ]);
+        right.extend([
+            help_column_binding("a / Del", "Add / remove agent"),
+            help_column_binding("c", "Configure / close"),
+            help_column_binding("w", "Workspace"),
+            help_column_binding("+/-/0/f", "Zoom/reset/fit"),
+            help_column_binding("Ctrl+arrows", "Move agent card"),
+            help_column_binding("Enter", "Message agent"),
+            help_column_binding("Shift+Enter", "New line"),
+            help_column_binding("↑ / ↓", "Prompt history"),
+            help_column_binding("Ctrl+Z / Y", "Undo / redo"),
+        ]);
+    } else {
+        left.extend([
+            help_column_binding("1 / 2", "Team / tasks"),
+            help_column_binding("i", "Inspect tasks"),
+            help_column_binding("Tab", "Switch tabs"),
+            help_column_binding("t", "Focus tasks/team"),
+            help_column_binding("h", "Show / hide tasks"),
+            help_column_binding("j / k", "Browse agents"),
+            help_column_binding("Click", "Select agent"),
+            help_column_binding("o / +", "Open agent tab"),
+            help_column_binding("Ctrl+W", "Close agent tab"),
+            Line::from(""),
+            help_section("TASKS & EVENTS"),
+            help_column_binding("e", "Events"),
+            help_column_binding("u", "Usage & cost"),
+            help_column_binding("v", "Output details"),
+            help_column_binding("PgUp/Dn", "Scroll inspector"),
+            help_column_binding("r", "Retry task"),
+            help_column_binding("x", "Cancel task"),
+        ]);
+        right.extend([
+            help_column_binding("a", "Add agent"),
+            help_column_binding("Del", "Remove agent"),
+            help_column_binding("c", "Configure/close"),
+            help_column_binding("w", "Workspace"),
+            help_column_binding("+/-/0/f", "Zoom/reset/fit"),
+            help_column_binding("Ctrl+arrows", "Move agent card"),
+            help_column_binding("Enter", "Message agent"),
+            help_column_binding("Shift+Enter", "New line"),
+            help_column_binding("↑ / ↓", "Prompt history"),
+            help_column_binding("Ctrl+Z / Y", "Undo / redo"),
+        ]);
+    }
+    (left, right)
 }
 
 fn help_lines_width(lines: &[Line<'_>]) -> u16 {
@@ -4855,42 +5090,68 @@ fn help_popup_layout(area: Rect) -> (Rect, bool, bool) {
     let logo_height = logo.as_ref().map_or(0, |image| image.lines.len() as u16);
     let max_width = area.width.saturating_sub(2).min(104);
     let max_height = area.height.saturating_sub(2).min(34);
-    let full_width = help_lines_width(&full_help);
-    let compact_width = help_lines_width(&compact_help);
-    let full_height = u16::try_from(full_help.len()).unwrap_or(u16::MAX);
-    let use_compact = max_height.saturating_sub(2) < full_height;
-    let help_width = if use_compact {
-        compact_width
-    } else {
-        full_width
+    let (full_left, full_right) = help_columns(false);
+    let (compact_left, compact_right) = help_columns(true);
+    let columns_width = |left: &[Line<'_>], right: &[Line<'_>]| {
+        help_lines_width(left)
+            .saturating_add(1)
+            .saturating_add(help_lines_width(right))
     };
-    let can_show_logo = logo_width
-        .saturating_add(2)
-        .saturating_add(help_width)
-        .saturating_add(4)
-        <= max_width
-        && logo_height.saturating_add(2) <= max_height;
+    let full_column_height = full_left.len().max(full_right.len()) as u16;
+    let compact_column_height = compact_left.len().max(compact_right.len()) as u16;
+    let fits_logo = |help_width: u16, help_height: u16| {
+        logo_width
+            .saturating_add(1)
+            .saturating_add(help_width)
+            .saturating_add(6)
+            <= max_width
+            && logo_height.max(help_height).saturating_add(4) <= max_height
+    };
+    let (use_compact, can_show_logo, help_width, content_height) =
+        if fits_logo(columns_width(&full_left, &full_right), full_column_height) {
+            (
+                false,
+                true,
+                columns_width(&full_left, &full_right),
+                logo_height.max(full_column_height),
+            )
+        } else if fits_logo(
+            columns_width(&compact_left, &compact_right),
+            compact_column_height,
+        ) {
+            (
+                true,
+                true,
+                columns_width(&compact_left, &compact_right),
+                logo_height.max(compact_column_height),
+            )
+        } else {
+            let compact_height = u16::try_from(compact_help.len()).unwrap_or(u16::MAX);
+            let full_height = u16::try_from(full_help.len()).unwrap_or(u16::MAX);
+            let compact = max_height.saturating_sub(4) < full_height
+                || help_lines_width(&full_help).saturating_add(6) > max_width;
+            let help_width = if compact {
+                help_lines_width(&compact_help)
+            } else {
+                help_lines_width(&full_help)
+            };
+            (
+                compact,
+                false,
+                help_width,
+                if compact { compact_height } else { full_height },
+            )
+        };
     let width = if can_show_logo {
         logo_width
-            .saturating_add(2)
+            .saturating_add(1)
             .saturating_add(help_width)
-            .saturating_add(4)
+            .saturating_add(6)
     } else {
-        help_width.saturating_add(4)
+        help_width.saturating_add(6)
     }
     .min(max_width);
-    let content_height = if can_show_logo {
-        logo_height.max(if use_compact {
-            u16::try_from(compact_help.len()).unwrap_or(u16::MAX)
-        } else {
-            full_height
-        })
-    } else if use_compact {
-        u16::try_from(compact_help.len()).unwrap_or(u16::MAX)
-    } else {
-        full_height
-    };
-    let height = content_height.saturating_add(2).min(max_height);
+    let height = content_height.saturating_add(4).min(max_height);
     (
         centered_popup(area, width, height),
         use_compact,
@@ -4929,10 +5190,10 @@ fn task_status_visual(status: TaskStatus) -> (&'static str, &'static str, Color)
         TaskStatus::Ready => ("◇", "ready", theme::BLUE),
         TaskStatus::Running => ("▶", "running", theme::AQUA),
         TaskStatus::WaitingApproval => ("◆", "approval", theme::YELLOW),
-        TaskStatus::Blocked => ("!", "blocked", theme::RED),
+        TaskStatus::Blocked => ("↻", "blocked", theme::YELLOW),
         TaskStatus::Completed => ("✓", "completed", theme::GREEN),
         TaskStatus::Failed => ("×", "failed", theme::RED),
-        TaskStatus::Cancelled => ("–", "cancelled", theme::RED),
+        TaskStatus::Cancelled => ("–", "cancelled", theme::MUTED),
     }
 }
 
@@ -5707,14 +5968,24 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             let logo_width = logo.lines.iter().map(Line::width).max().unwrap_or(0) as u16;
             let logo_height = logo.lines.len() as u16;
             let logo_area = Rect::new(content.x, content.y, logo_width, logo_height);
-            let help_area = Rect::new(
-                content.x + logo_width + 2,
+            let (left_help, right_help) = help_columns(compact);
+            let left_width = help_lines_width(&left_help);
+            let right_width = help_lines_width(&right_help);
+            let left_area = Rect::new(
+                content.x + logo_width + 1,
                 content.y,
-                content.width.saturating_sub(logo_width + 2),
+                left_width,
+                content.height,
+            );
+            let right_area = Rect::new(
+                left_area.right() + 1,
+                content.y,
+                right_width,
                 content.height,
             );
             frame.render_widget(Paragraph::new(logo), logo_area);
-            frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), help_area);
+            frame.render_widget(Paragraph::new(left_help), left_area);
+            frame.render_widget(Paragraph::new(right_help), right_area);
         } else {
             frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), content);
         }
@@ -5917,6 +6188,25 @@ fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, appro
     );
 }
 
+fn approval_patch_artifact_ids(reason: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(reason) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if let Some(id) = value.get("artifact_id").and_then(serde_json::Value::as_str) {
+        ids.push(id.to_owned());
+    }
+    if let Some(patches) = value.get("patches").and_then(serde_json::Value::as_array) {
+        ids.extend(patches.iter().filter_map(|patch| {
+            patch
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }));
+    }
+    ids
+}
+
 fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approval: &Approval) {
     if !app.approval_details {
         render_compact_approval(frame, app, approval);
@@ -5992,14 +6282,43 @@ fn render_approval_popup(frame: &mut ratatui::Frame<'_>, app: &AppModel, approva
                 lines.push(Line::from(format!("    • {}", sanitize(&criterion))));
             }
         }
+    } else if approval.action == "file.patch" {
+        let patch_ids = approval_patch_artifact_ids(&approval.reason);
+        if patch_ids.is_empty() {
+            push_text_lines(&mut lines, &sanitize(&approval.reason), "  ");
+        } else {
+            let paths = app
+                .artifacts
+                .iter()
+                .filter(|artifact| patch_ids.contains(&artifact.id.to_string()))
+                .map(|artifact| artifact.location.as_str())
+                .collect::<Vec<_>>();
+            lines.push(Line::from(format!(
+                "  Proposed files: {}",
+                paths.join(", ")
+            )));
+        }
     } else {
         push_text_lines(&mut lines, &sanitize(&approval.reason), "  ");
     }
-    if let Some(artifact) = app
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.producer == approval.task_id)
-    {
+    let patch_ids = if approval.action == "file.patch" {
+        approval_patch_artifact_ids(&approval.reason)
+    } else {
+        Vec::new()
+    };
+    let previews = if patch_ids.is_empty() {
+        app.artifacts
+            .iter()
+            .find(|artifact| artifact.producer == approval.task_id)
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        app.artifacts
+            .iter()
+            .filter(|artifact| patch_ids.contains(&artifact.id.to_string()))
+            .collect::<Vec<_>>()
+    };
+    for artifact in previews {
         lines.push(Line::from(""));
         popup_section_into(&mut lines, "PREVIEW");
         lines.push(Line::from(Span::styled(
@@ -6197,6 +6516,55 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[tokio::test]
+    async fn startup_builder_task_records_result_and_failure() {
+        let repository = SqliteRepository::open_in_memory().await.unwrap();
+        let session_id = SessionId::new();
+        for (result, expected_status) in [
+            (
+                Ok((
+                    crate::onboarding::SetupDraft {
+                        developers: Vec::new(),
+                        working_directory: PathBuf::new(),
+                    },
+                    "Team generated".to_owned(),
+                )),
+                TaskStatus::Completed,
+            ),
+            (Err("provider unavailable".to_owned()), TaskStatus::Failed),
+        ] {
+            let mut task = Task::root(
+                AgentId::new(),
+                "team builder prompt",
+                vec![],
+                Default::default(),
+            );
+            task.transition(TaskStatus::Ready).unwrap();
+            task.transition(TaskStatus::Running).unwrap();
+            let task_id = task.id;
+            repository.save_task(task).await.unwrap();
+
+            finish_startup_task(&repository, session_id, task_id, &result)
+                .await
+                .unwrap();
+
+            let saved = repository.task(task_id).await.unwrap().unwrap();
+            assert_eq!(saved.status, expected_status);
+            assert_eq!(
+                saved.result.as_ref().map(|result| result.summary.as_str()),
+                (expected_status == TaskStatus::Completed).then_some("Team generated")
+            );
+            let events = repository.events(session_id).await.unwrap();
+            assert!(events.iter().any(|event| {
+                event.task_id == Some(task_id)
+                    && matches!(
+                        event.kind,
+                        CanonicalEventKind::TaskTransition { to, .. } if to == expected_status
+                    )
+            }));
+        }
+    }
 
     #[test]
     fn resize_redraws_immediately_and_preserves_input_with_help_open() {
@@ -6445,6 +6813,8 @@ mod tests {
         let unrelated = Task::root(backend.id, "Other app", vec![], Default::default());
         app.agents = vec![lead, backend];
         app.tasks = vec![root.clone(), child.clone(), unrelated.clone()];
+        app.push_scoped_event(Some(root.id), &CanonicalEventKind::TaskCreated);
+        app.push_scoped_event(Some(child.id), &CanonicalEventKind::TaskCreated);
         app.push_scoped_event(
             Some(child.id),
             &CanonicalEventKind::TaskDelegated {
@@ -6479,6 +6849,10 @@ mod tests {
                 .join("\n")
         };
         let text = render(&app);
+        assert!(
+            text.contains("Build tracker") && text.contains("Build API"),
+            "{text}"
+        );
         assert!(
             text.find("─↳ Lead → Backend").unwrap() < text.find("Fix the failing check").unwrap()
         );
@@ -8047,17 +8421,34 @@ mod tests {
             colored_logo_cells > 10,
             "ANSI logo should retain its colors"
         );
-        let (_, compact, _) = help_popup_layout(Rect::new(0, 0, 112, 32));
+        let (_, compact, show_logo) = help_popup_layout(Rect::new(0, 0, 112, 32));
+        assert!(
+            show_logo,
+            "wide help layout should keep the logo and columns"
+        );
         assert!(rendered.contains(if compact {
             "Add / remove agent"
         } else {
             "Add agent"
         }));
+        assert!(rendered.contains("TASKS & EVENTS"));
+        assert!(rendered.contains("TEAM & PROMPT"));
+        assert!(rendered.contains("Move agent card"));
         assert!(popup.width < 104, "popup should fit its content: {popup:?}");
         assert!(popup.width > 60, "logo and help list should fit: {popup:?}");
-        assert!(
-            usize::from(popup.height) >= help_lines(compact).len() + 2,
-            "popup should leave room for the help list and its padding: {popup:?}"
+        let content_rows = if show_logo {
+            let (left, right) = help_columns(compact);
+            left.len().max(right.len()).max(
+                crate::onboarding::animated_logo_text_for(theme::SURFACE)
+                    .map_or(0, |logo| logo.lines.len()),
+            )
+        } else {
+            help_lines(compact).len()
+        };
+        assert_eq!(
+            usize::from(popup.height),
+            content_rows + 4,
+            "popup should wrap tightly around its content: {popup:?}"
         );
         assert!(rendered.contains("[?] / [Esc] close · [q] safe exit"));
         let title_row = (0..112)
@@ -8988,11 +9379,13 @@ mod tests {
             DelegationProposal {
                 target_agent: backend_agent.name.clone(),
                 objective: "Create calculator API".into(),
+                owned_paths: vec!["backend".into()],
                 acceptance_criteria: vec!["API responds".into()],
             },
             DelegationProposal {
                 target_agent: frontend_agent.name.clone(),
                 objective: "Create calculator interface".into(),
+                owned_paths: vec!["frontend".into()],
                 acceptance_criteria: vec!["UI calls API".into()],
             },
         ];
@@ -9062,11 +9455,13 @@ mod tests {
             DelegationProposal {
                 target_agent: "Backend".into(),
                 objective: "Create calculator API".into(),
+                owned_paths: vec!["backend".into()],
                 acceptance_criteria: vec!["API responds".into()],
             },
             DelegationProposal {
                 target_agent: "Frontend".into(),
                 objective: "Create calculator interface".into(),
+                owned_paths: vec!["frontend".into()],
                 acceptance_criteria: vec!["UI calls API".into()],
             },
         ];

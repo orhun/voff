@@ -1,4 +1,4 @@
-//! Near-black, blue-toned terminal palette with restrained burnt-orange accents.
+//! High-contrast navy terminal palette with vivid voff-orange and blue accents.
 
 use ratatui::style::{Color, Style};
 

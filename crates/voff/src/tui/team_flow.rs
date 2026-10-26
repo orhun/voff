@@ -82,7 +82,7 @@ impl AgentCard {
         };
         let status_text = self.activity.as_ref().map_or_else(
             || status_label.to_owned(),
-            |activity| format!("{status_label} · {activity}"),
+            |activity| format!("({activity})"),
         );
         let status = Line::from(vec![Span::styled(
             format!("{status_symbol} {status_text}"),
@@ -676,7 +676,7 @@ fn agent_card(agent: &AgentProfile, snapshot: &TeamSnapshot<'_>, agent_color: Co
         model,
         task,
         focus,
-        activity: None,
+        activity: display_task.and_then(task_timing_label),
         response,
         usage,
         estimated_cost,
@@ -1332,23 +1332,61 @@ fn agent_status(tasks: &[Task], agent: &AgentProfile, pending: bool) -> (&'stati
     ("idle", theme::TEXT)
 }
 
+pub(super) fn task_timing_label(task: &Task) -> Option<String> {
+    let (label, duration) = match task.status {
+        TaskStatus::Running => (
+            "running for",
+            chrono::Utc::now()
+                .signed_duration_since(task.created_at)
+                .to_std()
+                .unwrap_or_default(),
+        ),
+        TaskStatus::Completed => (
+            "completed in",
+            task.updated_at
+                .signed_duration_since(task.created_at)
+                .to_std()
+                .unwrap_or_default(),
+        ),
+        _ => return None,
+    };
+    Some(format!("{label} {}", format_elapsed(duration)))
+}
+
+fn format_elapsed(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    match (hours, minutes, seconds) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, 0) => format!("{minutes}m"),
+        (0, minutes, seconds) => format!("{minutes}m {seconds}s"),
+        (hours, 0, 0) => format!("{hours}h"),
+        (hours, 0, seconds) => format!("{hours}h {seconds}s"),
+        (hours, minutes, 0) => format!("{hours}h {minutes}m"),
+        (hours, minutes, seconds) => format!("{hours}h {minutes}m {seconds}s"),
+    }
+}
+
 const fn task_status_presentation(status: TaskStatus) -> (&'static str, Color) {
     match status {
         TaskStatus::Running => ("working", theme::GREEN),
         TaskStatus::WaitingApproval => ("approval", theme::YELLOW),
         TaskStatus::Ready => ("ready", theme::AQUA),
         TaskStatus::Queued => ("queued", theme::BLUE),
-        TaskStatus::Blocked => ("blocked", theme::RED),
+        TaskStatus::Blocked => ("blocked", theme::YELLOW),
         TaskStatus::Failed => ("failed", theme::RED),
         TaskStatus::Completed => ("complete", theme::GREEN),
-        TaskStatus::Cancelled => ("cancelled", theme::RED),
+        TaskStatus::Cancelled => ("cancelled", theme::MUTED),
     }
 }
 
 fn status_symbol(status: &str) -> &'static str {
     match status {
         "complete" => "✓",
-        "failed" | "blocked" => "!",
+        "failed" => "!",
+        "blocked" => "↻",
         "approval" => "?",
         _ => "○",
     }

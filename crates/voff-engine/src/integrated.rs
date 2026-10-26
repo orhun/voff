@@ -11,12 +11,54 @@ struct Plan {
     integration: DelegationProposal,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum WorkDelegation {
     Plan(Plan),
     Single(DelegationProposal),
     Verification(VerificationAssignment),
+}
+
+impl WorkDelegation {
+    fn parse(json: &str) -> Result<Self, EngineError> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        let Some(object) = value.as_object() else {
+            return Err(invalid("task.delegate arguments must be a JSON object"));
+        };
+
+        if object.contains_key("shared_contract") || object.contains_key("integration") {
+            return serde_json::from_value(value)
+                .map(Self::Plan)
+                .map_err(|error| {
+                    invalid(format!("invalid contract-first delegation plan: {error}"))
+                });
+        }
+        if object.contains_key("objective") {
+            return serde_json::from_value(value)
+                .map(Self::Single)
+                .map_err(|error| invalid(format!("invalid single delegation: {error}")));
+        }
+        if object.contains_key("target_agent") {
+            return serde_json::from_value(value)
+                .map(Self::Verification)
+                .map_err(|error| invalid(format!("invalid verification handoff: {error}")));
+        }
+        if object.contains_key("proposals") {
+            let batch: DelegationBatch = serde_json::from_value(value)
+                .map_err(|error| invalid(format!("invalid delegation proposals: {error}")))?;
+            return match batch.proposals.as_slice() {
+                [proposal] => Ok(Self::Single(proposal.clone())),
+                [] => Err(invalid(
+                    "delegation proposals must include at least one task",
+                )),
+                _ => Err(invalid(
+                    "multi-workstream delegation requires shared_contract, proposals, and integration",
+                )),
+            };
+        }
+
+        Err(invalid(
+            "task.delegate expects a contract-first plan, one task proposal, or a verification handoff",
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -92,6 +134,38 @@ pub(super) fn is_implementation_objective(objective: &str) -> bool {
 
 pub(super) fn verification_only(task: &Task) -> bool {
     verification_kind(task).is_some() && !is_implementation_objective(&task.objective)
+}
+
+pub(super) fn dedicated_validation_target<'a>(
+    task: &Task,
+    lead: &AgentProfile,
+    targets: &'a [AgentProfile],
+) -> Option<&'a AgentProfile> {
+    if task.work.is_none()
+        || task.requested_target.is_some()
+        || task.limits.max_children < 2
+        || verification_only(task)
+        || verification_kind(task).is_none()
+        || !lead.tools.iter().any(|tool| tool == "task.delegate")
+    {
+        return None;
+    }
+
+    let validator = targets.iter().find(|target| {
+        if target.id == lead.id || !target.tools.iter().any(|tool| tool == "process.test") {
+            return false;
+        }
+        let identity = format!("{} {}", target.name, target.role).to_lowercase();
+        ["validat", "verif", "test", "quality", "qa"]
+            .iter()
+            .any(|marker| identity.contains(marker))
+    })?;
+    targets
+        .iter()
+        .any(|target| {
+            target.id != validator.id && target.tools.iter().any(|tool| tool == "file.patch")
+        })
+        .then_some(validator)
 }
 
 fn verification_kind_for_objective(objective: &str) -> Option<VerificationKind> {
@@ -188,7 +262,7 @@ mod tests {
                 .contains("temporary working directory is not the configured workspace")
         );
         let mut tools = Vec::new();
-        configure_tools(&mut tools, &[], 0);
+        configure_tools(&mut tools, &[], 0, None);
         assert!(tools.iter().any(|tool| tool.name == "task.blocked"));
     }
 
@@ -488,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prose_or_patch_cannot_bypass_acceptance_and_turn_budget_survives_retry() {
+    async fn prose_or_patch_cannot_bypass_acceptance_and_turn_count_survives_retry() {
         let (engine, repo, mut task, _) = fixture().await;
         task.status = TaskStatus::Running;
         task.work.as_mut().unwrap().turns = 32;
@@ -503,19 +577,6 @@ mod tests {
         repo.save_task(task.clone()).await.unwrap();
         let retry = engine.retry_task(task.id).await.unwrap();
         assert_eq!(retry.work.as_ref().unwrap().turns, 32);
-        engine.mark_ready(retry.id).await.unwrap();
-        assert!(
-            engine
-                .run_task(retry.id)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("32-turn")
-        );
-        assert_eq!(
-            repo.task(retry.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
-        );
     }
 
     #[test]
@@ -596,6 +657,7 @@ mod tests {
         implementation.parent = Some(parent.id);
         implementation.work = Some(WorkProgress {
             contract: "one API contract".into(),
+            owned_paths: Vec::new(),
             integration: false,
             turns: 2,
         });
@@ -660,30 +722,73 @@ struct CriterionEvidence {
     explanation: String,
 }
 
-pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String], limit: u16) {
+pub(super) fn configure_tools(
+    tools: &mut Vec<ToolDefinition>,
+    targets: &[String],
+    limit: u16,
+    required_validator: Option<&str>,
+) {
     tools.retain(|tool| {
         tool.name != "review.request" && !(tool.name == "task.delegate" && limit == 0)
     });
     if let Some(tool) = tools.iter_mut().find(|tool| tool.name == "task.delegate") {
+        let implementation_targets = targets
+            .iter()
+            .map(String::as_str)
+            .filter(|target| Some(*target) != required_validator)
+            .collect::<Vec<_>>();
         let item = serde_json::json!({"type":"object","properties":{
             "target_agent":{"type":"string","enum":targets},"objective":{"type":"string"},
+            "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
             "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
         },"required":["target_agent","objective","acceptance_criteria"],"additionalProperties":false});
+        let plan_item = serde_json::json!({"type":"object","properties":{
+            "target_agent":{"type":"string","enum":implementation_targets},"objective":{"type":"string"},
+            "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
+            "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
+        },"required":["target_agent","objective","owned_paths","acceptance_criteria"],"additionalProperties":false});
         let verification = serde_json::json!({"type":"object","properties":{
             "target_agent":{"type":"string","enum":targets}
         },"required":["target_agent"],"additionalProperties":false});
         let mut alternatives = vec![verification, item.clone()];
         if limit >= 2 {
-            alternatives.insert(
-                0,
-                serde_json::json!({"type":"object","properties":{
+            let integration = if let Some(validator) = required_validator {
+                serde_json::json!({
+                    "type":"object",
+                    "properties":{
+                        "target_agent":{"type":"string","enum":[validator]},
+                        "objective":{"type":"string"},
+                        "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
+                        "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
+                    },
+                    "required":["target_agent","objective","acceptance_criteria"],
+                    "additionalProperties":false
+                })
+            } else {
+                item.clone()
+            };
+            let plan = serde_json::json!({"type":"object","properties":{
                     "shared_contract":{"type":"string"},
-                    "proposals":{"type":"array","minItems":1,"maxItems":limit.saturating_sub(1),"items":item},
-                    "integration":item
-                },"required":["shared_contract","proposals","integration"],"additionalProperties":false}),
-            );
+                    "proposals":{"type":"array","minItems":1,"maxItems":limit.saturating_sub(1),"items":plan_item},
+                    "integration":integration
+                },"required":["shared_contract","proposals","integration"],"additionalProperties":false});
+            if required_validator.is_some() {
+                alternatives = vec![plan];
+            } else {
+                alternatives.insert(0, plan);
+            }
         }
-        tool.description = tool_descriptions::DELEGATE.into();
+        tool.description = if let Some(validator) = required_validator {
+            format!(
+                "{} This request requires independent verification. Assign implementation in proposals and assign the integration task to {validator}; integration must inspect the combined result and run the requested verification after implementation completes.",
+                tool_descriptions::DELEGATE
+            )
+        } else {
+            format!(
+                "{} Multi-workstream plans require explicit disjoint owned_paths for every implementation proposal; integration waits for them.",
+                tool_descriptions::DELEGATE
+            )
+        };
         tool.input_schema = serde_json::json!({"type":"object","oneOf": alternatives}).to_string();
     }
     tools.push(ToolDefinition {
@@ -706,11 +811,111 @@ pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String
     });
 }
 
-fn invalid(message: &str) -> EngineError {
+fn invalid(message: impl Into<String>) -> EngineError {
     EngineError::InvalidDelegationPlan(message.into())
 }
 
+fn validate_plan_ownership(proposals: &[DelegationProposal]) -> Result<(), EngineError> {
+    let mut claimed = Vec::<&Path>::new();
+    for proposal in proposals {
+        if proposal.owned_paths.is_empty() {
+            return Err(invalid(
+                "each parallel implementation needs explicit owned_paths",
+            ));
+        }
+        for path in &proposal.owned_paths {
+            if path.as_os_str().is_empty()
+                || path.is_absolute()
+                || path.components().any(|component| {
+                    !matches!(component, std::path::Component::Normal(_))
+                        || matches!(component, std::path::Component::Normal(name)
+                            if [".voff", ".ssh", ".aws", ".codex", ".claude"]
+                                .iter()
+                                .any(|denied| name == std::ffi::OsStr::new(denied)))
+                })
+            {
+                return Err(invalid(
+                    "owned_paths must be safe, workspace-relative paths",
+                ));
+            }
+            if claimed
+                .iter()
+                .any(|existing| path.starts_with(existing) || existing.starts_with(path))
+            {
+                return Err(invalid(
+                    "parallel implementation owned_paths must not overlap",
+                ));
+            }
+            claimed.push(path);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn task_owns_path(task: &Task, path: &Path) -> bool {
+    task.work.as_ref().is_none_or(|work| {
+        work.integration
+            || work.owned_paths.is_empty()
+            || work.owned_paths.iter().any(|scope| path.starts_with(scope))
+    })
+}
+
 impl<R: Repository + 'static> Engine<R> {
+    pub(super) async fn workspace_context_for_task(
+        &self,
+        task: &Task,
+    ) -> Result<Option<String>, EngineError> {
+        let Some(workspace) = &self.workspace else {
+            return Ok(self.workspace_context.clone());
+        };
+        let mut scopes = task
+            .work
+            .as_ref()
+            .map(|work| work.owned_paths.clone())
+            .unwrap_or_default();
+        if task.work.as_ref().is_some_and(|work| work.integration) {
+            let dependency_ids = self
+                .repo
+                .dependencies()
+                .await?
+                .into_iter()
+                .filter(|dependency| dependency.task_id == task.id)
+                .map(|dependency| dependency.depends_on)
+                .collect::<HashSet<_>>();
+            scopes.extend(
+                self.repo
+                    .artifacts()
+                    .await?
+                    .into_iter()
+                    .filter(|artifact| {
+                        dependency_ids.contains(&artifact.producer)
+                            && matches!(artifact.kind.as_str(), "patch" | "file_read")
+                    })
+                    .map(|artifact| PathBuf::from(artifact.location)),
+            );
+            scopes.sort();
+            scopes.dedup();
+        }
+        let include_overview = task.work.as_ref().is_none_or(|work| work.turns <= 1);
+        let mut context =
+            workspace.context_bundle_for_paths(&scopes, include_overview, 40, 16 * 1024)?;
+        let feedback = self
+            .repo
+            .artifacts()
+            .await?
+            .into_iter()
+            .filter(|artifact| artifact.producer == task.id && artifact.kind == "workflow_feedback")
+            .map(|artifact| artifact.preview)
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>();
+        if !feedback.is_empty() {
+            context.push_str("\n\nHost workflow feedback (address before completion):\n");
+            context.push_str(&feedback.into_iter().rev().collect::<Vec<_>>().join("\n"));
+        }
+        Ok(Some(context))
+    }
+
     pub(super) async fn validate_integrated_plan(
         &self,
         task: &Task,
@@ -720,9 +925,19 @@ impl<R: Repository + 'static> Engine<R> {
         if !agent.tools.iter().any(|tool| tool == "task.delegate") {
             return Err(invalid("task owner cannot delegate"));
         }
-        let delegation: WorkDelegation = serde_json::from_str(json)?;
+        let delegation = WorkDelegation::parse(json)?;
+        let targets = self
+            .enabled_delegation_targets(&agent.allowed_targets)
+            .await?;
+        let required_validator = dedicated_validation_target(task, agent, &targets);
         let plan = match delegation {
             WorkDelegation::Verification(assignment) => {
+                if let Some(validator) = required_validator {
+                    return Err(invalid(format!(
+                        "this implementation request requires an implementation proposal and an integration handoff to {}",
+                        validator.name
+                    )));
+                }
                 if self
                     .repo
                     .tasks()
@@ -737,6 +952,7 @@ impl<R: Repository + 'static> Engine<R> {
                 let proposal = DelegationProposal {
                     target_agent: assignment.target_agent,
                     objective: task.objective.clone(),
+                    owned_paths: Vec::new(),
                     acceptance_criteria: task.acceptance_criteria.clone(),
                 };
                 self.validate_delegation_proposals(task, agent, std::slice::from_ref(&proposal))
@@ -753,6 +969,12 @@ impl<R: Repository + 'static> Engine<R> {
                 return Ok(());
             }
             WorkDelegation::Single(proposal) => {
+                if let Some(validator) = required_validator {
+                    return Err(invalid(format!(
+                        "this implementation request requires a contract-first plan with its integration task assigned to {}",
+                        validator.name
+                    )));
+                }
                 if self
                     .repo
                     .tasks()
@@ -796,7 +1018,28 @@ impl<R: Repository + 'static> Engine<R> {
                 }
                 return Ok(());
             }
-            WorkDelegation::Plan(plan) => plan,
+            WorkDelegation::Plan(plan) => {
+                if let Some(validator) = required_validator
+                    && plan.integration.target_agent != validator.name
+                {
+                    return Err(invalid(format!(
+                        "assign the integration task to the configured verification report {}",
+                        validator.name
+                    )));
+                }
+                if let Some(validator) = required_validator
+                    && plan
+                        .proposals
+                        .iter()
+                        .any(|proposal| proposal.target_agent == validator.name)
+                {
+                    return Err(invalid(format!(
+                        "keep the validation report {} independent; assign implementation proposals to another report",
+                        validator.name
+                    )));
+                }
+                plan
+            }
         };
         if plan.shared_contract.trim().is_empty()
             || plan.shared_contract.len() > 32_768
@@ -806,6 +1049,7 @@ impl<R: Repository + 'static> Engine<R> {
                 "plan requires a nonempty shared contract (up to 32768 bytes), implementation tasks, and integration",
             ));
         }
+        validate_plan_ownership(&plan.proposals)?;
         if self
             .repo
             .tasks()
@@ -872,7 +1116,7 @@ impl<R: Repository + 'static> Engine<R> {
             .ok_or(EngineError::TaskNotFound)?;
         self.validate_integrated_plan(&parent, &agent, &approval.reason)
             .await?;
-        let delegation: WorkDelegation = serde_json::from_str(&approval.reason)?;
+        let delegation = WorkDelegation::parse(&approval.reason)?;
         let plan = match delegation {
             WorkDelegation::Verification(assignment) => {
                 let check = match verification_kind(&parent) {
@@ -898,6 +1142,7 @@ impl<R: Repository + 'static> Engine<R> {
                         "Verification handoff for task {}: {}",
                         parent.id, parent.objective
                     ),
+                    owned_paths: Vec::new(),
                     integration: true,
                     turns: 0,
                 });
@@ -930,7 +1175,8 @@ impl<R: Repository + 'static> Engine<R> {
                     .await?;
                 child.work = Some(WorkProgress {
                     contract: format!("Bounded handoff from parent task {}", parent.id),
-                    integration: true,
+                    owned_paths: Vec::new(),
+                    integration: false,
                     turns: 0,
                 });
                 self.repo.save_task(child.clone()).await?;
@@ -958,6 +1204,7 @@ impl<R: Repository + 'static> Engine<R> {
             .chain(std::iter::once(plan.integration))
             .enumerate()
         {
+            let owned_paths = proposal.owned_paths.clone();
             let owner = self
                 .delegation_target(&proposal.target_agent)
                 .await?
@@ -972,6 +1219,11 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?;
             child.work = Some(WorkProgress {
                 contract: plan.shared_contract.clone(),
+                owned_paths: if index < count {
+                    owned_paths
+                } else {
+                    Vec::new()
+                },
                 integration: index == count,
                 turns: 0,
             });
@@ -998,52 +1250,124 @@ impl<R: Repository + 'static> Engine<R> {
         };
         let tasks = self.repo.tasks().await?;
         let retry_lineage = retry_lineage_ids(task, &tasks);
-        let artifacts = self
+        let artifact_times = self
+            .repo
+            .events(self.session)
+            .await?
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                CanonicalEventKind::ArtifactPublished { artifact_id, .. } => {
+                    Some((artifact_id, event.created_at))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let mut artifact_records = self
             .repo
             .artifacts()
             .await?
             .into_iter()
             .filter(|artifact| retry_lineage.contains(&artifact.producer))
-            .map(|a| {
+            .collect::<Vec<_>>();
+        artifact_records.sort_by_key(|artifact| artifact_times.get(&artifact.id).copied());
+        let mut latest = HashMap::new();
+        for artifact in &artifact_records {
+            if artifact.producer == task.id
+                && matches!(
+                    artifact.kind.as_str(),
+                    "file_read"
+                        | "search_result"
+                        | "test_report"
+                        | "workflow_feedback"
+                        | "task_checkpoint"
+                )
+            {
+                latest.insert(
+                    (artifact.kind.clone(), artifact.location.clone()),
+                    artifact.id,
+                );
+            }
+        }
+        let artifact_list = artifact_records
+            .iter()
+            .rev()
+            .map(|artifact| {
                 let attempt = tasks
                     .iter()
-                    .find(|candidate| candidate.id == a.producer)
+                    .find(|candidate| candidate.id == artifact.producer)
                     .map_or(task.attempt, |candidate| candidate.attempt);
-                format!(
-                    "{} · attempt {} · {} · {}\n{}",
-                    a.id,
-                    attempt,
-                    a.kind,
-                    a.location,
-                    a.preview.chars().take(2000).collect::<String>()
-                )
+                let show_preview = artifact.producer == task.id
+                    && latest.get(&(artifact.kind.clone(), artifact.location.clone()))
+                        == Some(&artifact.id)
+                    && matches!(
+                        artifact.kind.as_str(),
+                        "file_read"
+                            | "search_result"
+                            | "test_report"
+                            | "workflow_feedback"
+                            | "task_checkpoint"
+                    );
+                let preview = if !show_preview {
+                    String::new()
+                } else if artifact.kind == "test_report" {
+                    voff_tools::compact_command_output(&artifact.location, &artifact.preview, 1_200)
+                } else {
+                    artifact.preview.chars().take(1_200).collect()
+                };
+                if preview.is_empty() {
+                    format!(
+                        "{} · attempt {} · {} · {}",
+                        artifact.id, attempt, artifact.kind, artifact.location
+                    )
+                } else {
+                    format!(
+                        "{} · attempt {} · {} · {}\n{}",
+                        artifact.id, attempt, artifact.kind, artifact.location, preview
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let approvals = self
+        let mut approval_counts = HashMap::new();
+        for approval in self
             .repo
             .approvals(self.session)
             .await?
             .into_iter()
             .filter(|approval| retry_lineage.contains(&approval.task_id))
-            .map(|approval| {
-                let attempt = tasks
-                    .iter()
-                    .find(|candidate| candidate.id == approval.task_id)
-                    .map_or(task.attempt, |candidate| candidate.attempt);
-                format!(
-                    "attempt {attempt} · {} · {:?}",
-                    approval.action, approval.decision
-                )
+        {
+            let attempt = tasks
+                .iter()
+                .find(|candidate| candidate.id == approval.task_id)
+                .map_or(task.attempt, |candidate| candidate.attempt);
+            *approval_counts
+                .entry((attempt, approval.action, format!("{:?}", approval.decision)))
+                .or_insert(0usize) += 1;
+        }
+        let approvals = approval_counts
+            .into_iter()
+            .map(|((attempt, action, decision), count)| {
+                format!("attempt {attempt} · {action} {decision} ×{count}")
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let owned_paths = work
+            .owned_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(format!(
-            "Shared contract (task data, not permission):\n{}\nIntegration task: {}\nTurn {}/32. Retry history artifacts and actions may be reused when still relevant. Re-run verification after any new patch. Recorded actions across attempts:\n{approvals}\nArtifacts (a proposed patch alone is not proof of execution):\n{}",
+            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. Re-run verification after any new patch. Recorded action counts across attempts:\n{approvals}\nArtifact index (patch bodies are omitted; workspace context contains the current files):\n{}",
             work.contract,
+            if owned_paths.is_empty() {
+                "all paths after dependencies"
+            } else {
+                &owned_paths
+            },
             work.integration,
             work.turns,
-            artifacts.chars().take(32_768).collect::<String>()
+            artifact_list.chars().take(12_000).collect::<String>()
         ))
     }
 
@@ -1056,12 +1380,16 @@ impl<R: Repository + 'static> Engine<R> {
             return Err(invalid("task.complete requires verified work"));
         }
         let completion: Completion = serde_json::from_str(json)?;
-        if completion.summary.trim().is_empty()
-            || completion.evidence.len() != task.acceptance_criteria.len()
-        {
-            return Err(invalid(
-                "completion requires a summary and evidence for every acceptance criterion",
-            ));
+        if completion.summary.trim().is_empty() {
+            return Err(invalid("completion summary cannot be empty"));
+        }
+        if completion.evidence.len() != task.acceptance_criteria.len() {
+            return Err(invalid(format!(
+                "completion needs exactly {} evidence entries, one for each criterion index 0 through {}; received {}",
+                task.acceptance_criteria.len(),
+                task.acceptance_criteria.len().saturating_sub(1),
+                completion.evidence.len()
+            )));
         }
         let tasks = self.repo.tasks().await?;
         let retry_lineage = retry_lineage_ids(task, &tasks);

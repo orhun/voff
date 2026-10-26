@@ -3,12 +3,12 @@
   <br>
   <b>Workflow builder for coding agents 🐶</b>
   <br><br>
-  <a href="https://github.com/orhun/voff/releases"><img src="https://img.shields.io/github/v/release/orhun/voff?include_prereleases&style=flat&labelColor=1C1C1D&color=FA5D00&logo=github&logoColor=white" alt="GitHub release"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.92%2B?style=flat&labelColor=1C1C1D&color=FA5D00&logo=rust&logoColor=white" alt="Rust 1.92 or newer"></a>
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0?style=flat&labelColor=1C1C1D&color=FA5D00" alt="MIT or Apache 2.0 license"></a>
+  <a href="https://github.com/voffsh/voff/releases"><img src="https://img.shields.io/github/v/release/voffsh/voff?include_prereleases&style=flat&labelColor=1C1C1D&color=FA5D00&logo=github&logoColor=white" alt="GitHub release"></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-FA5D00?style=flat&labelColor=1C1C1D" alt="MIT or Apache-2.0 license"></a>
   <br>
   <a href="https://crates.io/crates/voff"><img src="https://img.shields.io/crates/v/voff?style=flat&labelColor=1C1C1D&color=FA5D00&logo=Rust&logoColor=white" alt="Crate release"></a>
-  <a href="https://github.com/orhun/voff/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/orhun/voff/ci.yml?branch=main&style=flat&labelColor=1C1C1D&color=FA5D00&logo=GitHub%20Actions&logoColor=white&label=CI" alt="Continuous Integration"></a>
+  <a href="https://github.com/voffsh/voff/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/voffsh/voff/ci.yml?branch=main&style=flat&labelColor=1C1C1D&color=FA5D00&logo=GitHub%20Actions&logoColor=white&label=CI" alt="Continuous Integration"></a>
+  <a href="https://github.com/voffsh/voff/actions/workflows/cd.yml"><img src="https://img.shields.io/github/actions/workflow/status/voffsh/voff/cd.yml?branch=main&style=flat&labelColor=1C1C1D&color=FA5D00&logo=GitHub%20Actions&logoColor=white&label=CD" alt="Continuous Deployment"></a>
 </p>
 
 <p align="center">
@@ -110,8 +110,6 @@ Available tools depend on the agent:
 | `review.request` | Request an agent review         |
 | `task.complete`  | Report completion with evidence |
 | `task.blocked`   | Report why work cannot continue |
-
-Commands cannot request network access, installation, publication, deployment or destructive actions.
 
 ## Configuration
 
