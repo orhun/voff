@@ -1,20 +1,20 @@
-//! Near-black, blue-toned terminal palette with restrained burnt-orange accents.
+//! High-contrast navy terminal palette with vivid voff-orange and blue accents.
 
 use ratatui::style::{Color, Style};
 
-pub const BACKGROUND: Color = Color::Rgb(3, 8, 14);
-pub const SURFACE: Color = Color::Rgb(7, 15, 24);
-pub const ELEVATED: Color = Color::Rgb(12, 27, 42);
-pub const BORDER: Color = Color::Rgb(67, 104, 131);
-pub const TEXT: Color = Color::Rgb(230, 241, 249);
-pub const MUTED: Color = Color::Rgb(166, 195, 213);
-pub const ORANGE: Color = Color::Rgb(192, 93, 43);
-pub const YELLOW: Color = Color::Rgb(196, 161, 91);
-pub const AQUA: Color = Color::Rgb(103, 165, 164);
-pub const GREEN: Color = Color::Rgb(124, 165, 138);
-pub const BLUE: Color = Color::Rgb(116, 153, 185);
-pub const PURPLE: Color = Color::Rgb(157, 137, 175);
-pub const RED: Color = Color::Rgb(194, 105, 104);
+pub const BACKGROUND: Color = Color::Rgb(8, 12, 23);
+pub const SURFACE: Color = Color::Rgb(15, 22, 38);
+pub const ELEVATED: Color = Color::Rgb(26, 38, 61);
+pub const BORDER: Color = Color::Rgb(67, 111, 158);
+pub const TEXT: Color = Color::Rgb(235, 241, 255);
+pub const MUTED: Color = Color::Rgb(164, 181, 211);
+pub const ORANGE: Color = Color::Rgb(250, 93, 0);
+pub const YELLOW: Color = Color::Rgb(255, 202, 93);
+pub const AQUA: Color = Color::Rgb(70, 218, 210);
+pub const GREEN: Color = Color::Rgb(91, 220, 153);
+pub const BLUE: Color = Color::Rgb(116, 177, 255);
+pub const PURPLE: Color = Color::Rgb(194, 151, 255);
+pub const RED: Color = Color::Rgb(255, 107, 120);
 
 const AGENT_COLORS: [Color; 32] = [
     ORANGE,
@@ -24,31 +24,31 @@ const AGENT_COLORS: [Color; 32] = [
     BLUE,
     GREEN,
     RED,
-    Color::Rgb(174, 140, 217),
-    Color::Rgb(217, 196, 140),
-    Color::Rgb(140, 215, 217),
-    Color::Rgb(217, 140, 192),
-    Color::Rgb(170, 217, 140),
-    Color::Rgb(140, 148, 217),
-    Color::Rgb(217, 155, 140),
-    Color::Rgb(140, 217, 177),
-    Color::Rgb(200, 140, 217),
-    Color::Rgb(211, 217, 140),
-    Color::Rgb(140, 189, 217),
-    Color::Rgb(217, 140, 167),
-    Color::Rgb(145, 217, 140),
-    Color::Rgb(158, 140, 217),
-    Color::Rgb(217, 181, 140),
-    Color::Rgb(140, 217, 203),
-    Color::Rgb(217, 140, 208),
-    Color::Rgb(186, 217, 140),
-    Color::Rgb(140, 164, 217),
-    Color::Rgb(217, 140, 141),
-    Color::Rgb(140, 217, 162),
-    Color::Rgb(184, 140, 217),
-    Color::Rgb(217, 206, 140),
-    Color::Rgb(140, 205, 217),
-    Color::Rgb(217, 140, 183),
+    Color::Rgb(194, 151, 255),
+    Color::Rgb(255, 202, 93),
+    Color::Rgb(70, 218, 210),
+    Color::Rgb(255, 126, 198),
+    Color::Rgb(145, 235, 111),
+    Color::Rgb(139, 159, 255),
+    Color::Rgb(255, 145, 113),
+    Color::Rgb(91, 220, 153),
+    Color::Rgb(218, 145, 255),
+    Color::Rgb(237, 224, 105),
+    Color::Rgb(116, 195, 255),
+    Color::Rgb(255, 130, 167),
+    Color::Rgb(163, 235, 107),
+    Color::Rgb(171, 145, 255),
+    Color::Rgb(255, 186, 119),
+    Color::Rgb(100, 230, 199),
+    Color::Rgb(244, 146, 226),
+    Color::Rgb(194, 235, 107),
+    Color::Rgb(145, 179, 255),
+    Color::Rgb(255, 134, 139),
+    Color::Rgb(104, 230, 164),
+    Color::Rgb(206, 145, 255),
+    Color::Rgb(255, 216, 105),
+    Color::Rgb(105, 211, 235),
+    Color::Rgb(255, 145, 184),
 ];
 
 /// Assign a stable highlight color by an agent's position in the configured team.

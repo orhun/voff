@@ -3414,6 +3414,10 @@ pub(crate) fn animated_logo_text_for(background: Color) -> Option<Text<'static>>
     const HALF_OPEN: &[u8] = include_bytes!("../assets/logo-blink/half-open-block.ansi");
     const NEARLY_CLOSED: &[u8] = include_bytes!("../assets/logo-blink/nearly-closed-block.ansi");
     const CLOSED: &[u8] = include_bytes!("../assets/logo-blink/closed-block.ansi");
+    const OPEN_CELLS: &[u8] = include_bytes!("../assets/logo-blink/open.rgba");
+    const HALF_OPEN_CELLS: &[u8] = include_bytes!("../assets/logo-blink/half-open.rgba");
+    const NEARLY_CLOSED_CELLS: &[u8] = include_bytes!("../assets/logo-blink/nearly-closed.rgba");
+    const CLOSED_CELLS: &[u8] = include_bytes!("../assets/logo-blink/closed.rgba");
     static BLINK: OnceLock<Mutex<LogoBlink>> = OnceLock::new();
 
     let mut blink = BLINK
@@ -3421,7 +3425,16 @@ pub(crate) fn animated_logo_text_for(background: Color) -> Option<Text<'static>>
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let frame = blink.frame(OPEN, HALF_OPEN, NEARLY_CLOSED, CLOSED);
-    logo_text_from_bytes(frame, background)
+    let cells = if std::ptr::eq(frame.as_ptr(), OPEN.as_ptr()) {
+        OPEN_CELLS
+    } else if std::ptr::eq(frame.as_ptr(), HALF_OPEN.as_ptr()) {
+        HALF_OPEN_CELLS
+    } else if std::ptr::eq(frame.as_ptr(), NEARLY_CLOSED.as_ptr()) {
+        NEARLY_CLOSED_CELLS
+    } else {
+        CLOSED_CELLS
+    };
+    logo_text_from_bytes(frame, cells, background)
 }
 
 struct LogoBlink {
@@ -3488,12 +3501,19 @@ impl LogoBlink {
     }
 }
 
-fn logo_text_from_bytes(bytes: &'static [u8], background: Color) -> Option<Text<'static>> {
+fn logo_text_from_bytes(
+    bytes: &'static [u8],
+    cell_colors: &'static [u8],
+    background: Color,
+) -> Option<Text<'static>> {
     let bytes = bytes.strip_prefix(b"\x1b[?25l").unwrap_or(bytes);
     let bytes = bytes.strip_suffix(b"\x1b[?25h").unwrap_or(bytes);
     let logo = bytes.into_text().ok()?;
-    // The ANSI image uses black *foreground* pixels for its outlines. Treating
-    // black as transparent removes parts of the dog, so crop only blank cells.
+    // ANSI block glyphs retain the original shading. A softened per-cell map
+    // from the GIF fills blank glyphs and smooths the helmet's darkest edge.
+    if cell_colors.len() != 40 * 22 * 4 {
+        return Some(fill_logo_background(logo, background));
+    }
     let mut left = usize::MAX;
     let mut right = 0;
     let mut top = usize::MAX;
@@ -3516,34 +3536,55 @@ fn logo_text_from_bytes(bytes: &'static [u8], background: Color) -> Option<Text<
         if column != line.width() {
             return Some(fill_logo_background(logo, background));
         }
+        // Keep the full 40-column source canvas, including transparent edge
+        // cells, so the logo retains its intended layout width.
+        right = right.max(column);
     }
     if left == usize::MAX {
         return None;
     }
     let mut lines = Vec::new();
-    for line in logo.lines.into_iter().skip(top).take(bottom - top) {
-        let mut row_left = usize::MAX;
-        let mut row_right = 0;
-        let mut row_column = 0;
-        for span in &line.spans {
-            for character in span.content.chars() {
-                if logo_art_cell(character, span.style) {
-                    row_left = row_left.min(row_column);
-                    row_right = row_column + 1;
-                }
-                row_column += 1;
-            }
-        }
+    for (row, line) in logo
+        .lines
+        .into_iter()
+        .enumerate()
+        .skip(top)
+        .take(bottom - top)
+    {
         let mut column = 0;
         let mut spans = Vec::new();
         for span in line.spans {
             for character in span.content.chars() {
                 if (left..right).contains(&column) {
-                    let style = if column < row_left || column >= row_right {
-                        Style::default().bg(background)
-                    } else {
-                        span.style
-                    };
+                    let cell_offset = (row * 40 + column) * 4;
+                    let cell = &cell_colors[cell_offset..cell_offset + 4];
+                    let mut style = span.style;
+                    if character.is_whitespace() && cell[3] != 0 {
+                        style = style.bg(Color::Rgb(cell[0], cell[1], cell[2]));
+                    } else if matches!(
+                        style.bg,
+                        Some(Color::Rgb(0, 0, 0) | Color::Black | Color::Reset) | None
+                    ) {
+                        style = style.bg(if cell[3] == 0 {
+                            background
+                        } else {
+                            Color::Rgb(1, 1, 1)
+                        });
+                    }
+                    if row < 14 && cell[3] != 0 && cell[..3].iter().all(|channel| *channel < 80) {
+                        if style.fg.is_some_and(|foreground| {
+                            matches!(
+                                foreground,
+                                Color::Rgb(red, green, blue)
+                                    if red < 32 && green < 32 && blue < 32
+                            )
+                        }) {
+                            style = style.fg(Color::Rgb(cell[0], cell[1], cell[2]));
+                        }
+                        if style.bg == Some(Color::Rgb(1, 1, 1)) {
+                            style = style.bg(Color::Rgb(cell[0], cell[1], cell[2]));
+                        }
+                    }
                     spans.push(Span::styled(character.to_string(), style));
                 }
                 column += 1;
@@ -3554,7 +3595,7 @@ fn logo_text_from_bytes(bytes: &'static [u8], background: Color) -> Option<Text<
         }
         lines.push(Line::from(spans).style(line.style.bg(background)));
     }
-    Some(fill_logo_background(Text::from(lines), background))
+    Some(Text::from(lines))
 }
 
 fn fill_logo_background(mut logo: Text<'static>, background: Color) -> Text<'static> {
@@ -3574,6 +3615,7 @@ fn fill_logo_background(mut logo: Text<'static>, background: Color) -> Text<'sta
 
 fn logo_art_cell(character: char, style: Style) -> bool {
     !character.is_whitespace()
+        || style.add_modifier.contains(Modifier::REVERSED)
         || style.bg.is_some_and(|background| {
             !matches!(
                 background,
@@ -3592,15 +3634,23 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
     {
         frame.render_widget(Paragraph::new(logo).style(theme::canvas()), logo_area);
     }
-    render_setup(frame, wizard, shell);
+    render_setup(frame, wizard, shell, false);
     render_model_browser(frame, wizard, shell);
 }
 
 pub(crate) fn render_popup(frame: &mut ratatui::Frame<'_>, wizard: &Wizard) {
     let shell = wizard.shell(frame.area());
     frame.render_widget(Clear, shell);
-    frame.render_widget(Block::default().style(theme::surface()), shell);
-    render_setup(frame, wizard, shell);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::surface())
+        .border_style(Style::default().fg(theme::BORDER));
+    if let Some(title) = setup_title(wizard) {
+        block = block.title(title);
+    }
+    frame.render_widget(block, shell);
+    render_setup(frame, wizard, shell, true);
     render_model_browser(frame, wizard, shell);
 }
 
@@ -3672,8 +3722,8 @@ fn render_model_browser(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, shell: 
     frame.set_cursor_position((cursor_x, area.y + 1));
 }
 
-fn render_setup(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, shell: Rect) {
-    let title = if wizard.step == Step::WorkspacePicker {
+fn setup_title(wizard: &Wizard) -> Option<Line<'static>> {
+    if wizard.step == Step::WorkspacePicker {
         let directory = wizard.workspace_explorer.as_ref().map_or_else(
             || wizard.working_directory.display().to_string(),
             |explorer| explorer.cwd().display().to_string(),
@@ -3707,8 +3757,16 @@ fn render_setup(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, shell: Rect) {
                 ),
             ])),
         }
-    };
-    if let Some(title) = title {
+    }
+}
+
+fn render_setup(
+    frame: &mut ratatui::Frame<'_>,
+    wizard: &Wizard,
+    shell: Rect,
+    title_in_block: bool,
+) {
+    if !title_in_block && let Some(title) = setup_title(wizard) {
         frame.render_widget(
             Paragraph::new(title).style(theme::surface()),
             Rect::new(shell.x, shell.y, shell.width, 1),
@@ -4400,6 +4458,21 @@ mod tests {
     }
 
     #[test]
+    fn workspace_picker_popup_restores_its_rounded_border() {
+        let directory = tempfile::tempdir().unwrap();
+        let wizard = Wizard::workspace(directory.path());
+        let area = Rect::new(0, 0, 100, 32);
+        let shell = wizard.shell(area);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| render_popup(frame, &wizard)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(shell.x, shell.y)].symbol(), "╭");
+        assert_eq!(buffer[(shell.right() - 1, shell.y)].symbol(), "╮");
+        assert_eq!(buffer[(shell.x, shell.bottom() - 1)].symbol(), "╰");
+        assert_eq!(buffer[(shell.x, shell.y)].fg, theme::BORDER);
+    }
+
+    #[test]
     fn startup_configures_only_team_lead() {
         let mut wizard = Wizard::default();
         wizard.handle_key(key(KeyCode::Enter));
@@ -4804,10 +4877,59 @@ mod tests {
     }
 
     #[test]
+    fn bundled_logo_frames_keep_black_pixels_and_canvas_width() {
+        const FRAMES: [(&[u8], &[u8]); 4] = [
+            (
+                include_bytes!("../assets/voff-logo.ansi"),
+                include_bytes!("../assets/logo-blink/open.rgba"),
+            ),
+            (
+                include_bytes!("../assets/logo-blink/half-open-block.ansi"),
+                include_bytes!("../assets/logo-blink/half-open.rgba"),
+            ),
+            (
+                include_bytes!("../assets/logo-blink/nearly-closed-block.ansi"),
+                include_bytes!("../assets/logo-blink/nearly-closed.rgba"),
+            ),
+            (
+                include_bytes!("../assets/logo-blink/closed-block.ansi"),
+                include_bytes!("../assets/logo-blink/closed.rgba"),
+            ),
+        ];
+
+        for (frame, cell_colors) in FRAMES {
+            let logo = logo_text_from_bytes(frame, cell_colors, theme::SURFACE)
+                .expect("bundled ANSI frame should parse");
+            assert!(logo.lines.len() <= 22);
+            assert!(logo.lines.iter().all(|line| line.width() == 40));
+            assert!(
+                logo.lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.style.fg == Some(Color::Rgb(0, 0, 0))),
+                "black foreground pixels must remain visible"
+            );
+            assert!(
+                logo.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.chars().any(char::is_whitespace)
+                        && span.style.bg.is_some_and(|color| {
+                            matches!(color, Color::Rgb(red, green, blue) if red > 0 || green > 0 || blue > 0)
+                        })
+                }),
+                "opaque blank cells must be filled from the source image"
+            );
+        }
+    }
+
+    #[test]
     fn welcome_screen_has_a_clear_start_action() {
         let logo = logo_text().expect("bundled ANSI logo must be parseable");
         assert!(logo.lines.len() <= 22, "logo must fit a 24-row terminal");
-        assert!(logo.lines.iter().all(|line| line.width() == 40));
+        assert!(
+            logo.lines.iter().all(|line| line.width() == 40),
+            "logo widths: {:?}",
+            logo.lines.iter().map(Line::width).collect::<Vec<_>>()
+        );
         assert!(
             logo.lines
                 .iter()

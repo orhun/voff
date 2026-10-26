@@ -4831,6 +4831,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("j/k / click", "Browse / select"),
             help_binding("o / +", "Open agent tab"),
             help_binding("Ctrl+W", "Close tab"),
+            Line::from(""),
             help_section("TASKS & EVENTS"),
             help_binding("e / v", "Events / details"),
             help_binding("u", "Usage & cost"),
@@ -4845,7 +4846,6 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Enter / Shift+Enter", "Message / new line"),
             help_binding("↑ / ↓", "Prompt history"),
             help_binding("Ctrl+Z / Y", "Undo / redo"),
-            Line::from(""),
         ]
     } else {
         vec![
@@ -4859,6 +4859,7 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Click", "Select agent"),
             help_binding("o / +", "Open agent tab"),
             help_binding("Ctrl+W", "Close agent tab"),
+            Line::from(""),
             help_section("TASKS & EVENTS"),
             help_binding("e", "Events"),
             help_binding("u", "Usage & cost"),
@@ -4877,9 +4878,86 @@ fn help_lines(compact: bool) -> Vec<Line<'static>> {
             help_binding("Shift+Enter", "New line"),
             help_binding("↑ / ↓", "Prompt history"),
             help_binding("Ctrl+Z / Y", "Undo / redo"),
-            Line::from(""),
         ]
     }
+}
+
+fn help_column_binding(key: &str, action: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{key:<11}"),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(action.to_owned(), Style::default().fg(theme::TEXT)),
+    ])
+}
+
+fn help_columns(compact: bool) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let mut left = vec![help_section("NAVIGATION")];
+    let mut right = vec![help_section("TEAM & PROMPT")];
+    if compact {
+        left.extend([
+            help_column_binding("1 / 2", "Team / tasks"),
+            help_column_binding("i", "Inspect tasks"),
+            help_column_binding("Tab", "Switch tabs"),
+            help_column_binding("t / h", "Focus / toggle pane"),
+            help_column_binding("j/k", "Browse agents"),
+            help_column_binding("o / +", "Open agent tab"),
+            help_column_binding("Ctrl+W", "Close tab"),
+            Line::from(""),
+            help_section("TASKS & EVENTS"),
+            help_column_binding("e / v", "Events / details"),
+            help_column_binding("u", "Usage & cost"),
+            help_column_binding("PgUp/Dn", "Scroll inspector"),
+            help_column_binding("r / x", "Retry / cancel"),
+        ]);
+        right.extend([
+            help_column_binding("a / Del", "Add / remove agent"),
+            help_column_binding("c", "Configure / close"),
+            help_column_binding("w", "Workspace"),
+            help_column_binding("+/-/0/f", "Zoom/reset/fit"),
+            help_column_binding("Ctrl+arrows", "Move agent card"),
+            help_column_binding("Enter", "Message agent"),
+            help_column_binding("Shift+Enter", "New line"),
+            help_column_binding("↑ / ↓", "Prompt history"),
+            help_column_binding("Ctrl+Z / Y", "Undo / redo"),
+        ]);
+    } else {
+        left.extend([
+            help_column_binding("1 / 2", "Team / tasks"),
+            help_column_binding("i", "Inspect tasks"),
+            help_column_binding("Tab", "Switch tabs"),
+            help_column_binding("t", "Focus tasks/team"),
+            help_column_binding("h", "Show / hide tasks"),
+            help_column_binding("j / k", "Browse agents"),
+            help_column_binding("Click", "Select agent"),
+            help_column_binding("o / +", "Open agent tab"),
+            help_column_binding("Ctrl+W", "Close agent tab"),
+            Line::from(""),
+            help_section("TASKS & EVENTS"),
+            help_column_binding("e", "Events"),
+            help_column_binding("u", "Usage & cost"),
+            help_column_binding("v", "Output details"),
+            help_column_binding("PgUp/Dn", "Scroll inspector"),
+            help_column_binding("r", "Retry task"),
+            help_column_binding("x", "Cancel task"),
+        ]);
+        right.extend([
+            help_column_binding("a", "Add agent"),
+            help_column_binding("Del", "Remove agent"),
+            help_column_binding("c", "Configure/close"),
+            help_column_binding("w", "Workspace"),
+            help_column_binding("+/-/0/f", "Zoom/reset/fit"),
+            help_column_binding("Ctrl+arrows", "Move agent card"),
+            help_column_binding("Enter", "Message agent"),
+            help_column_binding("Shift+Enter", "New line"),
+            help_column_binding("↑ / ↓", "Prompt history"),
+            help_column_binding("Ctrl+Z / Y", "Undo / redo"),
+        ]);
+    }
+    (left, right)
 }
 
 fn help_lines_width(lines: &[Line<'_>]) -> u16 {
@@ -4919,42 +4997,68 @@ fn help_popup_layout(area: Rect) -> (Rect, bool, bool) {
     let logo_height = logo.as_ref().map_or(0, |image| image.lines.len() as u16);
     let max_width = area.width.saturating_sub(2).min(104);
     let max_height = area.height.saturating_sub(2).min(34);
-    let full_width = help_lines_width(&full_help);
-    let compact_width = help_lines_width(&compact_help);
-    let full_height = u16::try_from(full_help.len()).unwrap_or(u16::MAX);
-    let use_compact = max_height.saturating_sub(2) < full_height;
-    let help_width = if use_compact {
-        compact_width
-    } else {
-        full_width
+    let (full_left, full_right) = help_columns(false);
+    let (compact_left, compact_right) = help_columns(true);
+    let columns_width = |left: &[Line<'_>], right: &[Line<'_>]| {
+        help_lines_width(left)
+            .saturating_add(1)
+            .saturating_add(help_lines_width(right))
     };
-    let can_show_logo = logo_width
-        .saturating_add(2)
-        .saturating_add(help_width)
-        .saturating_add(4)
-        <= max_width
-        && logo_height.saturating_add(2) <= max_height;
+    let full_column_height = full_left.len().max(full_right.len()) as u16;
+    let compact_column_height = compact_left.len().max(compact_right.len()) as u16;
+    let fits_logo = |help_width: u16, help_height: u16| {
+        logo_width
+            .saturating_add(1)
+            .saturating_add(help_width)
+            .saturating_add(6)
+            <= max_width
+            && logo_height.max(help_height).saturating_add(4) <= max_height
+    };
+    let (use_compact, can_show_logo, help_width, content_height) =
+        if fits_logo(columns_width(&full_left, &full_right), full_column_height) {
+            (
+                false,
+                true,
+                columns_width(&full_left, &full_right),
+                logo_height.max(full_column_height),
+            )
+        } else if fits_logo(
+            columns_width(&compact_left, &compact_right),
+            compact_column_height,
+        ) {
+            (
+                true,
+                true,
+                columns_width(&compact_left, &compact_right),
+                logo_height.max(compact_column_height),
+            )
+        } else {
+            let compact_height = u16::try_from(compact_help.len()).unwrap_or(u16::MAX);
+            let full_height = u16::try_from(full_help.len()).unwrap_or(u16::MAX);
+            let compact = max_height.saturating_sub(4) < full_height
+                || help_lines_width(&full_help).saturating_add(6) > max_width;
+            let help_width = if compact {
+                help_lines_width(&compact_help)
+            } else {
+                help_lines_width(&full_help)
+            };
+            (
+                compact,
+                false,
+                help_width,
+                if compact { compact_height } else { full_height },
+            )
+        };
     let width = if can_show_logo {
         logo_width
-            .saturating_add(2)
+            .saturating_add(1)
             .saturating_add(help_width)
-            .saturating_add(4)
+            .saturating_add(6)
     } else {
-        help_width.saturating_add(4)
+        help_width.saturating_add(6)
     }
     .min(max_width);
-    let content_height = if can_show_logo {
-        logo_height.max(if use_compact {
-            u16::try_from(compact_help.len()).unwrap_or(u16::MAX)
-        } else {
-            full_height
-        })
-    } else if use_compact {
-        u16::try_from(compact_help.len()).unwrap_or(u16::MAX)
-    } else {
-        full_height
-    };
-    let height = content_height.saturating_add(2).min(max_height);
+    let height = content_height.saturating_add(4).min(max_height);
     (
         centered_popup(area, width, height),
         use_compact,
@@ -5771,14 +5875,24 @@ fn render_overlays(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
             let logo_width = logo.lines.iter().map(Line::width).max().unwrap_or(0) as u16;
             let logo_height = logo.lines.len() as u16;
             let logo_area = Rect::new(content.x, content.y, logo_width, logo_height);
-            let help_area = Rect::new(
-                content.x + logo_width + 2,
+            let (left_help, right_help) = help_columns(compact);
+            let left_width = help_lines_width(&left_help);
+            let right_width = help_lines_width(&right_help);
+            let left_area = Rect::new(
+                content.x + logo_width + 1,
                 content.y,
-                content.width.saturating_sub(logo_width + 2),
+                left_width,
+                content.height,
+            );
+            let right_area = Rect::new(
+                left_area.right() + 1,
+                content.y,
+                right_width,
                 content.height,
             );
             frame.render_widget(Paragraph::new(logo), logo_area);
-            frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), help_area);
+            frame.render_widget(Paragraph::new(left_help), left_area);
+            frame.render_widget(Paragraph::new(right_help), right_area);
         } else {
             frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), content);
         }
@@ -8159,17 +8273,34 @@ mod tests {
             colored_logo_cells > 10,
             "ANSI logo should retain its colors"
         );
-        let (_, compact, _) = help_popup_layout(Rect::new(0, 0, 112, 32));
+        let (_, compact, show_logo) = help_popup_layout(Rect::new(0, 0, 112, 32));
+        assert!(
+            show_logo,
+            "wide help layout should keep the logo and columns"
+        );
         assert!(rendered.contains(if compact {
             "Add / remove agent"
         } else {
             "Add agent"
         }));
+        assert!(rendered.contains("TASKS & EVENTS"));
+        assert!(rendered.contains("TEAM & PROMPT"));
+        assert!(rendered.contains("Move agent card"));
         assert!(popup.width < 104, "popup should fit its content: {popup:?}");
         assert!(popup.width > 60, "logo and help list should fit: {popup:?}");
-        assert!(
-            usize::from(popup.height) >= help_lines(compact).len() + 2,
-            "popup should leave room for the help list and its padding: {popup:?}"
+        let content_rows = if show_logo {
+            let (left, right) = help_columns(compact);
+            left.len().max(right.len()).max(
+                crate::onboarding::animated_logo_text_for(theme::SURFACE)
+                    .map_or(0, |logo| logo.lines.len()),
+            )
+        } else {
+            help_lines(compact).len()
+        };
+        assert_eq!(
+            usize::from(popup.height),
+            content_rows + 4,
+            "popup should wrap tightly around its content: {popup:?}"
         );
         assert!(rendered.contains("[?] / [Esc] close · [q] safe exit"));
         let title_row = (0..112)
