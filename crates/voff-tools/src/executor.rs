@@ -181,8 +181,13 @@ pub fn validate_process_argv(program: &str, args: &[String]) -> Result<(), Execu
             | "pwsh"
             | "nu"
     );
-    if !valid_program || shell {
+    if shell {
         return Err(ExecutorError::Denied);
+    }
+    if !valid_program {
+        return Err(ExecutorError::InvalidInvocation(
+            "program must be a bare executable name without path separators",
+        ));
     }
     if args.len() > MAX_ARGUMENTS {
         return Err(ExecutorError::InvalidInvocation(
@@ -223,6 +228,22 @@ impl ControlledExecutor {
             return Err(ExecutorError::OutsideWorkspace);
         }
         Ok(cwd)
+    }
+
+    /// Return whether a directly executable program is currently discoverable
+    /// through the same sanitized PATH used for approved process execution.
+    ///
+    /// This is a best-effort preflight check. Execution still handles a
+    /// program disappearing between this check and `spawn`.
+    #[must_use]
+    pub fn program_available(&self, program: &str) -> bool {
+        if validate_process_argv(program, &[]).is_err() {
+            return false;
+        }
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|path| path.is_absolute() && path != Path::new("."))
+            .map(|path| path.join(program))
+            .any(|candidate| candidate.is_file())
     }
     pub async fn execute(
         &self,
@@ -419,5 +440,18 @@ mod tests {
             validate_process_argv("sh", &["-c".into(), "echo unsafe".into()]),
             Err(ExecutorError::Denied)
         ));
+        assert!(matches!(
+            validate_process_argv("/usr/bin/grep", &["needle".into()]),
+            Err(ExecutorError::InvalidInvocation(
+                "program must be a bare executable name without path separators"
+            ))
+        ));
+    }
+
+    #[test]
+    fn unavailable_program_is_detected_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ControlledExecutor::new(dir.path()).unwrap();
+        assert!(!executor.program_available("voff-command-that-does-not-exist"));
     }
 }

@@ -103,7 +103,7 @@ fn plan() -> serde_json::Value {
         "proposals":[
             {"target_agent":"Server","objective":"components","owned_paths":["server.txt"],"acceptance_criteria":["client and server components implemented"]}
         ],
-        "integration":{"target_agent":"Client","objective":"integrate","acceptance_criteria":["client and server use the same port"]}
+        "integration":{"target_agent":"Client","objective":"integrate","owned_paths":["server.txt","client.txt","src"],"acceptance_criteria":["client and server use the same port"]}
     })
 }
 

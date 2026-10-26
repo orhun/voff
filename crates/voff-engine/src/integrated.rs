@@ -123,6 +123,8 @@ pub(super) fn is_implementation_objective(objective: &str) -> bool {
         "change",
         "remove",
         "refactor",
+        "repair",
+        "reconcil",
         "support",
         "make ",
         "build a ",
@@ -587,6 +589,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repair_and_reconciliation_are_implementation_not_verification_only() {
+        assert!(is_implementation_objective(
+            "Inspect the result, repair defects, and rerun verification"
+        ));
+        assert!(is_implementation_objective(
+            "Review and reconcile cross-component mismatches"
+        ));
+    }
+
+    #[test]
+    fn integration_scope_must_cover_every_implementation_path() {
+        let implementation = DelegationProposal {
+            target_agent: "Implementer".into(),
+            objective: "implement app".into(),
+            owned_paths: vec![PathBuf::from("index.html"), PathBuf::from("script.js")],
+            acceptance_criteria: vec!["app works".into()],
+        };
+        let mut integration = DelegationProposal {
+            target_agent: "Reviewer".into(),
+            objective: "integrate and verify".into(),
+            owned_paths: vec![PathBuf::from("README.md")],
+            acceptance_criteria: vec!["combined app verified".into()],
+        };
+
+        let error =
+            validate_integration_ownership(std::slice::from_ref(&implementation), &integration)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("missing: index.html, script.js"));
+
+        integration.owned_paths = vec![
+            PathBuf::from("index.html"),
+            PathBuf::from("script.js"),
+            PathBuf::from("tests.js"),
+            PathBuf::from("README.md"),
+        ];
+        validate_integration_ownership(&[implementation], &integration).unwrap();
+    }
+
     #[tokio::test]
     async fn verified_work_still_answers_simple_questions_without_tools() {
         let repo = Arc::new(InMemoryRepository::default());
@@ -761,7 +803,7 @@ pub(super) fn configure_tools(
                         "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
                         "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
                     },
-                    "required":["target_agent","objective","acceptance_criteria"],
+                    "required":["target_agent","objective","owned_paths","acceptance_criteria"],
                     "additionalProperties":false
                 })
             } else {
@@ -780,12 +822,12 @@ pub(super) fn configure_tools(
         }
         tool.description = if let Some(validator) = required_validator {
             format!(
-                "{} This request requires independent verification. Assign implementation in proposals and assign the integration task to {validator}; integration must inspect the combined result and run the requested verification after implementation completes.",
+                "{} This request requires independent verification. Assign implementation in proposals and assign the integration task to {validator}; integration must inspect the combined result and run the requested verification after implementation completes. Integration owned_paths must cover every implementation path plus any verification harness files it may need to create or repair; do not describe a narrower edit scope in its objective.",
                 tool_descriptions::DELEGATE
             )
         } else {
             format!(
-                "{} Multi-workstream plans require explicit disjoint owned_paths for every implementation proposal; integration waits for them.",
+                "{} Multi-workstream plans require explicit disjoint owned_paths for every implementation proposal. Integration waits for them, and its owned_paths must cover every implementation path plus any verification harness files it may need to create or repair.",
                 tool_descriptions::DELEGATE
             )
         };
@@ -852,11 +894,54 @@ fn validate_plan_ownership(proposals: &[DelegationProposal]) -> Result<(), Engin
     Ok(())
 }
 
+fn validate_integration_ownership(
+    implementations: &[DelegationProposal],
+    integration: &DelegationProposal,
+) -> Result<(), EngineError> {
+    if integration.owned_paths.is_empty() {
+        return Err(invalid(
+            "integration needs explicit owned_paths covering implementation and verification files",
+        ));
+    }
+    for path in &integration.owned_paths {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                !matches!(component, std::path::Component::Normal(_))
+                    || matches!(component, std::path::Component::Normal(name)
+                        if [".voff", ".ssh", ".aws", ".codex", ".claude"]
+                            .iter()
+                            .any(|denied| name == std::ffi::OsStr::new(denied)))
+            })
+        {
+            return Err(invalid(
+                "integration owned_paths must be safe, workspace-relative paths",
+            ));
+        }
+    }
+    let uncovered = implementations
+        .iter()
+        .flat_map(|proposal| &proposal.owned_paths)
+        .filter(|implementation_path| {
+            !integration
+                .owned_paths
+                .iter()
+                .any(|scope| implementation_path.starts_with(scope))
+        })
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !uncovered.is_empty() {
+        return Err(invalid(format!(
+            "integration owned_paths must cover every implementation path so cross-component defects can be repaired; missing: {}",
+            uncovered.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn task_owns_path(task: &Task, path: &Path) -> bool {
     task.work.as_ref().is_none_or(|work| {
-        work.integration
-            || work.owned_paths.is_empty()
-            || work.owned_paths.iter().any(|scope| path.starts_with(scope))
+        work.owned_paths.is_empty() || work.owned_paths.iter().any(|scope| path.starts_with(scope))
     })
 }
 
@@ -1050,6 +1135,7 @@ impl<R: Repository + 'static> Engine<R> {
             ));
         }
         validate_plan_ownership(&plan.proposals)?;
+        validate_integration_ownership(&plan.proposals, &plan.integration)?;
         if self
             .repo
             .tasks()
@@ -1219,11 +1305,7 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?;
             child.work = Some(WorkProgress {
                 contract: plan.shared_contract.clone(),
-                owned_paths: if index < count {
-                    owned_paths
-                } else {
-                    Vec::new()
-                },
+                owned_paths,
                 integration: index == count,
                 turns: 0,
             });

@@ -4,6 +4,7 @@ mod integrated;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -225,7 +226,10 @@ pub fn is_read_only_request(objective: &str) -> bool {
         "write",
     ]
     .iter()
-    .any(|word| words.contains(*word));
+    .any(|word| words.contains(*word))
+        || words
+            .iter()
+            .any(|word| word.starts_with("repair") || word.starts_with("reconcil"));
     asks_to_inspect && !asks_to_change
 }
 
@@ -1631,8 +1635,9 @@ impl<R: Repository + 'static> Engine<R> {
                         side_effects += 1;
                     }
                     "process.test" => {
-                        let args: TestArguments = serde_json::from_str(&call.arguments_json)?;
-                        command_spec(&args, Path::new("."))?;
+                        // Invocation validation is handled while publishing the
+                        // completed response so a malformed-but-safe proposal
+                        // becomes workflow feedback instead of failing the task.
                         side_effects += 1;
                     }
                     _ => {
@@ -2019,9 +2024,110 @@ impl<R: Repository + 'static> Engine<R> {
                             .to_string();
                         }
                         "process.test" => {
-                            let args: TestArguments =
-                                serde_json::from_str(&request.arguments_json)?;
-                            command_spec(&args, Path::new("."))?;
+                            let args = match serde_json::from_str::<TestArguments>(
+                                &request.arguments_json,
+                            ) {
+                                Ok(args) => args,
+                                Err(error) => {
+                                    self.record_recoverable_proposal_error(
+                                        &task,
+                                        "process.invalid_schema",
+                                        format!(
+                                            "Invalid process.test arguments: {error}. Correct the tool arguments to match the process.test schema; no command was executed."
+                                        ),
+                                    )
+                                    .await?;
+                                    inspected_workspace = true;
+                                    continue;
+                                }
+                            };
+                            let (spec, _, _) = match command_spec(&args, Path::new(".")) {
+                                Ok(command) => command,
+                                Err(
+                                    error @ EngineError::Executor(
+                                        ExecutorError::Denied | ExecutorError::InvalidInvocation(_),
+                                    ),
+                                ) => {
+                                    self.record_recoverable_proposal_error(
+                                        &task,
+                                        "process.invalid_invocation",
+                                        format!(
+                                            "Rejected process.test proposal: {error}. Use a bare executable name such as 'grep', never '/usr/bin/grep' or a shell; correct the invocation and continue. No command was executed."
+                                        ),
+                                    )
+                                    .await?;
+                                    inspected_workspace = true;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            if self
+                                .successful_verification_is_reusable(&task, &spec)
+                                .await?
+                            {
+                                let mut hasher = DefaultHasher::new();
+                                spec.program.hash(&mut hasher);
+                                spec.args.hash(&mut hasher);
+                                let feedback_key =
+                                    format!("process.reuse:{:016x}", hasher.finish());
+                                let lineage =
+                                    integrated::retry_lineage_ids(&task, &self.repo.tasks().await?);
+                                let feedback_exists =
+                                    self.repo.artifacts().await?.iter().any(|artifact| {
+                                        lineage.contains(&artifact.producer)
+                                            && artifact.kind == "workflow_feedback"
+                                            && artifact.location == feedback_key
+                                    });
+                                if !feedback_exists {
+                                    let feedback = format!(
+                                        "The exact verification invocation '{} {}' already succeeded after the latest approved patch. Reuse its persisted test_report; changing only the purpose does not justify another run. Submit task.complete with that evidence, make a necessary patch before rerunning, or choose a materially different command for an uncovered criterion.",
+                                        spec.program,
+                                        spec.args.join(" ")
+                                    );
+                                    self.publish_artifact(Artifact {
+                                        id: ArtifactId::new(),
+                                        producer: id,
+                                        kind: "workflow_feedback".into(),
+                                        location: feedback_key,
+                                        digest: String::new(),
+                                        preview: feedback.clone(),
+                                    })
+                                    .await?;
+                                    self.record(
+                                        Some(id),
+                                        CanonicalEventKind::ProviderWarning(feedback),
+                                    )
+                                    .await?;
+                                }
+                                inspected_workspace = true;
+                                continue;
+                            }
+                            let executor = self
+                                .executor
+                                .as_ref()
+                                .ok_or(EngineError::WorkflowNotConfigured)?;
+                            if !executor.program_available(&spec.program) {
+                                let feedback = format!(
+                                    "Verification program '{}' is not installed or not available on the approved execution PATH. Choose an already available project-native command or use existing artifact evidence; do not propose this unavailable program again.",
+                                    spec.program
+                                );
+                                self.publish_artifact(Artifact {
+                                    id: ArtifactId::new(),
+                                    producer: id,
+                                    kind: "workflow_feedback".into(),
+                                    location: format!("process.unavailable:{}", spec.program),
+                                    digest: String::new(),
+                                    preview: feedback.clone(),
+                                })
+                                .await?;
+                                self.record(
+                                    Some(id),
+                                    CanonicalEventKind::ProviderWarning(feedback),
+                                )
+                                .await?;
+                                inspected_workspace = true;
+                                continue;
+                            }
                         }
                         _ => {
                             self.record(
@@ -2068,6 +2174,105 @@ impl<R: Repository + 'static> Engine<R> {
             self.finish_task(id, response_text, vec![]).await?;
         }
         Ok(())
+    }
+
+    async fn record_recoverable_proposal_error(
+        &self,
+        task: &Task,
+        category: &str,
+        feedback: String,
+    ) -> Result<(), EngineError> {
+        let mut hasher = DefaultHasher::new();
+        category.hash(&mut hasher);
+        feedback.hash(&mut hasher);
+        let location = format!("{category}:{:016x}", hasher.finish());
+        let lineage = integrated::retry_lineage_ids(task, &self.repo.tasks().await?);
+        let exists = self.repo.artifacts().await?.iter().any(|artifact| {
+            lineage.contains(&artifact.producer)
+                && artifact.kind == "workflow_feedback"
+                && artifact.location == location
+        });
+        if !exists {
+            self.publish_artifact(Artifact {
+                id: ArtifactId::new(),
+                producer: task.id,
+                kind: "workflow_feedback".into(),
+                location,
+                digest: String::new(),
+                preview: feedback.clone(),
+            })
+            .await?;
+            self.record(Some(task.id), CanonicalEventKind::ProviderWarning(feedback))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn successful_verification_is_reusable(
+        &self,
+        task: &Task,
+        spec: &CommandSpec,
+    ) -> Result<bool, EngineError> {
+        let tasks = self.repo.tasks().await?;
+        let lineage = integrated::retry_lineage_ids(task, &tasks);
+        let approvals = self.repo.approvals(self.session).await?;
+        let matching = approvals
+            .iter()
+            .filter(|approval| {
+                lineage.contains(&approval.task_id)
+                    && approval.action == "process.test"
+                    && approval.decision == ApprovalDecision::ApprovedOnce
+            })
+            .filter_map(|approval| {
+                let request = serde_json::from_str::<TestArguments>(&approval.reason).ok()?;
+                let (program, args, _, _) = request.invocation().ok()?;
+                (program == spec.program && args == spec.args).then_some(approval.id)
+            })
+            .collect::<HashSet<_>>();
+        if matching.is_empty() {
+            return Ok(false);
+        }
+        let patch_approvals = approvals
+            .iter()
+            .filter(|approval| {
+                approval.action == "file.patch"
+                    && approval.decision == ApprovalDecision::ApprovedOnce
+            })
+            .map(|approval| approval.id)
+            .collect::<HashSet<_>>();
+        let mut pending = HashSet::new();
+        let mut reusable = false;
+        for event in self.repo.events(self.session).await? {
+            match event.kind {
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                } if patch_approvals.contains(&approval_id) => {
+                    reusable = false;
+                    pending.clear();
+                }
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                } if matching.contains(&approval_id) => {
+                    if let Some(task_id) = event.task_id {
+                        pending.insert(task_id);
+                    }
+                }
+                CanonicalEventKind::ProcessFinished {
+                    verification: true,
+                    exit_code,
+                    ..
+                } if event
+                    .task_id
+                    .is_some_and(|id| lineage.contains(&id) && pending.remove(&id)) =>
+                {
+                    reusable = exit_code == Some(0);
+                }
+                _ => {}
+            }
+        }
+        Ok(reusable)
     }
 
     async fn maybe_report_stalled_work(&self, task: &Task) -> Result<(), EngineError> {
@@ -2265,19 +2470,17 @@ impl<R: Repository + 'static> Engine<R> {
                             approval.action.as_str(),
                             "file.patch" | "process.test" | "file.read"
                         )
-                    {
-                        if let Err(error) = self
+                        && let Err(error) = self
                             .publish_task_checkpoint(approval.task_id, &approval.action)
                             .await
-                        {
-                            tracing::warn!(
-                                session_id = %self.session,
-                                task_id = %approval.task_id,
-                                action = %approval.action,
-                                %error,
-                                "could not persist task continuation checkpoint"
-                            );
-                        }
+                    {
+                        tracing::warn!(
+                            session_id = %self.session,
+                            task_id = %approval.task_id,
+                            action = %approval.action,
+                            %error,
+                            "could not persist task continuation checkpoint"
+                        );
                     }
                     let has_pending =
                         self.repo
@@ -2383,6 +2586,48 @@ impl<R: Repository + 'static> Engine<R> {
                         },
                     )
                     .await?;
+                }
+                Err(error @ EngineError::VerificationFailed { .. }) => {
+                    let feedback = format!(
+                        "Approved verification failed: {error}. Inspect the persisted test_report, fix the implementation or choose a suitable available verification command, then continue the same task."
+                    );
+                    self.record(
+                        Some(approval.task_id),
+                        CanonicalEventKind::ProviderWarning(feedback.clone()),
+                    )
+                    .await?;
+                    self.publish_artifact(Artifact {
+                        id: ArtifactId::new(),
+                        producer: approval.task_id,
+                        kind: "workflow_feedback".into(),
+                        location: "process.verification_failed".into(),
+                        digest: String::new(),
+                        preview: feedback,
+                    })
+                    .await?;
+                    self.transition(approval.task_id, TaskStatus::Ready).await?;
+                }
+                Err(EngineError::Executor(ExecutorError::Io(error)))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    let feedback = format!(
+                        "Approved verification could not start because its program was not found: {error}. Choose an already available project-native command and continue the same task."
+                    );
+                    self.record(
+                        Some(approval.task_id),
+                        CanonicalEventKind::ProviderWarning(feedback.clone()),
+                    )
+                    .await?;
+                    self.publish_artifact(Artifact {
+                        id: ArtifactId::new(),
+                        producer: approval.task_id,
+                        kind: "workflow_feedback".into(),
+                        location: "process.program_not_found".into(),
+                        digest: String::new(),
+                        preview: feedback,
+                    })
+                    .await?;
+                    self.transition(approval.task_id, TaskStatus::Ready).await?;
                 }
                 Err(error) => {
                     let recovery_review = self.route_work_error(approval.task_id, &error).await?;
@@ -3660,6 +3905,170 @@ mod tests {
             "check the quality and fix any issues"
         ));
         assert!(!is_read_only_request("implement the requested feature"));
+        assert!(!is_read_only_request(
+            "inspect the combined result, repair any defects, then rerun verification"
+        ));
+        assert!(!is_read_only_request(
+            "review the components and reconcile integration mismatches"
+        ));
+    }
+
+    #[tokio::test]
+    async fn repair_verification_task_retains_file_patch_tool() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let owner = AgentProfile {
+            id: AgentId::new(),
+            name: "Integrator".into(),
+            role: "integration engineer".into(),
+            provider: "default".into(),
+            model: "mock-v1".into(),
+            system_prompt: String::new(),
+            tools: vec!["file.patch".into(), "process.test".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        };
+        repo.save_agent(owner.clone()).await.unwrap();
+        let recorded_tools = Arc::new(Mutex::new(None));
+        let provider = Arc::new(RequestRecorder {
+            tools: Arc::clone(&recorded_tools),
+            tool_choice: Arc::new(Mutex::new(None)),
+            max_output_tokens: Arc::new(Mutex::new(None)),
+        });
+        let (tx, _rx) = mpsc::channel(32);
+        let engine = Engine::new(repo.clone(), provider, SessionId::new(), tx);
+        let mut task = engine
+            .create_task(
+                owner.id,
+                "Inspect the combined result, repair any defects, then rerun verification",
+                vec!["integrated result passes".into()],
+            )
+            .await
+            .unwrap();
+        task.work = Some(WorkProgress {
+            contract: "repair and verify".into(),
+            owned_paths: vec![PathBuf::from("index.html")],
+            integration: true,
+            turns: 0,
+        });
+        repo.save_task(task.clone()).await.unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        let _ = engine.run_task(task.id).await;
+
+        let tools = recorded_tools.lock().await;
+        let names = tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"file.patch"));
+        assert!(names.contains(&"process.test"));
+    }
+
+    #[tokio::test]
+    async fn successful_process_invocation_is_reused_until_a_patch() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(32);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        );
+        let mut task = engine
+            .create_task(AgentId::new(), "verify and repair", vec![])
+            .await
+            .unwrap();
+        task.work = Some(WorkProgress {
+            contract: "verified".into(),
+            owned_paths: vec![PathBuf::from("tests.js")],
+            integration: true,
+            turns: 0,
+        });
+        repo.save_task(task.clone()).await.unwrap();
+        let test_approval = Approval {
+            id: ApprovalId::new(),
+            task_id: task.id,
+            tool_call_id: ToolCallId::new(),
+            action: "process.test".into(),
+            working_directory: ".".into(),
+            reason: serde_json::json!({
+                "program": "node",
+                "args": ["tests.js"],
+                "purpose": "first wording",
+                "verification": true
+            })
+            .to_string(),
+            decision: ApprovalDecision::ApprovedOnce,
+            created_at: chrono::Utc::now(),
+        };
+        repo.save_approval(test_approval.clone()).await.unwrap();
+        engine
+            .record(
+                Some(task.id),
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id: test_approval.id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .record(
+                Some(task.id),
+                CanonicalEventKind::ProcessFinished {
+                    program: "first wording: node tests.js".into(),
+                    verification: true,
+                    exit_code: Some(0),
+                    truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        let spec = CommandSpec {
+            program: "node".into(),
+            args: vec!["tests.js".into()],
+            cwd: PathBuf::from("."),
+            timeout_seconds: 30,
+            output_limit: 1024,
+        };
+        assert!(
+            engine
+                .successful_verification_is_reusable(&task, &spec)
+                .await
+                .unwrap()
+        );
+
+        let patch_approval = Approval {
+            id: ApprovalId::new(),
+            task_id: task.id,
+            tool_call_id: ToolCallId::new(),
+            action: "file.patch".into(),
+            working_directory: ".".into(),
+            reason: "{}".into(),
+            decision: ApprovalDecision::ApprovedOnce,
+            created_at: chrono::Utc::now(),
+        };
+        repo.save_approval(patch_approval.clone()).await.unwrap();
+        engine
+            .record(
+                Some(task.id),
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id: patch_approval.id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !engine
+                .successful_verification_is_reusable(&task, &spec)
+                .await
+                .unwrap()
+        );
     }
 
     struct RequestRecorder {
@@ -5828,5 +6237,149 @@ mod tests {
             repo.task(parent.id).await.unwrap().unwrap().status,
             TaskStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_verification_program_returns_feedback_without_approval_or_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(64);
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "process.test".into(),
+                arguments_json: serde_json::json!({
+                    "program": "voff-command-that-does-not-exist",
+                    "args": [],
+                    "purpose": "verify output",
+                    "verification": true
+                })
+                .to_string(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let task = engine
+            .create_task(AgentId::new(), "verify", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        assert!(repo.approvals(session).await.unwrap().is_empty());
+        assert!(repo.artifacts().await.unwrap().iter().any(|artifact| {
+            artifact.producer == task.id
+                && artifact.kind == "workflow_feedback"
+                && artifact.location.starts_with("process.unavailable:")
+        }));
+    }
+
+    #[tokio::test]
+    async fn invalid_process_invocation_returns_feedback_without_failing_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(64);
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "process.test".into(),
+                arguments_json: serde_json::json!({
+                    "program": "/usr/bin/grep",
+                    "args": ["needle", "index.html"],
+                    "purpose": "inspect markup",
+                    "verification": true
+                })
+                .to_string(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let task = engine
+            .create_task(AgentId::new(), "verify", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        assert!(repo.approvals(session).await.unwrap().is_empty());
+        assert!(repo.artifacts().await.unwrap().iter().any(|artifact| {
+            artifact.producer == task.id
+                && artifact.kind == "workflow_feedback"
+                && artifact.location.starts_with("process.invalid_invocation:")
+                && artifact.preview.contains("bare executable name")
+        }));
+        assert!(!repo.events(session).await.unwrap().iter().any(|event| {
+            event.task_id == Some(task.id)
+                && matches!(event.kind, CanonicalEventKind::ProviderFailed(_))
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_approved_verification_returns_task_to_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(InMemoryRepository::default());
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(64);
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "process.test".into(),
+                arguments_json: serde_json::json!({
+                    "program": "rustc",
+                    "args": ["--definitely-not-a-rustc-option"],
+                    "purpose": "exercise a failing verification",
+                    "verification": true
+                })
+                .to_string(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
+            .with_safe_workflow(dir.path())
+            .unwrap();
+        let task = engine
+            .create_task(AgentId::new(), "verify", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+        engine.run_task(task.id).await.unwrap();
+        let approval = repo.approvals(session).await.unwrap().pop().unwrap();
+
+        engine
+            .decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        let artifacts = repo.artifacts().await.unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| { artifact.producer == task.id && artifact.kind == "test_report" })
+        );
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.producer == task.id
+                && artifact.kind == "workflow_feedback"
+                && artifact.location == "process.verification_failed"
+        }));
     }
 }
