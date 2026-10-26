@@ -1352,7 +1352,9 @@ impl<R: Repository + 'static> Engine<R> {
         );
         let publish = async {
             let mut pending = None;
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+            // Match the TUI's refresh cadence while coalescing streamed text
+            // into fewer durable event writes.
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let event = tokio::select! {
@@ -1561,17 +1563,6 @@ impl<R: Repository + 'static> Engine<R> {
                         if inspection_is_repeat(id, call, artifacts, approvals, events)? {
                             let feedback_key =
                                 format!("file.read:{}:{}", args.path.display(), args.offset);
-                            if artifacts.iter().any(|artifact| {
-                                artifact.producer == id
-                                    && artifact.kind == "workflow_feedback"
-                                    && artifact.location == feedback_key
-                            }) {
-                                return Err(EngineError::InvalidDelegationPlan(format!(
-                                    "repeated unchanged file.read for {} at offset {}; use the recorded artifact, or make an approved patch before rereading",
-                                    args.path.display(),
-                                    args.offset
-                                )));
-                            }
                             repeated_inspections.insert((call.name.clone(), feedback_key));
                         }
                         inspections += 1;
@@ -1596,16 +1587,6 @@ impl<R: Repository + 'static> Engine<R> {
                             .expect("inspection evidence loaded");
                         if inspection_is_repeat(id, call, artifacts, approvals, events)? {
                             let feedback_key = format!("search.text:{}", args.query);
-                            if artifacts.iter().any(|artifact| {
-                                artifact.producer == id
-                                    && artifact.kind == "workflow_feedback"
-                                    && artifact.location == feedback_key
-                            }) {
-                                return Err(EngineError::InvalidDelegationPlan(format!(
-                                    "repeated unchanged search.text query {:?}; reuse its recorded artifact or inspect after an approved patch",
-                                    args.query
-                                )));
-                            }
                             repeated_inspections.insert((call.name.clone(), feedback_key));
                         }
                         inspections += 1;
@@ -1842,15 +1823,26 @@ impl<R: Repository + 'static> Engine<R> {
                             if repeated_inspections
                                 .contains(&(request.name.clone(), feedback_key.clone()))
                             {
-                                self.publish_artifact(Artifact {
-                                    id: ArtifactId::new(),
-                                    producer: id,
-                                    kind: "workflow_feedback".into(),
-                                    location: feedback_key,
-                                    digest: String::new(),
-                                    preview: "This unchanged path and offset are already recorded. Use the existing artifact; if the file is missing, create it with an approved file.patch. Do not inspect this path again unless a patch is approved.".into(),
-                                })
-                                .await?;
+                                let feedback_exists = inspection_evidence.as_ref().is_some_and(
+                                    |(artifacts, _, _)| {
+                                        artifacts.iter().any(|artifact| {
+                                            artifact.producer == id
+                                                && artifact.kind == "workflow_feedback"
+                                                && artifact.location == feedback_key
+                                        })
+                                    },
+                                );
+                                if !feedback_exists {
+                                    self.publish_artifact(Artifact {
+                                        id: ArtifactId::new(),
+                                        producer: id,
+                                        kind: "workflow_feedback".into(),
+                                        location: feedback_key,
+                                        digest: String::new(),
+                                        preview: "This unchanged path and offset are already recorded. Use the existing artifact; if the file is missing, create it with an approved file.patch. Do not inspect this path again unless a patch is approved.".into(),
+                                    })
+                                    .await?;
+                                }
                                 inspected_workspace = true;
                                 continue;
                             }
@@ -1878,15 +1870,26 @@ impl<R: Repository + 'static> Engine<R> {
                             if repeated_inspections
                                 .contains(&(request.name.clone(), feedback_key.clone()))
                             {
-                                self.publish_artifact(Artifact {
-                                    id: ArtifactId::new(),
-                                    producer: id,
-                                    kind: "workflow_feedback".into(),
-                                    location: feedback_key,
-                                    digest: String::new(),
-                                    preview: "This unchanged search is already recorded. Reuse its artifact and act on the existing evidence instead of repeating the query.".into(),
-                                })
-                                .await?;
+                                let feedback_exists = inspection_evidence.as_ref().is_some_and(
+                                    |(artifacts, _, _)| {
+                                        artifacts.iter().any(|artifact| {
+                                            artifact.producer == id
+                                                && artifact.kind == "workflow_feedback"
+                                                && artifact.location == feedback_key
+                                        })
+                                    },
+                                );
+                                if !feedback_exists {
+                                    self.publish_artifact(Artifact {
+                                        id: ArtifactId::new(),
+                                        producer: id,
+                                        kind: "workflow_feedback".into(),
+                                        location: feedback_key,
+                                        digest: String::new(),
+                                        preview: "This unchanged search is already recorded. Reuse its artifact and act on the existing evidence instead of repeating the query.".into(),
+                                    })
+                                    .await?;
+                                }
                                 inspected_workspace = true;
                                 continue;
                             }
@@ -4604,7 +4607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_workspace_reads_stop_instead_of_spending_turns() {
+    async fn repeated_unchanged_workspace_reads_reuse_feedback_without_failing_task() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "const VALUE: u8 = 1;\n").unwrap();
         let repo = Arc::new(InMemoryRepository::default());
@@ -4668,15 +4671,10 @@ mod tests {
         let guarded_engine = Engine::new(repo.clone(), Arc::new(repeated_again), session, tx)
             .with_safe_workflow(dir.path())
             .unwrap();
-        let error = guarded_engine.run_task(task.id).await.unwrap_err();
-
-        assert!(matches!(
-            error,
-            EngineError::InvalidDelegationPlan(message) if message.contains("repeated unchanged file.read")
-        ));
+        guarded_engine.run_task(task.id).await.unwrap();
         assert_eq!(
             repo.task(task.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
+            TaskStatus::Ready
         );
         assert_eq!(repo.artifacts().await.unwrap().len(), 2);
         assert!(repo.approvals(session).await.unwrap().is_empty());
