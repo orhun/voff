@@ -2973,6 +2973,7 @@ pub(crate) async fn build_workspace_team(
                     "agents": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": voff_prompts::setup::MAX_GENERATED_AGENTS,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2991,7 +2992,7 @@ pub(crate) async fn build_workspace_team(
             .to_string(),
         }],
         tool_choice: ToolChoice::Specific(vec!["create_team".into()]),
-        max_output_tokens: Some(4096),
+        max_output_tokens: Some(team_plan_output_budget(&scan)),
     };
     let events = collect_response(
         provider.as_ref(),
@@ -3035,6 +3036,12 @@ fn plan_to_draft(
     if plan.agents.is_empty() {
         return Err("the generated team must include a Team Lead".into());
     }
+    if plan.agents.len() > voff_prompts::setup::MAX_GENERATED_AGENTS {
+        return Err(format!(
+            "the generated team exceeds the limit of {} agents",
+            voff_prompts::setup::MAX_GENERATED_AGENTS
+        ));
+    }
     let names = plan
         .agents
         .iter()
@@ -3059,12 +3066,15 @@ fn plan_to_draft(
             }
             None
         } else {
-            let parent = agent.reports_to.as_deref().unwrap_or(names[0].as_str());
+            let parent = agent
+                .reports_to
+                .as_deref()
+                .ok_or_else(|| format!("agent {} must name its reporting parent", agent.name))?;
             Some(
                 names
                     .iter()
                     .position(|name| name == parent)
-                    .filter(|parent_index| *parent_index != index)
+                    .filter(|parent_index| *parent_index < index)
                     .ok_or_else(|| {
                         format!("agent {} has an invalid reporting target", agent.name)
                     })?,
@@ -3112,6 +3122,16 @@ fn plan_to_draft(
         }
     }
     Ok(developers)
+}
+
+fn team_plan_output_budget(scan: &WorkspaceScan) -> u64 {
+    const MIN_TOKENS: u64 = 4_096;
+    const MAX_TOKENS: u64 = 16_384;
+    let additional_files = scan.files_seen.saturating_sub(40);
+    let extra_tokens = u64::try_from(additional_files / 8)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(512);
+    MIN_TOKENS.saturating_add(extra_tokens).min(MAX_TOKENS)
 }
 
 pub(crate) fn scan_placeholder(
@@ -4312,6 +4332,98 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn generated_agent(name: &str, reports_to: Option<&str>) -> WorkspaceAgentPlan {
+        WorkspaceAgentPlan {
+            name: name.into(),
+            instructions: format!("Own the {name} workstream."),
+            reports_to: reports_to.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn generated_team_preserves_nested_reporting_ownership() {
+        let agents = plan_to_draft(
+            WorkspaceTeamPlan {
+                summary: "A project with separate service areas.".into(),
+                agents: vec![
+                    generated_agent("Team Lead", None),
+                    generated_agent("Platform Coordinator", Some("Team Lead")),
+                    generated_agent("Storage Specialist", Some("Platform Coordinator")),
+                ],
+            },
+            ProviderChoice::CodexCli,
+            "default",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(agents[1].reports_to, Some(0));
+        assert_eq!(agents[2].reports_to, Some(1));
+    }
+
+    #[test]
+    fn generated_team_rejects_missing_or_forward_reporting_parent() {
+        for agents in [
+            vec![
+                generated_agent("Team Lead", None),
+                generated_agent("Worker", None),
+            ],
+            vec![
+                generated_agent("Team Lead", None),
+                generated_agent("Worker", Some("Coordinator")),
+                generated_agent("Coordinator", Some("Team Lead")),
+            ],
+        ] {
+            let result = plan_to_draft(
+                WorkspaceTeamPlan {
+                    summary: "A project team.".into(),
+                    agents,
+                },
+                ProviderChoice::CodexCli,
+                "default",
+                None,
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn generated_team_size_is_bounded_for_large_workspace_plans() {
+        let agents = std::iter::once(generated_agent("Team Lead", None))
+            .chain(
+                (1..=voff_prompts::setup::MAX_GENERATED_AGENTS)
+                    .map(|index| generated_agent(&format!("Worker {index}"), Some("Team Lead"))),
+            )
+            .collect();
+        let result = plan_to_draft(
+            WorkspaceTeamPlan {
+                summary: "A broad project team.".into(),
+                agents,
+            },
+            ProviderChoice::CodexCli,
+            "default",
+            None,
+        );
+
+        assert!(result.unwrap_err().contains("exceeds the limit"));
+    }
+
+    #[test]
+    fn team_plan_output_budget_scales_with_project_evidence_and_is_bounded() {
+        let small = WorkspaceScan {
+            files_seen: 12,
+            ..WorkspaceScan::default()
+        };
+        let large = WorkspaceScan {
+            files_seen: 2_000,
+            ..WorkspaceScan::default()
+        };
+
+        assert_eq!(team_plan_output_budget(&small), 4_096);
+        assert!(team_plan_output_budget(&large) > team_plan_output_budget(&small));
+        assert_eq!(team_plan_output_budget(&large), 16_384);
     }
 
     #[test]
