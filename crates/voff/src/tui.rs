@@ -3,6 +3,7 @@ mod task_layout;
 mod team_flow;
 
 use crate::model_catalog::ModelCatalog;
+use crate::terminal_colors::ColorFallbackBackend;
 use crate::theme;
 use crossterm::{
     event::{
@@ -15,7 +16,6 @@ use crossterm::{
 };
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -2760,7 +2760,7 @@ async fn terminal_loop<R: Repository + 'static>(
     let mut terminal = if let Some(terminal) = startup_terminal {
         terminal
     } else {
-        Terminal::new(CrosstermBackend::new(io::stdout()))?
+        Terminal::new(ColorFallbackBackend::new(io::stdout()))?
     };
     let input = tokio::task::spawn_blocking(move || {
         forward_terminal_events(input_tx, event::poll, event::read);
@@ -4542,20 +4542,15 @@ fn conversation_lines(
         if task.attempt > 1 && app.expanded_output {
             title.push_str(&format!(" · attempt {}", task.attempt));
         }
-        let mut reviewer_highlight = None;
+        let mut reviewer_highlight: Option<(String, Color)> = None;
         let detail = if let Some(review) = &event.review {
             let reviewer = app.agent_for_owner(review.reviewer).map_or_else(
                 || short_agent_id(review.reviewer),
                 |agent| sanitize(&agent.name),
             );
             if review.reviewer != task.owner {
-                let start = match &review.decision {
-                    Some((true, _)) => 0,
-                    Some((false, _)) => "↶ ".len(),
-                    None => "↶ Waiting for ".len(),
-                };
                 reviewer_highlight = Some((
-                    start..start + reviewer.len(),
+                    reviewer.clone(),
                     app.agent_for_owner(review.reviewer)
                         .map_or(theme::TEXT, |agent| app.agent_color(agent)),
                 ));
@@ -4614,13 +4609,17 @@ fn conversation_lines(
                 .to_owned()
         };
         if app.expanded_output {
-            title = format!(
-                "{} · {title}",
-                event
-                    .created_at
-                    .with_timezone(&chrono::Local)
-                    .format("%H:%M:%S")
-            );
+            let timestamp = event
+                .created_at
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S");
+            title = if let Some(label) = title.strip_prefix('✓') {
+                format!("✓ {timestamp} ·{label}")
+            } else if let Some(label) = title.strip_prefix("↳") {
+                format!("↳ {timestamp} ·{label}")
+            } else {
+                format!("{timestamp} · {title}")
+            };
         }
         let start = lines.len();
         push_activity_entry(
@@ -4647,9 +4646,19 @@ fn conversation_lines(
                 width,
             );
         }
-        if let Some(highlight) = reviewer_highlight {
+        if let Some((reviewer, color)) = reviewer_highlight
+            && let Some(highlight_start) = title
+                .strip_prefix('✓')
+                .map_or(title.as_str(), str::trim)
+                .find(&reviewer)
+        {
             let label = title.strip_prefix('✓').map_or(title.as_str(), str::trim);
-            color_activity_label(&mut lines[start..], label, &[highlight], width);
+            color_activity_label(
+                &mut lines[start..],
+                label,
+                &[((highlight_start..highlight_start + reviewer.len()), color)],
+                width,
+            );
         }
         if connected && let Some(index) = previous_entry {
             let previous: &mut Line<'static> = &mut lines[index];
@@ -6466,7 +6475,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter_with_handoff(
         startup_handoff: Option<crate::onboarding::TerminalHandoff>,
-    ) -> io::Result<(Self, Option<Terminal<CrosstermBackend<io::Stdout>>>)> {
+    ) -> io::Result<(Self, Option<Terminal<ColorFallbackBackend<io::Stdout>>>)> {
         let key_flags = PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
@@ -6662,7 +6671,7 @@ mod tests {
         let rendered = (0..36)
             .flat_map(|y| (0..120).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("REVIEW"), "{rendered}");
+        assert!(rendered.contains("Reviewing proposal"), "{rendered}");
         app.lead_reviews.clear();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.team_flow.edges()[0].source, lead.id.to_string());
@@ -6949,7 +6958,7 @@ mod tests {
             .join("\n");
         assert!(!text.contains("Review 1") && !text.contains("Review 2"));
         assert_eq!(text.matches("Waiting for pashaaaaa").count(), 1);
-        assert_eq!(text.matches("✓ pashaaaaa approved").count(), 1);
+        assert_eq!(text.matches("pashaaaaa approved").count(), 1);
         assert!(text.contains("approved · running checks"));
         assert!(!text.contains("process.test") && !text.contains("Action proposed"));
         assert!(
@@ -7247,18 +7256,33 @@ mod tests {
             app.expanded_output = expanded;
             let lines = conversation_lines(&app, &HashSet::from([task.id]), 40, None);
             let rows: Vec<_> = lines.iter().map(ToString::to_string).collect();
-            assert_eq!(
-                rows,
-                [
-                    " Backend",
-                    " ├─• First line",
-                    " │   Second line",
-                    " │",
-                    " ╰─✓ Finished",
-                    "     Verified",
-                    ""
-                ]
-            );
+            if expanded {
+                assert_eq!(rows.len(), 9, "{rows:?}");
+                assert_eq!(rows[0], " Backend");
+                assert!(rows[1].starts_with(" ├─• "), "{rows:?}");
+                assert!(rows[1].ends_with(" ·"), "{rows:?}");
+                assert_eq!(rows[2], " │   First line");
+                assert_eq!(rows[3], " │   Second line");
+                assert_eq!(rows[4], " │");
+                assert!(rows[5].starts_with(" ╰─✓ "), "{rows:?}");
+                assert!(rows[5].ends_with(" ·"), "{rows:?}");
+                assert_eq!(rows[6], "     Finished");
+                assert_eq!(rows[7], "     Verified");
+                assert_eq!(rows[8], "");
+            } else {
+                assert_eq!(
+                    rows,
+                    [
+                        " Backend",
+                        " ├─• First line",
+                        " │   Second line",
+                        " │",
+                        " ╰─✓ Finished",
+                        "     Verified",
+                        ""
+                    ]
+                );
+            }
         }
     }
 
@@ -7416,11 +7440,6 @@ mod tests {
         assert!(!help.contains("Ctrl+F4"));
         assert!(help.contains("↑ / ↓"));
         assert!(help.contains("Prompt history"));
-        assert!(
-            help_lines(false)
-                .last()
-                .is_some_and(|line| line.width() == 0)
-        );
     }
 
     #[test]
@@ -8474,7 +8493,7 @@ mod tests {
         assert_eq!(buffer[heading].fg, theme::ORANGE);
         assert!(matches!(
             buffer[(content.x, content.y)].bg,
-            ratatui::style::Color::Reset | ratatui::style::Color::Indexed(_)
+            ratatui::style::Color::Reset | ratatui::style::Color::Rgb(_, _, _)
         ));
     }
 

@@ -252,17 +252,17 @@ async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
     }));
 
     engine.coordinate_pending().await.unwrap();
-    let retry = repo
-        .tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|candidate| candidate.retry_of == Some(task.id))
-        .expect("approved recovery should create a new attempt");
-    assert_eq!(retry.status, TaskStatus::Queued);
-    assert_eq!(retry.owner, task.owner);
-    assert_eq!(retry.parent, task.parent);
-    assert_eq!(retry.acceptance_criteria, task.acceptance_criteria);
+    let resumed = repo.task(task.id).await.unwrap().unwrap();
+    assert_eq!(resumed.status, TaskStatus::Ready);
+    assert_eq!(resumed.owner, task.owner);
+    assert_eq!(resumed.parent, task.parent);
+    assert_eq!(resumed.acceptance_criteria, task.acceptance_criteria);
+    assert!(repo.events(session).await.unwrap().iter().any(|event| {
+        matches!(
+            event.kind,
+            CanonicalEventKind::WorkRetrying { attempt: 1, .. }
+        )
+    }));
 
     let requests = provider.requests.lock().await;
     assert_eq!(requests.len(), 2);
@@ -282,7 +282,7 @@ async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
 }
 
 #[tokio::test]
-async fn malformed_process_invocation_gets_one_reviewed_recovery_attempt() {
+async fn malformed_process_invocation_returns_feedback_without_failing_task() {
     let malformed_check = call(
         "process.test",
         serde_json::json!({
@@ -292,8 +292,11 @@ async fn malformed_process_invocation_gets_one_reviewed_recovery_attempt() {
             "verification":true
         }),
     );
-    let (engine, repo, provider, _dir, session, lead) =
-        setup(vec![malformed_check, verdict(true)], false).await;
+    let (engine, repo, provider, _dir, session, lead) = setup(
+        vec![malformed_check, Ok(vec![ProviderEvent::Completed])],
+        false,
+    )
+    .await;
     let mut agent = repo.agent(lead).await.unwrap().unwrap();
     agent.tools.push("process.test".into());
     repo.save_agent(agent).await.unwrap();
@@ -303,27 +306,24 @@ async fn malformed_process_invocation_gets_one_reviewed_recovery_attempt() {
         .await
         .unwrap();
     engine.mark_ready(task.id).await.unwrap();
-    assert!(matches!(
-        engine.run_task(task.id).await,
-        Err(voff_engine::EngineError::Executor(
-            voff_tools::ExecutorError::InvalidInvocation(_)
-        ))
-    ));
+    engine.run_task(task.id).await.unwrap();
 
     let events = repo.events(session).await.unwrap();
-    assert!(events.iter().any(|event| matches!(
-        &event.kind,
-        CanonicalEventKind::WorkRecoveryRequested {
-            reason,
-            retry_allowed: true,
-        } if reason.contains("process invocation is invalid")
-    )));
-    engine.coordinate_pending().await.unwrap();
-
-    assert!(repo.tasks().await.unwrap().iter().any(|candidate| {
-        candidate.retry_of == Some(task.id) && candidate.status == TaskStatus::Queued
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, CanonicalEventKind::WorkRecoveryRequested { .. }))
+    );
+    assert!(repo.artifacts().await.unwrap().iter().any(|artifact| {
+        artifact.producer == task.id
+            && artifact.kind == "workflow_feedback"
+            && artifact.location.starts_with("process.invalid_invocation:")
     }));
-    assert_eq!(provider.requests.lock().await.len(), 2);
+    assert_eq!(
+        repo.task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Ready
+    );
+    assert_eq!(provider.requests.lock().await.len(), 1);
     assert!(repo.approvals(session).await.unwrap().is_empty());
 }
 
@@ -438,7 +438,7 @@ async fn rejected_delegated_work_gets_feedback_and_returns_for_review() {
     );
     let bad = call(
         "file.patch",
-        serde_json::json!({"path":"scaffold.sh","replacement":"rm -rf voffak-frontend"}),
+        serde_json::json!({"path":"scaffold.sh","replacement":"rm -rf frontend"}),
     );
     let rejection = call(
         "workflow.decide",
@@ -456,18 +456,12 @@ async fn rejected_delegated_work_gets_feedback_and_returns_for_review() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     let tasks = repo.tasks().await.unwrap();
-    let blocked = tasks
+    assert_eq!(tasks.len(), 2);
+    let worker_task = tasks
         .iter()
-        .find(|task| task.status == TaskStatus::Blocked)
+        .find(|task| task.parent == Some(root.id))
         .unwrap();
-    let revised = tasks
-        .iter()
-        .find(|task| task.retry_of == Some(blocked.id))
-        .unwrap();
-    assert_eq!(revised.owner, blocked.owner);
-    assert_eq!(revised.parent, blocked.parent);
-    assert_eq!(revised.acceptance_criteria, blocked.acceptance_criteria);
-    assert_eq!(revised.status, TaskStatus::Completed);
+    assert_eq!(worker_task.status, TaskStatus::Completed);
     assert_eq!(
         repo.task(root.id).await.unwrap().unwrap().status,
         TaskStatus::Completed
@@ -486,11 +480,6 @@ async fn rejected_delegated_work_gets_feedback_and_returns_for_review() {
             .contains("Remove destructive deletion")
     );
     assert!(
-        requests[3].messages[1]
-            .content
-            .contains("rm -rf voffak-frontend")
-    );
-    assert!(
         repo.events(session)
             .await
             .unwrap()
@@ -502,7 +491,7 @@ async fn rejected_delegated_work_gets_feedback_and_returns_for_review() {
             .await
             .unwrap()
             .iter()
-            .any(|approval| approval.task_id == blocked.id
+            .any(|approval| approval.task_id == worker_task.id
                 && approval.decision == ApprovalDecision::Denied)
     );
 }
@@ -515,7 +504,7 @@ async fn unchanged_denied_proposal_cannot_be_approved_on_a_retry() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     assert_eq!(provider.requests.lock().await.len(), 3);
-    assert_eq!(repo.tasks().await.unwrap().len(), 2);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
     assert!(!dir.path().join("backend").exists());
     assert!(
         repo.events(session)
@@ -527,18 +516,18 @@ async fn unchanged_denied_proposal_cannot_be_approved_on_a_retry() {
 }
 
 #[tokio::test]
-async fn unrelated_evidence_cannot_reopen_a_rejected_process_action() {
+async fn invalid_inline_process_proposal_returns_feedback_without_approval() {
     let inline_check = call(
         "process.test",
         serde_json::json!({
-            "program":"node",
-            "args":["-e", "console.log('inline test')"],
+            "program":"/usr/bin/node",
+            "args":["--check", "converter.js"],
             "purpose":"Check converter behavior",
             "verification":true
         }),
     );
     let (engine, repo, provider, _dir, session, lead) = setup(
-        vec![inline_check.clone(), verdict(false), inline_check],
+        vec![inline_check, Ok(vec![ProviderEvent::Completed])],
         false,
     )
     .await;
@@ -552,49 +541,29 @@ async fn unrelated_evidence_cannot_reopen_a_rejected_process_action() {
         .unwrap();
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task(root.id).await.unwrap();
-    engine.coordinate_pending().await.unwrap();
-    let retry = repo
-        .tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.retry_of == Some(root.id))
-        .expect("the first rejection should request a bounded correction");
-
-    engine
-        .publish_artifact(Artifact {
-            id: ArtifactId::new(),
-            producer: retry.id,
-            kind: "test_report".into(),
-            location: "node --check converter.js".into(),
-            digest: String::new(),
-            preview: "Syntax check passed".into(),
-        })
-        .await
-        .unwrap();
-    engine.mark_ready(retry.id).await.unwrap();
-    engine.run_task(retry.id).await.unwrap();
-    engine.coordinate_pending().await.unwrap();
+    let retry = repo.task(root.id).await.unwrap().unwrap();
+    assert_eq!(retry.status, TaskStatus::Ready);
 
     let approvals = repo.approvals(session).await.unwrap();
-    assert_eq!(
+    assert!(
         approvals
             .iter()
-            .filter(|approval| approval.action == "process.test")
-            .count(),
-        2
+            .all(|approval| approval.action != "process.test")
     );
-    assert!(approvals.iter().all(|approval| {
-        approval.action != "process.test" || approval.decision == ApprovalDecision::Denied
-    }));
-    assert_eq!(provider.requests.lock().await.len(), 3);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
+    assert_eq!(provider.requests.lock().await.len(), 1);
     assert!(
         repo.events(session)
             .await
             .unwrap()
             .iter()
-            .any(|event| matches!(event.kind, CanonicalEventKind::RevisionStopped(_)))
+            .all(|event| { !matches!(event.kind, CanonicalEventKind::RevisionStopped(_)) })
     );
+    assert!(repo.artifacts().await.unwrap().iter().any(|artifact| {
+        artifact.producer == root.id
+            && artifact.kind == "workflow_feedback"
+            && artifact.location.starts_with("process.invalid_invocation:")
+    }));
 }
 
 #[tokio::test]
@@ -616,13 +585,8 @@ async fn denied_proposal_gets_fresh_review_after_retry_adds_evidence() {
     engine.run_task(root.id).await.unwrap();
     engine.coordinate_pending().await.unwrap();
 
-    let retry = repo
-        .tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.retry_of == Some(root.id))
-        .expect("denial feedback should create a retry");
+    let retry = repo.task(root.id).await.unwrap().unwrap();
+    assert_eq!(retry.status, TaskStatus::Ready);
     let new_evidence = "The inspected workspace manifest confirms the package is in the workspace.";
     engine
         .publish_artifact(Artifact {
@@ -636,7 +600,6 @@ async fn denied_proposal_gets_fresh_review_after_retry_adds_evidence() {
         .await
         .unwrap();
 
-    engine.mark_ready(retry.id).await.unwrap();
     engine.run_task(retry.id).await.unwrap();
     engine.coordinate_pending().await.unwrap();
 
@@ -669,7 +632,16 @@ async fn changed_but_rejected_revisions_stop_at_attempt_limit() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     engine.run_until_idle_bounded(2).await.unwrap();
-    assert_eq!(repo.tasks().await.unwrap().len(), 3);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
+    assert_eq!(
+        repo.events(session)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, CanonicalEventKind::WorkRetrying { .. }))
+            .count(),
+        2
+    );
     assert_eq!(provider.requests.lock().await.len(), 6);
     assert!(!dir.path().join("app.js").exists());
     assert_eq!(
@@ -719,8 +691,8 @@ async fn persisted_revision_resumes_once_after_sqlite_reopen() {
         .decide_approval(approval.id, ApprovalDecision::Denied)
         .await
         .unwrap();
-    // Snapshot the durable point after a valid Lead rejection and before the
-    // scheduler creates the revised attempt.
+    // Snapshot the durable point after a Lead rejection and before the
+    // scheduler resumes the same task with review feedback.
     memory
         .append_event(CanonicalEvent {
             id: EventId::new(),
@@ -765,18 +737,10 @@ async fn persisted_revision_resumes_once_after_sqlite_reopen() {
     resumed.run_until_idle_bounded(2).await.unwrap();
     resumed.run_until_idle_bounded(2).await.unwrap();
     let tasks = repo.tasks().await.unwrap();
-    assert_eq!(tasks.len(), 2);
-    assert_eq!(
-        tasks
-            .iter()
-            .find(|task| task.retry_of.is_some())
-            .unwrap()
-            .status,
-        TaskStatus::Completed
-    );
+    assert_eq!(tasks.len(), 1);
     assert_eq!(
         repo.task(task.id).await.unwrap().unwrap().status,
-        TaskStatus::Blocked
+        TaskStatus::Completed
     );
     assert!(!dir.path().join("bad.sh").exists());
     assert!(
@@ -808,24 +772,24 @@ async fn delegated_failure_returns_to_lead_and_repair_completes_parent() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     let tasks = repo.tasks().await.unwrap();
-    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks.len(), 2);
     assert_eq!(
         repo.task(root.id).await.unwrap().unwrap().status,
         TaskStatus::Completed
     );
-    let failed = tasks
+    let worker_task = tasks
         .iter()
-        .find(|task| task.status == TaskStatus::Failed)
+        .find(|task| task.parent == Some(root.id))
         .unwrap();
-    let retry = tasks
-        .iter()
-        .find(|task| task.retry_of == Some(failed.id))
-        .unwrap();
-    assert_eq!(retry.status, TaskStatus::Completed);
-    assert_eq!(retry.acceptance_criteria, failed.acceptance_criteria);
-    assert_eq!(retry.owner, failed.owner);
-    assert_eq!(retry.parent, failed.parent);
-    assert!(retry.objective.contains("Team Lead repair instructions"));
+    assert_eq!(worker_task.status, TaskStatus::Completed);
+    assert_eq!(worker_task.acceptance_criteria, vec!["Runnable"]);
+    assert!(repo.events(session).await.unwrap().iter().any(|event| {
+        event.task_id == Some(worker_task.id)
+            && matches!(
+                event.kind,
+                CanonicalEventKind::WorkRetrying { attempt: 1, .. }
+            )
+    }));
     assert!(dir.path().join("backend/src/app.js").is_file());
     assert_eq!(provider.requests.lock().await.len(), 5);
     assert!(
@@ -846,7 +810,7 @@ async fn delegated_failure_returns_to_lead_and_repair_completes_parent() {
 
 #[tokio::test]
 async fn automatic_repairs_stop_after_three_attempts() {
-    let (engine, repo, provider, _dir, _, lead) = setup(
+    let (engine, repo, provider, _dir, session, lead) = setup(
         vec![
             error(ProviderErrorKind::InvalidResponse),
             verdict(true),
@@ -861,7 +825,16 @@ async fn automatic_repairs_stop_after_three_attempts() {
     engine.mark_ready(task.id).await.unwrap();
     engine.run_task_and_schedule(task.id, 2).await.unwrap();
     engine.run_until_idle_bounded(2).await.unwrap();
-    assert_eq!(repo.tasks().await.unwrap().len(), 3);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
+    assert_eq!(
+        repo.events(session)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| { matches!(event.kind, CanonicalEventKind::WorkRetrying { .. }) })
+            .count(),
+        2
+    );
     assert_eq!(provider.requests.lock().await.len(), 5);
 }
 
@@ -994,7 +967,7 @@ async fn local_file_error_is_reviewed_with_path_and_repaired() {
         "file.patch",
         serde_json::json!({"path":"existing_file/app.js","replacement":"wrong destination"}),
     );
-    let (engine, repo, provider, dir, _, lead) =
+    let (engine, repo, provider, dir, _session, lead) =
         setup(vec![bad, verdict(true), patch(), verdict(true)], false).await;
     std::fs::write(dir.path().join("existing_file"), "preserve me").unwrap();
     let task = engine.create_task(lead, "Build", vec![]).await.unwrap();
@@ -1005,7 +978,8 @@ async fn local_file_error_is_reviewed_with_path_and_repaired() {
         "preserve me"
     );
     assert!(dir.path().join("backend/src/app.js").is_file());
-    assert_eq!(repo.tasks().await.unwrap().len(), 2);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
+    assert_eq!(provider.requests.lock().await.len(), 4);
     assert!(
         provider.requests.lock().await[1].messages[1]
             .content

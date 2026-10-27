@@ -3,6 +3,7 @@ mod logging;
 mod model_catalog;
 mod onboarding;
 mod runtime;
+mod terminal_colors;
 mod theme;
 mod tui;
 

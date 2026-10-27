@@ -1,6 +1,7 @@
 //! Interactive workspace setup and team builder.
 
 use crate::model_catalog::ModelCatalog;
+use crate::terminal_colors::ColorFallbackBackend;
 use crate::theme;
 use ansi_to_tui::IntoText as _;
 use crossterm::{
@@ -14,7 +15,6 @@ use crossterm::{
 };
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -468,11 +468,11 @@ pub(crate) enum StartupChoice {
 
 pub(crate) struct TerminalHandoff {
     guard: TerminalGuard,
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: Terminal<ColorFallbackBackend<io::Stdout>>,
 }
 
 impl TerminalHandoff {
-    pub(crate) fn adopt(mut self) -> Terminal<CrosstermBackend<io::Stdout>> {
+    pub(crate) fn adopt(mut self) -> Terminal<ColorFallbackBackend<io::Stdout>> {
         self.guard.handoff();
         self.terminal
     }
@@ -1679,7 +1679,7 @@ fn unique_name(base: &str, developers: &[DeveloperDraft], exclude: Option<usize>
 /// Set up a project team from the workspace or a short user description.
 pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
     let guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = Terminal::new(ColorFallbackBackend::new(io::stdout()))?;
     let choices = startup_provider_choices();
     let catalog = ModelCatalog::default();
     let mut provider = ProviderChoice::default_provider();
@@ -1922,7 +1922,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
 }
 
 fn browse_startup_workspace(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<ColorFallbackBackend<io::Stdout>>,
     view: StartupView<'_>,
 ) -> io::Result<StartupPickerResult<PathBuf>> {
     let mut wizard = Wizard::workspace(view.workspace);
@@ -2007,7 +2007,7 @@ fn render_startup_workspace_browser(
 }
 
 fn browse_startup_model(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<ColorFallbackBackend<io::Stdout>>,
     view: StartupView<'_>,
     catalog: &ModelCatalog,
 ) -> io::Result<StartupPickerResult<String>> {
@@ -2136,7 +2136,7 @@ pub(crate) fn show_splash() -> io::Result<()> {
         return Ok(());
     }
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = Terminal::new(ColorFallbackBackend::new(io::stdout()))?;
     terminal.draw(|frame| {
         let provider = ProviderChoice::default_provider();
         let catalog = ModelCatalog::default();
@@ -2774,8 +2774,8 @@ fn render_starfield(frame: &mut ratatui::Frame<'_>, area: Rect, background: Colo
             }
             let phase = (elapsed + u128::from(seed % 12_000)) % 12_000;
             let (symbol, color) = match phase {
-                0..=1_499 => ("✦", portable_color(Color::Rgb(178, 81, 30))),
-                1_500..=2_499 => ("✧", portable_color(Color::Rgb(116, 59, 31))),
+                0..=1_499 => ("✦", Color::Rgb(178, 81, 30)),
+                1_500..=2_499 => ("✧", Color::Rgb(116, 59, 31)),
                 _ => continue,
             };
             frame.render_widget(
@@ -3622,12 +3622,9 @@ fn fill_logo_background(mut logo: Text<'static>, background: Color) -> Text<'sta
     for line in &mut logo.lines {
         line.style = line.style.bg(background);
         for span in &mut line.spans {
-            span.style.fg = span.style.fg.map(portable_color);
-            span.style.bg = span.style.bg.map(portable_color);
-            span.style.underline_color = span.style.underline_color.map(portable_color);
             if matches!(
                 span.style.bg,
-                None | Some(Color::Indexed(0) | Color::Indexed(16) | Color::Black | Color::Reset,)
+                None | Some(Color::Rgb(0, 0, 0) | Color::Black | Color::Reset)
             ) {
                 span.style = span.style.bg(background);
             }
@@ -3636,51 +3633,13 @@ fn fill_logo_background(mut logo: Text<'static>, background: Color) -> Text<'sta
     logo
 }
 
-fn portable_color(color: Color) -> Color {
-    portable_color_for(color, truecolor_supported())
-}
-
-fn portable_color_for(color: Color, truecolor: bool) -> Color {
-    match color {
-        Color::Rgb(red, green, blue) if !truecolor => theme::ansi256(red, green, blue),
-        color => color,
-    }
-}
-
-fn truecolor_supported() -> bool {
-    truecolor_supported_by(
-        std::env::var("COLORTERM").ok().as_deref(),
-        std::env::var("TERM").ok().as_deref(),
-        std::env::var("TERM_PROGRAM").ok().as_deref(),
-    )
-}
-
-fn truecolor_supported_by(
-    colorterm: Option<&str>,
-    term: Option<&str>,
-    term_program: Option<&str>,
-) -> bool {
-    let declares_truecolor = |value: &str| {
-        let value = value.to_ascii_lowercase();
-        value.contains("truecolor") || value.contains("24bit") || value.contains("direct")
-    };
-    colorterm.is_some_and(declares_truecolor)
-        || term.is_some_and(declares_truecolor)
-        || term_program.is_some_and(|program| {
-            matches!(
-                program.to_ascii_lowercase().as_str(),
-                "ghostty" | "iterm.app" | "kitty" | "wezterm" | "vscode" | "warpterminal"
-            )
-        })
-}
-
 fn logo_art_cell(character: char, style: Style) -> bool {
     !character.is_whitespace()
         || style.add_modifier.contains(Modifier::REVERSED)
         || style.bg.is_some_and(|background| {
             !matches!(
-                portable_color(background),
-                Color::Indexed(0) | Color::Indexed(16) | Color::Black | Color::Reset
+                background,
+                Color::Rgb(0, 0, 0) | Color::Black | Color::Reset
             )
         })
 }
@@ -5100,17 +5059,18 @@ mod tests {
             "logo must retain its original shaded blocks"
         );
         assert!(
-            logo.lines.iter().flat_map(|line| &line.spans).any(|span| {
-                matches!(
-                    span.style.fg,
-                    Some(Color::Rgb(0, 0, 0) | Color::Indexed(16))
-                )
-            }),
+            logo.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg == Some(Color::Rgb(0, 0, 0))),
             "black outline pixels must not be made transparent"
         );
-        assert!(logo.lines.iter().flat_map(|line| &line.spans).any(|span| {
-            matches!(span.style.fg, Some(Color::Rgb(_, _, _) | Color::Indexed(_)))
-        }));
+        assert!(
+            logo.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _))))
+        );
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| {
@@ -5147,33 +5107,6 @@ mod tests {
         assert!(rendered.contains("Model"), "{rendered}");
         assert!(rendered.contains("Press Enter to voff"), "{rendered}");
         assert!(!rendered.contains("not detected"), "{rendered}");
-    }
-
-    #[test]
-    fn truecolor_detection_keeps_rgb_only_for_capable_terminals() {
-        assert!(truecolor_supported_by(
-            Some("truecolor"),
-            Some("xterm-256color"),
-            None
-        ));
-        assert!(truecolor_supported_by(
-            None,
-            Some("xterm-256color"),
-            Some("iTerm.app")
-        ));
-        assert!(!truecolor_supported_by(
-            None,
-            Some("xterm-256color"),
-            Some("Apple_Terminal")
-        ));
-        assert_eq!(
-            portable_color_for(Color::Rgb(12, 34, 56), true),
-            Color::Rgb(12, 34, 56)
-        );
-        assert!(matches!(
-            portable_color_for(Color::Rgb(12, 34, 56), false),
-            Color::Indexed(16..=255)
-        ));
     }
 
     #[test]

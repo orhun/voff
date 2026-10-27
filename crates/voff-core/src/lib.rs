@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_transition_sequences_preserve_terminal_states() {
+    fn generated_transition_sequences_preserve_terminal_states_and_allow_failure_recovery() {
         let terminal = [
             TaskStatus::Completed,
             TaskStatus::Failed,
@@ -651,8 +651,15 @@ mod tests {
                 TaskStatus::Failed,
                 TaskStatus::Cancelled,
             ] {
-                assert!(task.transition(candidate).is_err());
-                assert_eq!(task.status, final_status);
+                let mut candidate_task = task.clone();
+                let result = candidate_task.transition(candidate);
+                if final_status == TaskStatus::Failed && candidate == TaskStatus::Ready {
+                    assert!(result.is_ok());
+                    assert_eq!(candidate_task.status, TaskStatus::Ready);
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(candidate_task.status, final_status);
+                }
             }
         }
     }

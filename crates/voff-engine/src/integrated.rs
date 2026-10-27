@@ -255,14 +255,16 @@ mod tests {
     use voff_storage::InMemoryRepository;
 
     #[test]
-    fn plan_requires_request_appropriate_verification_and_an_explicit_blocker_path() {
-        assert!(WORK_INSTRUCTIONS.contains("verification-only request"));
-        assert!(WORK_INSTRUCTIONS.contains("task.blocked"));
-        assert!(WORK_INSTRUCTIONS.contains("separate, mediated interface"));
+    fn work_instructions_require_evidence_and_a_concrete_blocker() {
         assert!(
             WORK_INSTRUCTIONS
-                .contains("temporary working directory is not the configured workspace")
+                .contains("Do not claim an action or check was completed without evidence")
         );
+        assert!(
+            WORK_INSTRUCTIONS
+                .contains("Use task.blocked only when no permitted path can meet the requirement")
+        );
+        assert!(WORK_INSTRUCTIONS.contains("mediated separately from provider-native tools"));
         let mut tools = Vec::new();
         configure_tools(&mut tools, &[], 0, None);
         assert!(tools.iter().any(|tool| tool.name == "task.blocked"));

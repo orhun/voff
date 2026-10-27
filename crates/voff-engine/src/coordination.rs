@@ -7,6 +7,7 @@ use voff_prompts::{
 };
 const REVIEW_TIMEOUT_SECONDS: u64 = 300;
 const REVIEW_RETRY_DELAY_SECONDS: i64 = 30;
+const MAX_AUTOMATIC_REPAIR_RETRIES: u32 = 2;
 const MAX_PARALLEL_REVIEWS: usize = 4;
 const TEMPORARY_REVIEW_PREFIX: &str = "Reporting-agent review temporarily unavailable";
 
@@ -297,6 +298,29 @@ impl<R: Repository + 'static> Engine<R> {
             if !children_have_settled_attempts(task.id, &tasks) {
                 continue;
             }
+            if retry_allowed
+                && next_work_retry_attempt(&events, task.id) > MAX_AUTOMATIC_REPAIR_RETRIES
+            {
+                let already_stopped = events.iter().any(|event| {
+                    event.task_id == Some(task.id)
+                        && matches!(
+                            &event.kind,
+                            CanonicalEventKind::RevisionStopped(reason)
+                                if reason.starts_with("Automatic repair stopped after")
+                        )
+                });
+                if !already_stopped {
+                    self.record(
+                        Some(task.id),
+                        CanonicalEventKind::RevisionStopped(format!(
+                            "Automatic repair stopped after {} retries.",
+                            MAX_AUTOMATIC_REPAIR_RETRIES
+                        )),
+                    )
+                    .await?;
+                }
+                continue;
+            }
             let last_recovery_review = events
                 .iter()
                 .filter(|event| {
@@ -496,6 +520,27 @@ impl<R: Repository + 'static> Engine<R> {
         }
         let events = self.repo.events(self.session).await?;
         let attempt = next_work_retry_attempt(&events, task.id);
+        if attempt > MAX_AUTOMATIC_REPAIR_RETRIES {
+            let already_stopped = events.iter().any(|event| {
+                event.task_id == Some(task.id)
+                    && matches!(
+                        &event.kind,
+                        CanonicalEventKind::RevisionStopped(reason)
+                            if reason.starts_with("Automatic repair stopped after")
+                    )
+            });
+            if !already_stopped {
+                self.record(
+                    Some(task.id),
+                    CanonicalEventKind::RevisionStopped(format!(
+                        "Automatic repair stopped after {} retries.",
+                        MAX_AUTOMATIC_REPAIR_RETRIES
+                    )),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         self.publish_artifact(Artifact {
             id: ArtifactId::new(),
             producer: task.id,
@@ -929,16 +974,14 @@ mod tests {
     use super::*;
     use voff_storage::InMemoryRepository;
     #[test]
-    fn review_policy_allows_app_config_but_not_security_changes() {
-        assert!(REVIEW_POLICY.contains("Vite proxies"));
-        assert!(REVIEW_POLICY.contains("may be created or edited when required by the task"));
+    fn review_policy_allows_scoped_workspace_changes_but_rejects_security_changes() {
         assert!(REVIEW_POLICY.contains(
-            "not permission to change Voff configuration, credentials, or security controls"
+            "Expected workspace-local changes directly required by the approved task may be allowed"
         ));
-        assert!(REVIEW_POLICY.contains("inspect the exact executable, every argv item"));
-        assert!(REVIEW_POLICY.contains("Reject shell execution"));
-        assert!(REVIEW_POLICY.contains("command names are not pre-approved"));
-        assert!(REVIEW_POLICY.contains("bounded local workspace command"));
+        assert!(REVIEW_POLICY.contains("permission changes, credential access"));
+        assert!(REVIEW_POLICY.contains("inspect the exact executable, every argument"));
+        assert!(REVIEW_POLICY.contains("shell execution or shell-invoking wrappers"));
+        assert!(REVIEW_POLICY.contains("a familiar command name does not make it pre-approved"));
         assert!(REVIEW_POLICY.contains("EVIDENCE_ONLY:"));
         assert!(REVIEW_POLICY.contains("never authorizes the action by itself"));
     }

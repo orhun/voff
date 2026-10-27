@@ -2235,7 +2235,8 @@ impl<R: Repository + 'static> Engine<R> {
         let patch_approvals = approvals
             .iter()
             .filter(|approval| {
-                approval.action == "file.patch"
+                lineage.contains(&approval.task_id)
+                    && approval.action == "file.patch"
                     && approval.decision == ApprovalDecision::ApprovedOnce
             })
             .map(|approval| approval.id)
@@ -4042,6 +4043,39 @@ mod tests {
                 .unwrap()
         );
 
+        let unrelated_task = engine
+            .create_task(AgentId::new(), "implement an unrelated change", vec![])
+            .await
+            .unwrap();
+        let unrelated_patch = Approval {
+            id: ApprovalId::new(),
+            task_id: unrelated_task.id,
+            tool_call_id: ToolCallId::new(),
+            action: "file.patch".into(),
+            working_directory: ".".into(),
+            reason: "{}".into(),
+            decision: ApprovalDecision::ApprovedOnce,
+            created_at: chrono::Utc::now(),
+        };
+        repo.save_approval(unrelated_patch.clone()).await.unwrap();
+        engine
+            .record(
+                Some(unrelated_task.id),
+                CanonicalEventKind::ApprovalDecided {
+                    approval_id: unrelated_patch.id,
+                    decision: ApprovalDecision::ApprovedOnce,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .successful_verification_is_reusable(&task, &spec)
+                .await
+                .unwrap(),
+            "an unrelated task's patch must not invalidate this verification"
+        );
+
         let patch_approval = Approval {
             id: ApprovalId::new(),
             task_id: task.id,
@@ -5284,7 +5318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_reconciles_parent_after_a_tool_proposal_error() {
+    async fn scheduler_blocks_parent_after_a_tool_proposal_error_for_review() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Arc::new(InMemoryRepository::default());
         let (tx, _rx) = mpsc::channel(64);
@@ -5328,7 +5362,7 @@ mod tests {
         );
         assert_eq!(
             repo.task(parent.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
+            TaskStatus::Blocked
         );
     }
 
@@ -6194,7 +6228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_child_fails_dependent_review_and_parent() {
+    async fn failed_child_fails_dependent_review_and_blocks_parent() {
         let repo = Arc::new(InMemoryRepository::default());
         let (tx, _rx) = mpsc::channel(256);
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![MockStep::Fail(
@@ -6235,7 +6269,7 @@ mod tests {
         );
         assert_eq!(
             repo.task(parent.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
+            TaskStatus::Blocked
         );
     }
 
