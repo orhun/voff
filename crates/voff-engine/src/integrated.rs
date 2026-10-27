@@ -136,6 +136,16 @@ pub(super) fn verification_only(task: &Task) -> bool {
     verification_kind(task).is_some() && !is_implementation_objective(&task.objective)
 }
 
+fn has_integration_sibling(task: &Task, tasks: &[Task]) -> bool {
+    task.parent.is_some()
+        && task.work.as_ref().is_some_and(|work| !work.integration)
+        && tasks.iter().any(|sibling| {
+            sibling.id != task.id
+                && sibling.parent == task.parent
+                && sibling.work.as_ref().is_some_and(|work| work.integration)
+        })
+}
+
 pub(super) fn dedicated_validation_target<'a>(
     task: &Task,
     lead: &AgentProfile,
@@ -1080,11 +1090,12 @@ impl<R: Repository + 'static> Engine<R> {
                 .delegation_target(&proposal.target_agent)
                 .await?
                 .ok_or(EngineError::TaskNotFound)?;
-            if verification_kind_for_objective(&proposal.objective).is_some()
+            if index + 1 == proposals.len()
+                && verification_kind_for_objective(&proposal.objective).is_some()
                 && !target.tools.iter().any(|tool| tool == "process.test")
             {
                 return Err(invalid(
-                    "selected task owner cannot run the requested verification; choose a qualified enabled owner with process.test",
+                    "integration owner cannot run the requested verification; choose a qualified enabled report with process.test",
                 ));
             }
             if index + 1 == proposals.len() && !target.tools.iter().any(|tool| tool == "file.patch")
@@ -1351,6 +1362,13 @@ impl<R: Repository + 'static> Engine<R> {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let verification_guidance = if work.integration {
+            "You own integration verification: inspect the completed dependencies together, run the requested checks, and rerun them after any patch you make."
+        } else if has_integration_sibling(task, &tasks) {
+            "This is an implementation handoff with a separate integration verifier. Complete your owned acceptance criteria using your patch and inspection artifacts; do not wait for or duplicate combined verification. The integration task runs checks after implementation tasks complete."
+        } else {
+            "Run the requested verification after your latest patch before completing this task."
+        };
         let owned_paths = work
             .owned_paths
             .iter()
@@ -1358,7 +1376,7 @@ impl<R: Repository + 'static> Engine<R> {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. Re-run verification after any new patch. Recorded action counts across attempts:\n{approvals}\nArtifact index (patch bodies are omitted; workspace context contains the current files):\n{}",
+            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. {verification_guidance} Recorded action counts across attempts:\n{approvals}\nArtifact index (patch bodies are omitted; workspace context contains the current files):\n{}",
             work.contract,
             if owned_paths.is_empty() {
                 "all paths after dependencies"
@@ -1425,8 +1443,13 @@ impl<R: Repository + 'static> Engine<R> {
         // A later patch anywhere in this shared session invalidates earlier
         // verification. Failed and incomplete checks still fail closed.
         let approvals = self.repo.approvals(self.session).await?;
+        let delegated_verification = has_integration_sibling(task, &tasks);
         let mut verification = false;
-        let mut required_verification = verification_kind(task);
+        let mut required_verification = if delegated_verification {
+            None
+        } else {
+            verification_kind(task)
+        };
         for event in self.repo.events(self.session).await? {
             match event.kind {
                 CanonicalEventKind::ApprovalDecided {
@@ -1436,10 +1459,12 @@ impl<R: Repository + 'static> Engine<R> {
                     .iter()
                     .any(|a| a.id == approval_id && a.action == "file.patch") =>
                 {
-                    if required_verification.is_none() {
-                        required_verification = Some(VerificationKind::Tests);
+                    if !delegated_verification {
+                        if required_verification.is_none() {
+                            required_verification = Some(VerificationKind::Tests);
+                        }
+                        verification = false;
                     }
-                    verification = false;
                 }
                 CanonicalEventKind::ProcessFinished {
                     verification: true,
