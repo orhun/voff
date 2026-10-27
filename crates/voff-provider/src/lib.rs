@@ -246,7 +246,7 @@ impl ResilientProvider {
         state.last_error = Some(error.to_string());
         // A bad model/schema/task is not a provider-wide outage. It must not
         // prevent another role using a healthy model on the same route.
-        if retry_allowed(error) {
+        if provider_error_is_retryable(error) {
             state.failures = state.failures.saturating_add(1);
             if state.failures >= self.policy.failure_threshold {
                 state.opened_at = Some(Instant::now());
@@ -290,7 +290,10 @@ impl ModelProvider for ResilientProvider {
                     self.success().await;
                     return Ok(value);
                 }
-                Err(error) if retry_allowed(&error) && attempt < self.policy.max_attempts => {
+                Err(error)
+                    if provider_error_is_retryable(&error)
+                        && attempt < self.policy.max_attempts =>
+                {
                     self.failure(&error).await;
                     self.backoff(attempt, &cancellation).await?;
                 }
@@ -358,7 +361,10 @@ impl ModelProvider for ResilientProvider {
                     self.success().await;
                     return Ok(ProviderCompletion { usage });
                 }
-                Err(error) if retry_allowed(&error) && attempt < self.policy.max_attempts => {
+                Err(error)
+                    if provider_error_is_retryable(&error)
+                        && attempt < self.policy.max_attempts =>
+                {
                     self.failure(&error).await;
                     tracing::warn!(task_id = %request.task_id, attempt, ?error.kind, "retrying unsuccessful provider turn");
                     crate::adapters::send(
@@ -383,7 +389,7 @@ impl ModelProvider for ResilientProvider {
         unreachable!("attempt range is non-empty")
     }
 }
-fn retry_allowed(error: &ProviderError) -> bool {
+fn provider_error_is_retryable(error: &ProviderError) -> bool {
     error.retryable
         && matches!(
             error.kind,

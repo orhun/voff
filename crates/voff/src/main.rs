@@ -1146,19 +1146,16 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
                         CanonicalEventKind::TaskCancelled | CanonicalEventKind::RevisionStopped(_)
                     )
             });
-        // A blocked child with a retryable recovery request may be waiting for
-        // the lead's review. Keep its running ancestors alive across restart so
-        // the coordinator can finish that review and resume the same task.
+        // A blocked child with a recovery request may be waiting for the lead's
+        // review, or an approved in-place recovery may still need scheduling.
+        // Keep its running ancestors alive across restart in either case.
         let recovery_waiting = task.status == TaskStatus::Blocked
             && events.iter().any(|request| {
                 request.task_id == Some(task.id)
                     && last_retry.is_none_or(|retry| request.created_at > retry)
                     && matches!(
                         request.kind,
-                        CanonicalEventKind::WorkRecoveryRequested {
-                            retry_allowed: true,
-                            ..
-                        }
+                        CanonicalEventKind::WorkRecoveryRequested { .. }
                     )
                     && events
                         .iter()
@@ -1174,15 +1171,23 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
                                 )
                         })
                         .max_by_key(|event| event.created_at)
-                        .is_none_or(|event| {
-                            matches!(
-                                &event.kind,
-                                CanonicalEventKind::LeadReviewFinished { reason, .. }
-                                    if reason.starts_with("Reporting-agent review temporarily unavailable")
-                            )
+                        .is_none_or(|event| match &event.kind {
+                            CanonicalEventKind::LeadReviewFinished {
+                                approved, reason, ..
+                            } => {
+                                *approved
+                                    || reason.starts_with(
+                                        "Reporting-agent review temporarily unavailable",
+                                    )
+                            }
+                            _ => false,
                         })
             });
-        let retry_queued = (task.retry_of.is_some() || task.work.is_some())
+        let recovery_scheduled = events.iter().any(|event| {
+            event.task_id == Some(task.id)
+                && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+        });
+        let retry_queued = (task.retry_of.is_some() || task.work.is_some() || recovery_scheduled)
             && matches!(task.status, TaskStatus::Queued | TaskStatus::Ready);
         if revision_waiting || recovery_waiting || retry_queued {
             let mut current = Some(task);

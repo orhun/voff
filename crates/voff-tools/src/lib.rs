@@ -91,7 +91,7 @@ use std::{
 use thiserror::Error;
 use voff_core::{ArtifactId, TaskId};
 
-const READ_PAGE_CHAR_LIMIT: usize = 6_000;
+const READ_PAGE_CHAR_LIMIT: usize = 12_000;
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("workspace path is outside the authorized root")]
@@ -233,6 +233,17 @@ impl ScopedWorkspace {
     }
     /// A missing file is useful inspection evidence, not a failed write.
     pub fn read_page(&self, relative: &Path, offset: usize) -> Result<String, ToolError> {
+        self.read_page_with_digest(relative, offset)
+            .map(|(page, _)| page)
+    }
+
+    /// Read one page and return the digest of the complete file snapshot it came from.
+    /// The digest lets persisted read artifacts be reused only while the file is unchanged.
+    pub fn read_page_with_digest(
+        &self,
+        relative: &Path,
+        offset: usize,
+    ) -> Result<(String, String), ToolError> {
         match self.read_text(relative) {
             Ok(text) => {
                 let total = text.chars().count();
@@ -241,10 +252,33 @@ impl ScopedWorkspace {
                     .skip(offset)
                     .take(READ_PAGE_CHAR_LIMIT)
                     .collect();
-                Ok(format!("Characters {offset}..{} of {total}.\n{page}", offset.saturating_add(page.chars().count())))
+                let content_digest = digest(text.as_bytes());
+                Ok((
+                    format!(
+                        "Characters {offset}..{} of {total}.\n{page}",
+                        offset.saturating_add(page.chars().count())
+                    ),
+                    content_digest,
+                ))
             }
             Err(ToolError::PathIo { source, .. } | ToolError::Io(source)) if source.kind() == std::io::ErrorKind::NotFound =>
-                Ok("File does not exist. No changes made. If the task needs this file, create it with an approved file.patch; do not reread this unchanged path.".into()),
+                Ok((
+                    "File does not exist. No changes made. If the task needs this file, create it with an approved file.patch; do not reread this unchanged path.".into(),
+                    ABSENT_FILE_DIGEST.into(),
+                )),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return a content digest for a file, using a stable marker when it is absent.
+    pub fn content_digest(&self, relative: &Path) -> Result<String, ToolError> {
+        match self.read_text(relative) {
+            Ok(text) => Ok(digest(text.as_bytes())),
+            Err(ToolError::PathIo { source, .. } | ToolError::Io(source))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(ABSENT_FILE_DIGEST.into())
+            }
             Err(error) => Err(error),
         }
     }

@@ -247,22 +247,16 @@ async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
     assert!(repo.events(session).await.unwrap().iter().any(|event| {
         matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested {
             reason,
-            retry_allowed: true,
         } if reason.starts_with("worker-reported blocker"))
     }));
 
     engine.coordinate_pending().await.unwrap();
-    let retry = repo
-        .tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|candidate| candidate.retry_of == Some(task.id))
-        .expect("approved recovery should create a new attempt");
-    assert_eq!(retry.status, TaskStatus::Queued);
-    assert_eq!(retry.owner, task.owner);
-    assert_eq!(retry.parent, task.parent);
-    assert_eq!(retry.acceptance_criteria, task.acceptance_criteria);
+    let recovered = repo.task(task.id).await.unwrap().unwrap();
+    assert_eq!(recovered.status, TaskStatus::Ready);
+    assert_eq!(recovered.owner, task.owner);
+    assert_eq!(recovered.parent, task.parent);
+    assert_eq!(recovered.acceptance_criteria, task.acceptance_criteria);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
 
     let requests = provider.requests.lock().await;
     assert_eq!(requests.len(), 2);
@@ -272,10 +266,10 @@ async fn self_reported_blocker_can_be_reviewed_for_same_scope_recovery() {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(review_context.contains("task.blocked report is the worker's claim"));
-    assert!(review_context.contains("Voff-mediated actions"));
-    assert!(review_context.contains("Runtime permits an automatic corrective attempt: true"));
+    assert!(review_context.contains("When a worker reports a blocker"));
+    assert!(review_context.contains("Voff actions"));
     assert!(review_context.contains("Runtime capability evidence (authoritative)"));
+    assert!(review_context.contains("Available recovery owner IDs and capabilities"));
     assert!(review_context.contains("task owner Lead (enabled: true)"));
     assert!(review_context.contains("configured Voff tools [file.patch]"));
     assert!(review_context.contains("Recorded proposals/approval decisions: none"));
@@ -315,14 +309,15 @@ async fn malformed_process_invocation_gets_one_reviewed_recovery_attempt() {
         &event.kind,
         CanonicalEventKind::WorkRecoveryRequested {
             reason,
-            retry_allowed: true,
         } if reason.contains("process invocation is invalid")
     )));
     engine.coordinate_pending().await.unwrap();
 
-    assert!(repo.tasks().await.unwrap().iter().any(|candidate| {
-        candidate.retry_of == Some(task.id) && candidate.status == TaskStatus::Queued
-    }));
+    assert_eq!(
+        repo.task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Ready
+    );
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
     assert_eq!(provider.requests.lock().await.len(), 2);
     assert!(repo.approvals(session).await.unwrap().is_empty());
 }
@@ -456,18 +451,16 @@ async fn rejected_delegated_work_gets_feedback_and_returns_for_review() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     let tasks = repo.tasks().await.unwrap();
-    let blocked = tasks
+    let repaired = tasks
         .iter()
-        .find(|task| task.status == TaskStatus::Blocked)
+        .find(|task| task.parent == Some(root.id))
         .unwrap();
-    let revised = tasks
-        .iter()
-        .find(|task| task.retry_of == Some(blocked.id))
-        .unwrap();
-    assert_eq!(revised.owner, blocked.owner);
-    assert_eq!(revised.parent, blocked.parent);
-    assert_eq!(revised.acceptance_criteria, blocked.acceptance_criteria);
-    assert_eq!(revised.status, TaskStatus::Completed);
+    assert_eq!(repaired.status, TaskStatus::Completed);
+    assert_eq!(repaired.parent, Some(root.id));
+    assert_eq!(
+        repaired.acceptance_criteria,
+        vec!["Non-destructive frontend"]
+    );
     assert_eq!(
         repo.task(root.id).await.unwrap().unwrap().status,
         TaskStatus::Completed
@@ -502,7 +495,7 @@ async fn rejected_delegated_work_gets_feedback_and_returns_for_review() {
             .await
             .unwrap()
             .iter()
-            .any(|approval| approval.task_id == blocked.id
+            .any(|approval| approval.task_id == repaired.id
                 && approval.decision == ApprovalDecision::Denied)
     );
 }
@@ -515,7 +508,7 @@ async fn unchanged_denied_proposal_cannot_be_approved_on_a_retry() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     assert_eq!(provider.requests.lock().await.len(), 3);
-    assert_eq!(repo.tasks().await.unwrap().len(), 2);
+    assert_eq!(repo.tasks().await.unwrap().len(), 1);
     assert!(!dir.path().join("backend").exists());
     assert!(
         repo.events(session)
@@ -553,13 +546,8 @@ async fn unrelated_evidence_cannot_reopen_a_rejected_process_action() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task(root.id).await.unwrap();
     engine.coordinate_pending().await.unwrap();
-    let retry = repo
-        .tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.retry_of == Some(root.id))
-        .expect("the first rejection should request a bounded correction");
+    let retry = repo.task(root.id).await.unwrap().unwrap();
+    assert_eq!(retry.status, TaskStatus::Ready);
 
     engine
         .publish_artifact(Artifact {
@@ -572,7 +560,6 @@ async fn unrelated_evidence_cannot_reopen_a_rejected_process_action() {
         })
         .await
         .unwrap();
-    engine.mark_ready(retry.id).await.unwrap();
     engine.run_task(retry.id).await.unwrap();
     engine.coordinate_pending().await.unwrap();
 
@@ -616,13 +603,8 @@ async fn denied_proposal_gets_fresh_review_after_retry_adds_evidence() {
     engine.run_task(root.id).await.unwrap();
     engine.coordinate_pending().await.unwrap();
 
-    let retry = repo
-        .tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| task.retry_of == Some(root.id))
-        .expect("denial feedback should create a retry");
+    let retry = repo.task(root.id).await.unwrap().unwrap();
+    assert_eq!(retry.status, TaskStatus::Ready);
     let new_evidence = "The inspected workspace manifest confirms the package is in the workspace.";
     engine
         .publish_artifact(Artifact {
@@ -636,7 +618,6 @@ async fn denied_proposal_gets_fresh_review_after_retry_adds_evidence() {
         .await
         .unwrap();
 
-    engine.mark_ready(retry.id).await.unwrap();
     engine.run_task(retry.id).await.unwrap();
     engine.coordinate_pending().await.unwrap();
 
@@ -808,24 +789,18 @@ async fn delegated_failure_returns_to_lead_and_repair_completes_parent() {
     engine.mark_ready(root.id).await.unwrap();
     engine.run_task_and_schedule(root.id, 2).await.unwrap();
     let tasks = repo.tasks().await.unwrap();
-    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks.len(), 2);
     assert_eq!(
         repo.task(root.id).await.unwrap().unwrap().status,
         TaskStatus::Completed
     );
-    let failed = tasks
+    let repaired = tasks
         .iter()
-        .find(|task| task.status == TaskStatus::Failed)
+        .find(|task| task.parent == Some(root.id))
         .unwrap();
-    let retry = tasks
-        .iter()
-        .find(|task| task.retry_of == Some(failed.id))
-        .unwrap();
-    assert_eq!(retry.status, TaskStatus::Completed);
-    assert_eq!(retry.acceptance_criteria, failed.acceptance_criteria);
-    assert_eq!(retry.owner, failed.owner);
-    assert_eq!(retry.parent, failed.parent);
-    assert!(retry.objective.contains("Team Lead repair instructions"));
+    assert_eq!(repaired.status, TaskStatus::Completed);
+    assert_eq!(repaired.acceptance_criteria, vec!["Runnable"]);
+    assert_eq!(repaired.parent, Some(root.id));
     assert!(dir.path().join("backend/src/app.js").is_file());
     assert_eq!(provider.requests.lock().await.len(), 5);
     assert!(

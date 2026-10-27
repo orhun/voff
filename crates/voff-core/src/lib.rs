@@ -298,11 +298,9 @@ pub enum CanonicalEventKind {
     ProviderWarning(String),
     /// An application/account problem requiring user intervention, not model repair.
     ApplicationIssue(String),
-    /// Recoverable work failure awaiting a bounded coordinator decision.
+    /// Work failure or stall awaiting a coordinator recovery decision.
     WorkRecoveryRequested {
         reason: String,
-        /// False permits diagnosis only; the coordinator cannot override a denial.
-        retry_allowed: bool,
     },
     /// A validated Lead rejection returned to the same owner for new work.
     RevisionRequested {

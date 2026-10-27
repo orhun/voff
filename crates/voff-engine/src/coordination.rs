@@ -15,6 +15,10 @@ const TEMPORARY_REVIEW_PREFIX: &str = "Reporting-agent review temporarily unavai
 struct Verdict {
     approve: bool,
     reason: String,
+    #[serde(default)]
+    reassign_to: Option<String>,
+    #[serde(default)]
+    owned_paths: Option<Vec<String>>,
     #[serde(skip)]
     validated: bool,
     #[serde(skip)]
@@ -133,6 +137,8 @@ impl<R: Repository + 'static> Engine<R> {
                     Verdict {
                         approve: false,
                         reason: "Interrupted review; proposal denied without execution. Re-run the task to obtain a fresh review.".into(),
+                        reassign_to: None,
+                        owned_paths: None,
                         validated: false,
                         transient: false,
                     },
@@ -273,12 +279,8 @@ impl<R: Repository + 'static> Engine<R> {
                 {
                     return None;
                 }
-                if let CanonicalEventKind::WorkRecoveryRequested {
-                    reason,
-                    retry_allowed,
-                } = &event.kind
-                {
-                    Some((reason, *retry_allowed))
+                if let CanonicalEventKind::WorkRecoveryRequested { reason } = &event.kind {
+                    Some(reason)
                 } else {
                     None
                 }
@@ -288,10 +290,10 @@ impl<R: Repository + 'static> Engine<R> {
                     continue;
                 }
                 let guidance = format!("{}{feedback}", prompts::REJECTED_PROPOSAL_RETRY_PREFIX);
-                self.schedule_repair(task, &guidance).await?;
+                self.schedule_repair(task, &guidance, None, None).await?;
                 continue;
             }
-            let Some((failure, retry_allowed)) = failure else {
+            let Some(failure) = failure else {
                 continue;
             };
             if !children_have_settled_attempts(task.id, &tasks) {
@@ -314,14 +316,26 @@ impl<R: Repository + 'static> Engine<R> {
                         )
                 })
                 .max_by_key(|event| event.created_at);
-            if last_recovery_review.is_some_and(|event| {
-                matches!(
-                    &event.kind,
+            if let Some(event) = last_recovery_review {
+                match &event.kind {
+                    CanonicalEventKind::LeadReviewFinished {
+                        approved: true,
+                        reason,
+                        ..
+                    } => {
+                        // Older persisted sessions recorded approval before
+                        // scheduling the in-place recovery. Finish that action
+                        // after restart rather than leaving the task stranded.
+                        self.schedule_repair(task, reason, None, None).await?;
+                        continue;
+                    }
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
-                        if !reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                )
-            }) {
-                continue;
+                        if !reason.starts_with(TEMPORARY_REVIEW_PREFIX) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             if last_recovery_review.is_some_and(|event| {
                 matches!(
@@ -395,8 +409,25 @@ impl<R: Repository + 'static> Engine<R> {
             } else {
                 prompts::RECOVERY_PROFILE_MISSING.into()
             };
+            let owner_options = self.recovery_owners(reviewer).await?;
+            let owner_options_context = owner_options
+                .iter()
+                .map(|owner| {
+                    format!(
+                        "{} {} ({}) tools [{}]",
+                        owner.id,
+                        owner.name,
+                        owner.role,
+                        owner.tools.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let capability_evidence = format!(
+                "{capability_evidence}\nAvailable recovery owner IDs and capabilities: {owner_options_context}"
+            );
             let failure_context =
-                prompts::recovery_context(failure, retry_allowed, &capability_evidence, &evidence);
+                prompts::recovery_context(failure, &capability_evidence, &evidence);
             let recovery_note = if failure.starts_with("worker-reported blocker") {
                 prompts::RECOVERY_BLOCKER_NOTE
             } else {
@@ -409,27 +440,65 @@ impl<R: Repository + 'static> Engine<R> {
                     reviewer,
                 )
                 .await?;
-            if !retry_allowed {
+            let reassignment = match verdict.reassign_to.as_deref() {
+                Some(id) => match id.parse::<AgentId>() {
+                    Ok(id) if owner_options.iter().any(|owner| owner.id == id) => Some(id),
+                    _ => {
+                        verdict.approve = false;
+                        verdict.reason = format!(
+                            "Invalid recovery assignment {id:?}; choose the current owner, the reporting lead, or one of the listed enabled direct reports."
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let owned_paths = match verdict.owned_paths.as_deref() {
+                Some(_) if task.work.is_none() => {
+                    verdict.approve = false;
+                    verdict.reason =
+                        "Recovery scope cannot change because this task has no workspace work contract."
+                            .into();
+                    None
+                }
+                Some(paths) => match validate_recovery_paths(paths) {
+                    Ok(paths) => Some(paths),
+                    Err(reason) => {
+                        verdict.approve = false;
+                        verdict.reason = reason;
+                        None
+                    }
+                },
+                None => None,
+            };
+            if verdict.reassign_to.is_some() && reassignment.is_none() {
                 verdict.approve = false;
-                verdict.reason = format!(
-                    "Runtime denied automatic retry; diagnosis only. {}",
-                    verdict.reason
-                );
             }
+            if verdict.transient || !verdict.approve {
+                self.record(
+                    Some(task.id),
+                    CanonicalEventKind::LeadReviewFinished {
+                        lead: reviewer,
+                        approval_id: None,
+                        approved: false,
+                        reason: verdict.reason,
+                    },
+                )
+                .await?;
+                continue;
+            }
+            self.schedule_repair(task, &verdict.reason, reassignment, owned_paths)
+                .await?;
             self.record(
                 Some(task.id),
                 CanonicalEventKind::LeadReviewFinished {
                     lead: reviewer,
                     approval_id: None,
-                    approved: verdict.approve,
-                    reason: verdict.reason.clone(),
+                    approved: true,
+                    reason: verdict.reason,
                 },
             )
             .await?;
-            if verdict.transient || !verdict.approve {
-                continue;
-            }
-            self.schedule_repair(task, &verdict.reason).await?;
         }
         Ok(())
     }
@@ -480,7 +549,13 @@ impl<R: Repository + 'static> Engine<R> {
         Ok(())
     }
 
-    async fn schedule_repair(&self, task: &Task, guidance: &str) -> Result<(), EngineError> {
+    async fn schedule_repair(
+        &self,
+        task: &Task,
+        guidance: &str,
+        new_owner: Option<AgentId>,
+        owned_paths: Option<Vec<PathBuf>>,
+    ) -> Result<(), EngineError> {
         let _approval_guard = self.approval_lock.lock().await;
         if self.repo.events(self.session).await?.iter().any(|event| {
             event.task_id == Some(task.id)
@@ -488,7 +563,7 @@ impl<R: Repository + 'static> Engine<R> {
         }) {
             return Ok(());
         }
-        let Some(current) = self.repo.task(task.id).await? else {
+        let Some(mut current) = self.repo.task(task.id).await? else {
             return Err(EngineError::TaskNotFound);
         };
         if !matches!(current.status, TaskStatus::Blocked | TaskStatus::Failed) {
@@ -496,6 +571,25 @@ impl<R: Repository + 'static> Engine<R> {
         }
         let events = self.repo.events(self.session).await?;
         let attempt = next_work_retry_attempt(&events, task.id);
+        let old_owner = current.owner;
+        if let Some(new_owner) = new_owner {
+            current.owner = new_owner;
+        }
+        let scope_note = owned_paths.as_ref().map(|paths| {
+            if paths.is_empty() {
+                "all workspace paths".to_owned()
+            } else {
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        });
+        if let (Some(work), Some(owned_paths)) = (&mut current.work, owned_paths) {
+            work.owned_paths = owned_paths;
+        }
+        self.repo.save_task(current.clone()).await?;
         self.publish_artifact(Artifact {
             id: ArtifactId::new(),
             producer: task.id,
@@ -516,8 +610,43 @@ impl<R: Repository + 'static> Engine<R> {
             },
         )
         .await?;
+        if current.owner != old_owner || scope_note.is_some() {
+            self.publish_artifact(Artifact {
+                id: ArtifactId::new(),
+                producer: task.id,
+                kind: "workflow_feedback".into(),
+                location: "recovery.reassignment".into(),
+                digest: String::new(),
+                preview: format!(
+                    "The reporting lead recovered this task for agent {} (previous owner: {}). {} Continue the original acceptance criteria from the existing workspace and artifacts.",
+                    current.owner,
+                    old_owner,
+                    scope_note.map_or_else(
+                        || "The existing owned paths were preserved.".to_owned(),
+                        |paths| format!("The task scope is now: {paths}.")
+                    )
+                ),
+            })
+            .await?;
+        }
         self.transition(task.id, TaskStatus::Ready).await?;
         Ok(())
+    }
+
+    async fn recovery_owners(&self, reviewer: AgentId) -> Result<Vec<AgentProfile>, EngineError> {
+        let lead = self
+            .repo
+            .agent(reviewer)
+            .await?
+            .ok_or(EngineError::TaskNotFound)?;
+        let mut owners = vec![lead.clone()];
+        owners.extend(
+            self.enabled_delegation_targets(&lead.allowed_targets)
+                .await?,
+        );
+        owners.sort_by(|left, right| left.name.cmp(&right.name));
+        owners.dedup_by_key(|owner| owner.id);
+        Ok(owners)
     }
 
     async fn repeats_rejected_proposal(
@@ -606,6 +735,8 @@ impl<R: Repository + 'static> Engine<R> {
                 Ok(Verdict {
                     approve: false,
                     reason,
+                    reassign_to: None,
+                    owned_paths: None,
                     validated: false,
                     transient: true,
                 })
@@ -625,6 +756,11 @@ impl<R: Repository + 'static> Engine<R> {
             .agent(lead_id)
             .await?
             .ok_or(EngineError::TaskNotFound)?;
+        let recovery_owners = self.recovery_owners(lead_id).await?;
+        let recovery_owner_ids = recovery_owners
+            .iter()
+            .map(|owner| owner.id.to_string())
+            .collect::<Vec<_>>();
         let provider = self
             .providers
             .get(&lead.provider)
@@ -658,7 +794,7 @@ impl<R: Repository + 'static> Engine<R> {
                 CanonicalMessage { id: MessageId::new(), role: MessageRole::System, content: REVIEW_POLICY.into() },
                 CanonicalMessage { id: MessageId::new(), role: MessageRole::User, content: prompts::review_user_message(&task.objective, &task.acceptance_criteria.join("\n"), context, &self.work_context(task).await?) },
             ],
-            tools: vec![ToolDefinition { name: "workflow.decide".into(), description: tool_descriptions::WORKFLOW_DECIDE.into(), input_schema: serde_json::json!({"type":"object","properties":{"approve":{"type":"boolean"},"reason":{"type":"string"}},"required":["approve","reason"],"additionalProperties":false}).to_string() }],
+            tools: vec![ToolDefinition { name: "workflow.decide".into(), description: tool_descriptions::WORKFLOW_DECIDE.into(), input_schema: serde_json::json!({"type":"object","properties":{"approve":{"type":"boolean"},"reason":{"type":"string"},"reassign_to":{"type":"string","enum":recovery_owner_ids},"owned_paths":{"type":"array","items":{"type":"string"}}},"required":["approve","reason"],"additionalProperties":false}).to_string() }],
             tool_choice: ToolChoice::Specific(vec!["workflow.decide".into()]),
         };
         let response = collect_response_with_preview(
@@ -684,6 +820,8 @@ impl<R: Repository + 'static> Engine<R> {
             return Ok(Verdict {
                 approve: false,
                 reason,
+                reassign_to: None,
+                owned_paths: None,
                 validated: false,
                 transient: true,
             });
@@ -694,6 +832,8 @@ impl<R: Repository + 'static> Engine<R> {
             return Ok(Verdict {
                 approve: false,
                 reason: "Reporting-agent review cancelled; no action was authorized.".into(),
+                reassign_to: None,
+                owned_paths: None,
                 validated: false,
                 transient: false,
             });
@@ -719,6 +859,8 @@ impl<R: Repository + 'static> Engine<R> {
                 return Ok(Verdict {
                     approve: false,
                     reason: format!("{TEMPORARY_REVIEW_PREFIX}: {reason}"),
+                    reassign_to: None,
+                    owned_paths: None,
                     validated: false,
                     transient: true,
                 });
@@ -806,10 +948,7 @@ impl<R: Repository + 'static> Engine<R> {
             };
             self.record(
                 Some(id),
-                CanonicalEventKind::WorkRecoveryRequested {
-                    reason,
-                    retry_allowed: recoverable,
-                },
+                CanonicalEventKind::WorkRecoveryRequested { reason },
             )
             .await?;
         } else if matches!(
@@ -916,12 +1055,38 @@ fn next_work_retry_attempt(events: &[CanonicalEvent], task_id: TaskId) -> u32 {
 fn invalid_verdict() -> Verdict {
     Verdict {
         approve: false,
+        reassign_to: None,
+        owned_paths: None,
         validated: false,
         reason: format!(
             "{TEMPORARY_REVIEW_PREFIX}: invalid review response; the proposal remains pending and will be reviewed again."
         ),
         transient: true,
     }
+}
+
+fn validate_recovery_paths(paths: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut validated = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = PathBuf::from(path);
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                !matches!(component, std::path::Component::Normal(_))
+                    || matches!(component, std::path::Component::Normal(name)
+                        if [".voff", ".ssh", ".aws", ".codex", ".claude"]
+                            .iter()
+                            .any(|denied| name == std::ffi::OsStr::new(denied)))
+            })
+        {
+            return Err(
+                "Recovery scope rejected: owned_paths must contain only safe workspace-relative paths."
+                    .into(),
+            );
+        }
+        validated.push(path);
+    }
+    Ok(validated)
 }
 
 #[cfg(test)]

@@ -3,6 +3,10 @@ use super::*;
 use voff_prompts::tool_descriptions;
 pub(super) use voff_prompts::workflow::WORK_INSTRUCTIONS;
 
+const FILE_READ_CONTEXT_CHAR_LIMIT: usize = 12_200;
+const WORK_CONTEXT_ARTIFACT_CHAR_LIMIT: usize = 26_000;
+const REJECTED_PATCH_CACHE_CHAR_LIMIT: usize = 18_000;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
@@ -70,7 +74,6 @@ struct VerificationAssignment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum VerificationKind {
     Tests,
-    Build,
 }
 
 /// Return task IDs in a valid same-scope retry chain, including `task`.
@@ -105,35 +108,17 @@ pub(super) fn retry_lineage_ids(task: &Task, tasks: &[Task]) -> HashSet<TaskId> 
     lineage
 }
 
-/// Select the verification the user actually requested. Read-only requests do
-/// not need an unrelated test run; implementation requests retain test-suite
-/// verification as the default.
 pub(super) fn verification_kind(task: &Task) -> Option<VerificationKind> {
-    verification_kind_for_objective(&task.objective)
-}
-
-pub(super) fn is_implementation_objective(objective: &str) -> bool {
-    let objective = objective.to_lowercase();
-    [
-        "implement",
-        "add ",
-        "create",
-        "fix ",
-        "update",
-        "change",
-        "remove",
-        "refactor",
-        "support",
-        "make ",
-        "build a ",
-        "build the ",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase))
+    task.work
+        .as_ref()
+        .is_some_and(|work| work.integration)
+        .then_some(VerificationKind::Tests)
 }
 
 pub(super) fn verification_only(task: &Task) -> bool {
-    verification_kind(task).is_some() && !is_implementation_objective(&task.objective)
+    task.work
+        .as_ref()
+        .is_some_and(|work| work.integration && work.owned_paths.is_empty())
 }
 
 fn has_integration_sibling(task: &Task, tasks: &[Task]) -> bool {
@@ -146,115 +131,27 @@ fn has_integration_sibling(task: &Task, tasks: &[Task]) -> bool {
         })
 }
 
-pub(super) fn dedicated_validation_target<'a>(
-    task: &Task,
-    lead: &AgentProfile,
-    targets: &'a [AgentProfile],
-) -> Option<&'a AgentProfile> {
-    if task.work.is_none()
-        || task.requested_target.is_some()
-        || task.limits.max_children < 2
-        || verification_only(task)
-        || verification_kind(task).is_none()
-        || !lead.tools.iter().any(|tool| tool == "task.delegate")
-    {
-        return None;
-    }
-
-    let validator = targets.iter().find(|target| {
-        if target.id == lead.id || !target.tools.iter().any(|tool| tool == "process.test") {
-            return false;
-        }
-        let identity = format!("{} {}", target.name, target.role).to_lowercase();
-        ["validat", "verif", "test", "quality", "qa"]
-            .iter()
-            .any(|marker| identity.contains(marker))
-    })?;
-    targets
-        .iter()
-        .any(|target| {
-            target.id != validator.id && target.tools.iter().any(|tool| tool == "file.patch")
+fn artifact_context_key(artifact: &Artifact) -> (String, String, Option<usize>) {
+    let page_offset = (artifact.kind == "file_read")
+        .then(|| {
+            artifact
+                .preview
+                .strip_prefix("Characters ")
+                .and_then(|header| header.split("..").next())
+                .and_then(|offset| offset.parse().ok())
+                .or_else(|| {
+                    artifact
+                        .preview
+                        .starts_with("File does not exist.")
+                        .then_some(0)
+                })
         })
-        .then_some(validator)
-}
-
-fn verification_kind_for_objective(objective: &str) -> Option<VerificationKind> {
-    let objective = objective.to_lowercase();
-    if [
-        "do not run commands",
-        "don't run commands",
-        "do not execute commands",
-        "don't execute commands",
-        "without running commands",
-        "commands are forbidden",
-        "not allowed to run commands",
-        "no commands",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase))
-    {
-        return None;
-    }
-    let explicitly_skips_tests = [
-        "do not run test",
-        "don't run test",
-        "do not execute test",
-        "don't execute test",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase));
-    let explicit_test_run = [
-        "run test",
-        "execute test",
-        "check test",
-        "verify test",
-        "test suite",
-        "unit test",
-        "integration test",
-        "cargo test",
-        "npm test",
-        "node --test",
-        "unittest",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase))
-        && !explicitly_skips_tests;
-    if explicit_test_run {
-        return Some(VerificationKind::Tests);
-    }
-
-    let build_check = [
-        "build",
-        "compile",
-        "cargo check",
-        "clippy",
-        "examples",
-        "check ",
-        "check the",
-        "check if",
-        "check whether",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase));
-    if build_check {
-        return Some(VerificationKind::Build);
-    }
-
-    let implementation = [
-        "implement",
-        "add ",
-        "create",
-        "fix ",
-        "update",
-        "change",
-        "remove",
-        "refactor",
-        "support",
-        "make ",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase));
-    implementation.then_some(VerificationKind::Tests)
+        .flatten();
+    (
+        artifact.kind.clone(),
+        artifact.location.clone(),
+        page_offset,
+    )
 }
 
 #[cfg(test)]
@@ -263,16 +160,11 @@ mod tests {
     use voff_storage::InMemoryRepository;
 
     #[test]
-    fn plan_requires_request_appropriate_verification_and_an_explicit_blocker_path() {
-        assert!(WORK_INSTRUCTIONS.contains("verification-only request"));
+    fn work_instructions_expose_direct_answers_and_an_explicit_blocker_path() {
+        assert!(WORK_INSTRUCTIONS.contains("task.answer"));
         assert!(WORK_INSTRUCTIONS.contains("task.blocked"));
-        assert!(WORK_INSTRUCTIONS.contains("separate, mediated interface"));
-        assert!(
-            WORK_INSTRUCTIONS
-                .contains("temporary working directory is not the configured workspace")
-        );
         let mut tools = Vec::new();
-        configure_tools(&mut tools, &[], 0, None);
+        configure_tools(&mut tools, &[], 0);
         assert!(tools.iter().any(|tool| tool.name == "task.blocked"));
     }
 
@@ -446,6 +338,25 @@ mod tests {
         let tools = tool_definitions(&["file.read".into()], &[], 0);
         assert_eq!(tools[0].name, "file.read");
         assert!(tool_definitions(&[], &[], 0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_context_keeps_full_file_read_pages_available_for_reuse() {
+        let (engine, repo, task, _) = fixture().await;
+        let body = format!("{}END_OF_FILE_SENTINEL", "x".repeat(5_000));
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            producer: task.id,
+            kind: "file_read".into(),
+            location: "index.html".into(),
+            digest: String::new(),
+            preview: format!("Characters 0..{} of {}.\n{body}", body.len(), body.len()),
+        };
+        repo.save_artifact(artifact).await.unwrap();
+
+        let context = engine.work_context(&task).await.unwrap();
+
+        assert!(context.contains("END_OF_FILE_SENTINEL"));
     }
 
     async fn fixture() -> (
@@ -732,28 +643,18 @@ struct CriterionEvidence {
     explanation: String,
 }
 
-pub(super) fn configure_tools(
-    tools: &mut Vec<ToolDefinition>,
-    targets: &[String],
-    limit: u16,
-    required_validator: Option<&str>,
-) {
+pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String], limit: u16) {
     tools.retain(|tool| {
         tool.name != "review.request" && !(tool.name == "task.delegate" && limit == 0)
     });
     if let Some(tool) = tools.iter_mut().find(|tool| tool.name == "task.delegate") {
-        let implementation_targets = targets
-            .iter()
-            .map(String::as_str)
-            .filter(|target| Some(*target) != required_validator)
-            .collect::<Vec<_>>();
         let item = serde_json::json!({"type":"object","properties":{
             "target_agent":{"type":"string","enum":targets},"objective":{"type":"string"},
             "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
             "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
         },"required":["target_agent","objective","acceptance_criteria"],"additionalProperties":false});
         let plan_item = serde_json::json!({"type":"object","properties":{
-            "target_agent":{"type":"string","enum":implementation_targets},"objective":{"type":"string"},
+            "target_agent":{"type":"string","enum":targets},"objective":{"type":"string"},
             "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
             "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
         },"required":["target_agent","objective","owned_paths","acceptance_criteria"],"additionalProperties":false});
@@ -762,43 +663,17 @@ pub(super) fn configure_tools(
         },"required":["target_agent"],"additionalProperties":false});
         let mut alternatives = vec![verification, item.clone()];
         if limit >= 2 {
-            let integration = if let Some(validator) = required_validator {
-                serde_json::json!({
-                    "type":"object",
-                    "properties":{
-                        "target_agent":{"type":"string","enum":[validator]},
-                        "objective":{"type":"string"},
-                        "owned_paths":{"type":"array","items":{"type":"string"},"minItems":1},
-                        "acceptance_criteria":{"type":"array","items":{"type":"string"},"minItems":1}
-                    },
-                    "required":["target_agent","objective","acceptance_criteria"],
-                    "additionalProperties":false
-                })
-            } else {
-                item.clone()
-            };
             let plan = serde_json::json!({"type":"object","properties":{
                     "shared_contract":{"type":"string"},
                     "proposals":{"type":"array","minItems":1,"maxItems":limit.saturating_sub(1),"items":plan_item},
-                    "integration":integration
+                    "integration":item
                 },"required":["shared_contract","proposals","integration"],"additionalProperties":false});
-            if required_validator.is_some() {
-                alternatives = vec![plan];
-            } else {
-                alternatives.insert(0, plan);
-            }
+            alternatives.insert(0, plan);
         }
-        tool.description = if let Some(validator) = required_validator {
-            format!(
-                "{} This request requires independent verification. Assign implementation in proposals and assign the integration task to {validator}; integration must inspect the combined result and run the requested verification after implementation completes.",
-                tool_descriptions::DELEGATE
-            )
-        } else {
-            format!(
-                "{} Multi-workstream plans require explicit disjoint owned_paths for every implementation proposal; integration waits for them.",
-                tool_descriptions::DELEGATE
-            )
-        };
+        tool.description = format!(
+            "{} Multi-workstream plans require explicit disjoint owned_paths for every implementation proposal; integration waits for them.",
+            tool_descriptions::DELEGATE
+        );
         tool.input_schema = serde_json::json!({"type":"object","oneOf": alternatives}).to_string();
     }
     tools.push(ToolDefinition {
@@ -936,18 +811,8 @@ impl<R: Repository + 'static> Engine<R> {
             return Err(invalid("task owner cannot delegate"));
         }
         let delegation = WorkDelegation::parse(json)?;
-        let targets = self
-            .enabled_delegation_targets(&agent.allowed_targets)
-            .await?;
-        let required_validator = dedicated_validation_target(task, agent, &targets);
         let plan = match delegation {
             WorkDelegation::Verification(assignment) => {
-                if let Some(validator) = required_validator {
-                    return Err(invalid(format!(
-                        "this implementation request requires an implementation proposal and an integration handoff to {}",
-                        validator.name
-                    )));
-                }
                 if self
                     .repo
                     .tasks()
@@ -979,12 +844,6 @@ impl<R: Repository + 'static> Engine<R> {
                 return Ok(());
             }
             WorkDelegation::Single(proposal) => {
-                if let Some(validator) = required_validator {
-                    return Err(invalid(format!(
-                        "this implementation request requires a contract-first plan with its integration task assigned to {}",
-                        validator.name
-                    )));
-                }
                 if self
                     .repo
                     .tasks()
@@ -1012,44 +871,15 @@ impl<R: Repository + 'static> Engine<R> {
                     .delegation_target(&proposal.target_agent)
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
-                let changes_workspace = !super::is_read_only_request(&proposal.objective);
-                let requires_verification =
-                    verification_kind_for_objective(&proposal.objective).is_some();
+                let changes_workspace = !proposal.owned_paths.is_empty();
                 if changes_workspace && !target.tools.iter().any(|tool| tool == "file.patch") {
                     return Err(invalid(
                         "implementation owner must have file.patch to produce workspace changes",
                     ));
                 }
-                if requires_verification && !target.tools.iter().any(|tool| tool == "process.test")
-                {
-                    return Err(invalid(
-                        "the delegated task needs an enabled owner with process.test for the requested verification",
-                    ));
-                }
                 return Ok(());
             }
-            WorkDelegation::Plan(plan) => {
-                if let Some(validator) = required_validator
-                    && plan.integration.target_agent != validator.name
-                {
-                    return Err(invalid(format!(
-                        "assign the integration task to the configured verification report {}",
-                        validator.name
-                    )));
-                }
-                if let Some(validator) = required_validator
-                    && plan
-                        .proposals
-                        .iter()
-                        .any(|proposal| proposal.target_agent == validator.name)
-                {
-                    return Err(invalid(format!(
-                        "keep the validation report {} independent; assign implementation proposals to another report",
-                        validator.name
-                    )));
-                }
-                plan
-            }
+            WorkDelegation::Plan(plan) => plan,
         };
         if plan.shared_contract.trim().is_empty()
             || plan.shared_contract.len() > 32_768
@@ -1091,11 +921,10 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?
                 .ok_or(EngineError::TaskNotFound)?;
             if index + 1 == proposals.len()
-                && verification_kind_for_objective(&proposal.objective).is_some()
                 && !target.tools.iter().any(|tool| tool == "process.test")
             {
                 return Err(invalid(
-                    "integration owner cannot run the requested verification; choose a qualified enabled report with process.test",
+                    "integration owner must have process.test to verify the combined work",
                 ));
             }
             if index + 1 == proposals.len() && !target.tools.iter().any(|tool| tool == "file.patch")
@@ -1131,7 +960,6 @@ impl<R: Repository + 'static> Engine<R> {
         let plan = match delegation {
             WorkDelegation::Verification(assignment) => {
                 let check = match verification_kind(&parent) {
-                    Some(VerificationKind::Build) => "compile check",
                     Some(VerificationKind::Tests) | None => "test suite",
                 };
                 let objective = format!(
@@ -1261,11 +1089,9 @@ impl<R: Repository + 'static> Engine<R> {
         };
         let tasks = self.repo.tasks().await?;
         let retry_lineage = retry_lineage_ids(task, &tasks);
-        let artifact_times = self
-            .repo
-            .events(self.session)
-            .await?
-            .into_iter()
+        let events = self.repo.events(self.session).await?;
+        let artifact_times = events
+            .iter()
             .filter_map(|event| match event.kind {
                 CanonicalEventKind::ArtifactPublished { artifact_id, .. } => {
                     Some((artifact_id, event.created_at))
@@ -1293,23 +1119,24 @@ impl<R: Repository + 'static> Engine<R> {
                         | "task_checkpoint"
                 )
             {
-                latest.insert(
-                    (artifact.kind.clone(), artifact.location.clone()),
-                    artifact.id,
-                );
+                latest.insert(artifact_context_key(artifact), artifact.id);
             }
         }
         let artifact_list = artifact_records
             .iter()
             .rev()
+            .filter(|artifact| {
+                !matches!(artifact.kind.as_str(), "file_read" | "search_result")
+                    || artifact.producer != task.id
+                    || latest.get(&artifact_context_key(artifact)) == Some(&artifact.id)
+            })
             .map(|artifact| {
                 let attempt = tasks
                     .iter()
                     .find(|candidate| candidate.id == artifact.producer)
                     .map_or(task.attempt, |candidate| candidate.attempt);
                 let show_preview = artifact.producer == task.id
-                    && latest.get(&(artifact.kind.clone(), artifact.location.clone()))
-                        == Some(&artifact.id)
+                    && latest.get(&artifact_context_key(artifact)) == Some(&artifact.id)
                     && matches!(
                         artifact.kind.as_str(),
                         "file_read"
@@ -1322,6 +1149,12 @@ impl<R: Repository + 'static> Engine<R> {
                     String::new()
                 } else if artifact.kind == "test_report" {
                     voff_tools::compact_command_output(&artifact.location, &artifact.preview, 1_200)
+                } else if artifact.kind == "file_read" {
+                    artifact
+                        .preview
+                        .chars()
+                        .take(FILE_READ_CONTEXT_CHAR_LIMIT)
+                        .collect()
                 } else {
                     artifact.preview.chars().take(1_200).collect()
                 };
@@ -1339,12 +1172,10 @@ impl<R: Repository + 'static> Engine<R> {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let all_approvals = self.repo.approvals(self.session).await?;
         let mut approval_counts = HashMap::new();
-        for approval in self
-            .repo
-            .approvals(self.session)
-            .await?
-            .into_iter()
+        for approval in all_approvals
+            .iter()
             .filter(|approval| retry_lineage.contains(&approval.task_id))
         {
             let attempt = tasks
@@ -1352,7 +1183,11 @@ impl<R: Repository + 'static> Engine<R> {
                 .find(|candidate| candidate.id == approval.task_id)
                 .map_or(task.attempt, |candidate| candidate.attempt);
             *approval_counts
-                .entry((attempt, approval.action, format!("{:?}", approval.decision)))
+                .entry((
+                    attempt,
+                    approval.action.clone(),
+                    format!("{:?}", approval.decision),
+                ))
                 .or_insert(0usize) += 1;
         }
         let approvals = approval_counts
@@ -1362,6 +1197,70 @@ impl<R: Repository + 'static> Engine<R> {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let latest_denied_patch = all_approvals
+            .iter()
+            .filter(|approval| {
+                approval.task_id == task.id
+                    && approval.action == "file.patch"
+                    && approval.decision == ApprovalDecision::Denied
+            })
+            .filter_map(|approval| {
+                let decision_at = events.iter().find_map(|event| {
+                    (event.task_id == Some(task.id)
+                        && matches!(
+                            event.kind,
+                            CanonicalEventKind::ApprovalDecided {
+                                approval_id,
+                                decision: ApprovalDecision::Denied
+                            } if approval_id == approval.id
+                        ))
+                    .then_some(event.created_at)
+                })?;
+                Some((decision_at, approval))
+            })
+            .max_by_key(|(decision_at, _)| *decision_at);
+        let rejected_patch_cache = latest_denied_patch
+            .and_then(|(decision_at, approval)| {
+                let later_patch_was_approved = all_approvals
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.task_id == task.id
+                            && candidate.action == "file.patch"
+                            && candidate.decision == ApprovalDecision::ApprovedOnce
+                    })
+                    .any(|candidate| {
+                        events.iter().any(|event| {
+                            event.task_id == Some(task.id)
+                                && event.created_at > decision_at
+                                && matches!(
+                                    event.kind,
+                                    CanonicalEventKind::ApprovalDecided {
+                                        approval_id,
+                                        decision: ApprovalDecision::ApprovedOnce
+                                    } if approval_id == candidate.id
+                                )
+                        })
+                    });
+                if later_patch_was_approved {
+                    return None;
+                }
+                let patch = serde_json::from_str::<PatchArguments>(&approval.reason).ok()?;
+                let mut cached = String::from(
+                    "Rejected patch draft (untrusted cached proposal; it was not applied):\n",
+                );
+                for file in patch.into_patches() {
+                    if cached.chars().count() >= REJECTED_PATCH_CACHE_CHAR_LIMIT {
+                        break;
+                    }
+                    cached.push_str(&format!("\n--- {} ---\n", file.path.display()));
+                    let remaining =
+                        REJECTED_PATCH_CACHE_CHAR_LIMIT.saturating_sub(cached.chars().count());
+                    cached.extend(file.replacement.chars().take(remaining));
+                    cached.push('\n');
+                }
+                Some(cached)
+            })
+            .unwrap_or_default();
         let verification_guidance = if work.integration {
             "You own integration verification: inspect the completed dependencies together, run the requested checks, and rerun them after any patch you make."
         } else if has_integration_sibling(task, &tasks) {
@@ -1376,7 +1275,7 @@ impl<R: Repository + 'static> Engine<R> {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. {verification_guidance} Recorded action counts across attempts:\n{approvals}\nArtifact index (patch bodies are omitted; workspace context contains the current files):\n{}",
+            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. {verification_guidance} Recorded action counts across attempts:\n{approvals}\n{}\nArtifact index (patch bodies are omitted; workspace context contains current files):\n{}",
             work.contract,
             if owned_paths.is_empty() {
                 "all paths after dependencies"
@@ -1385,7 +1284,11 @@ impl<R: Repository + 'static> Engine<R> {
             },
             work.integration,
             work.turns,
-            artifact_list.chars().take(12_000).collect::<String>()
+            rejected_patch_cache,
+            artifact_list
+                .chars()
+                .take(WORK_CONTEXT_ARTIFACT_CHAR_LIMIT)
+                .collect::<String>()
         ))
     }
 

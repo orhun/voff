@@ -42,9 +42,7 @@ use voff_core::{
     AgentId, AgentProfile, Approval, ApprovalDecision, Artifact, CanonicalEvent,
     CanonicalEventKind, SessionId, Task, TaskResult, TaskStatus,
 };
-use voff_engine::{
-    DelegationProposal, Engine, EngineEvent, OutputContinuation, is_conversational_request,
-};
+use voff_engine::{DelegationProposal, Engine, EngineEvent, OutputContinuation};
 use voff_prompts::workflow::routed_agent_objective;
 use voff_storage::{PROMPT_HISTORY_LIMIT, Repository, RepositoryError, SqliteRepository};
 
@@ -2960,21 +2958,15 @@ async fn terminal_loop<R: Repository + 'static>(
                                 .composer_target()
                                 .filter(|agent| Some(agent.id) != model.team_lead)
                                 .map(|agent| (agent.id, agent.name.clone()));
-                            let conversational = role_target.is_none()
-                                && is_conversational_request(&objective);
                             let routed = model.routed_objective(&objective);
-                            let acceptance_criteria = if conversational {
-                                vec!["Answer the user's question from available context".into()]
-                            } else {
-                                vec![
-                                    if role_target.is_some() {
-                                        "Team Lead delegates to the requested role and integrates its response, or reports a blocker"
-                                    } else {
-                                        "Team Lead completes or delegates the requested work"
-                                    }
-                                    .into(),
-                                ]
-                            };
+                            let acceptance_criteria = vec![
+                                if role_target.is_some() {
+                                    "Team Lead delegates to the requested role and integrates its response, answers directly, or reports a blocker"
+                                } else {
+                                    "Team Lead answers directly, completes the requested work, or delegates and integrates it"
+                                }
+                                .into(),
+                            ];
                             model.pending_submissions += 1;
                             if let Some((id, name)) = &role_target {
                                 model.role_requests.push((*id, objective.clone()));
