@@ -1803,6 +1803,20 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     }
                     error = None;
                 }
+                KeyCode::Tab => {
+                    focused = focused.next(
+                        catalog.models(provider.id()).len() > 1,
+                        provider.uses_api_key() && !provider.is_available(),
+                    );
+                    error = None;
+                }
+                KeyCode::BackTab => {
+                    focused = focused.previous(
+                        catalog.models(provider.id()).len() > 1,
+                        provider.uses_api_key() && !provider.is_available(),
+                    );
+                    error = None;
+                }
                 KeyCode::Up => {
                     focused = focused.previous(
                         catalog.models(provider.id()).len() > 1,
