@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn review_policy_allows_app_config_but_not_security_changes() {
         assert!(REVIEW_POLICY.contains("Vite proxies"));
-        assert!(REVIEW_POLICY.contains("may be created or edited when required by the task"));
+        assert!(REVIEW_POLICY.contains("may create or edit application config"));
         assert!(REVIEW_POLICY.contains(
             "not permission to change Voff configuration, credentials, or security controls"
         ));

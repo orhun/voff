@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_transition_sequences_preserve_terminal_states() {
+    fn generated_transition_sequences_preserve_terminal_transition_policy() {
         let terminal = [
             TaskStatus::Completed,
             TaskStatus::Failed,
@@ -652,7 +652,14 @@ mod tests {
                 TaskStatus::Failed,
                 TaskStatus::Cancelled,
             ] {
-                assert!(task.transition(candidate).is_err());
+                let may_retry = final_status == TaskStatus::Failed
+                    && matches!(candidate, TaskStatus::Ready | TaskStatus::Cancelled);
+                let mut attempt = task.clone();
+                assert_eq!(
+                    attempt.transition(candidate).is_ok(),
+                    may_retry,
+                    "unexpected terminal transition: {final_status:?} -> {candidate:?}"
+                );
                 assert_eq!(task.status, final_status);
             }
         }

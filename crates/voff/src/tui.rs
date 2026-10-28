@@ -4606,13 +4606,24 @@ fn conversation_lines(
                 .to_owned()
         };
         if app.expanded_output {
-            title = format!(
-                "{} · {title}",
+            let timestamp_prefix = format!(
+                "{} · ",
                 event
                     .created_at
                     .with_timezone(&chrono::Local)
                     .format("%H:%M:%S")
             );
+            if let Some((range, _)) = &mut reviewer_highlight {
+                let marker_prefix = if title.starts_with('✓') {
+                    "✓ ".len()
+                } else {
+                    0
+                };
+                let shift = timestamp_prefix.len() + marker_prefix;
+                range.start += shift;
+                range.end += shift;
+            }
+            title = format!("{timestamp_prefix}{title}");
         }
         let start = lines.len();
         push_activity_entry(
@@ -6654,7 +6665,7 @@ mod tests {
         let rendered = (0..36)
             .flat_map(|y| (0..120).map(move |x| buffer[(x, y)].symbol()))
             .collect::<String>();
-        assert!(rendered.contains("REVIEW"), "{rendered}");
+        assert!(rendered.contains("Reviewing proposal"), "{rendered}");
         app.lead_reviews.clear();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.team_flow.edges()[0].source, lead.id.to_string());
@@ -7239,18 +7250,28 @@ mod tests {
             app.expanded_output = expanded;
             let lines = conversation_lines(&app, &HashSet::from([task.id]), 40, None);
             let rows: Vec<_> = lines.iter().map(ToString::to_string).collect();
-            assert_eq!(
-                rows,
-                [
-                    " Backend",
-                    " ├─• First line",
-                    " │   Second line",
-                    " │",
-                    " ╰─✓ Finished",
-                    "     Verified",
-                    ""
-                ]
-            );
+            assert_eq!(rows[0], " Backend");
+            if expanded {
+                assert!(rows[1].starts_with(" ├─• "));
+                assert!(rows[1].contains(" ·"));
+                assert_eq!(&rows[2..5], [" │   First line", " │   Second line", " │"]);
+                assert!(rows[5].starts_with(" ╰─• "));
+                assert!(rows[5].contains(" · ✓"));
+                assert_eq!(&rows[6..], ["     Finished", "     Verified", ""]);
+            } else {
+                assert_eq!(
+                    rows,
+                    [
+                        " Backend",
+                        " ├─• First line",
+                        " │   Second line",
+                        " │",
+                        " ╰─✓ Finished",
+                        "     Verified",
+                        ""
+                    ]
+                );
+            }
         }
     }
 
@@ -7411,7 +7432,7 @@ mod tests {
         assert!(
             help_lines(false)
                 .last()
-                .is_some_and(|line| line.width() == 0)
+                .is_some_and(|line| line.to_string().contains("Undo / redo"))
         );
     }
 

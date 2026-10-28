@@ -18,6 +18,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 voff-prompts = { version = "0.1.0", path = "../voff-prompts" }
+sha2.workspace = true
 futures-util = "0.3"
 [dev-dependencies]
 async-trait.workspace = true

@@ -1416,24 +1416,48 @@ impl<R: Repository + 'static> Engine<R> {
                         ));
                     }
                     "task.complete" if task.work.is_some() => {
+                        let proposal_digest =
+                            integrated::completion_proposal_digest(&call.arguments_json);
                         if let Err(error) =
                             self.validate_completion(&task, &call.arguments_json).await
                         {
-                            let feedback = format!(
-                                "Voff rejected this task.complete proposal: {error}. The task remains active. Continue the implementation, then submit one evidence entry for every acceptance criterion, using recorded artifact IDs and a concise explanation. Do not claim completion until verification and all criteria are satisfied."
-                            );
+                            let repeated = self.repo.artifacts().await?.iter().any(|artifact| {
+                                artifact.producer == id
+                                    && artifact.kind == "workflow_feedback"
+                                    && artifact.location == "task.complete"
+                                    && artifact.digest == proposal_digest
+                            });
+                            let feedback = if repeated {
+                                format!(
+                                    "Voff rejected this task.complete proposal again: {error}. This proposal is identical to the previously rejected completion, so Voff will not automatically retry it. A recovery request has been sent to the parent Team Lead; revise the evidence or task plan before submitting completion again."
+                                )
+                            } else {
+                                format!(
+                                    "Voff rejected this task.complete proposal: {error}. No completion was recorded. Correct the specific evidence issue above and submit a revised proposal."
+                                )
+                            };
                             self.publish_artifact(Artifact {
                                 id: ArtifactId::new(),
                                 producer: id,
                                 kind: "workflow_feedback".into(),
                                 location: "task.complete".into(),
-                                digest: String::new(),
+                                digest: proposal_digest,
                                 preview: feedback.clone(),
                             })
                             .await?;
                             self.record(Some(id), CanonicalEventKind::ProviderWarning(feedback))
                                 .await?;
-                            self.transition(id, TaskStatus::Ready).await?;
+                            if repeated {
+                                self.pause_for_loop_recovery(
+                                    id,
+                                    format!(
+                                        "The same task.complete proposal was rejected more than once: {error}. Review the evidence scope and provide a different completion proposal or recovery plan."
+                                    ),
+                                )
+                                .await?;
+                            } else {
+                                self.transition(id, TaskStatus::Ready).await?;
+                            }
                             return Ok(());
                         }
                         side_effects += 1;
@@ -4577,7 +4601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_coordinators_to_answer_but_requires_leaf_implementation_patches() {
+    async fn work_tasks_allow_the_model_to_choose_from_available_tools() {
         for (name, tools, allowed_targets, expected) in [
             (
                 "Lead",
@@ -4589,7 +4613,7 @@ mod tests {
                 "Developer",
                 vec!["file.patch".into()],
                 vec![],
-                ToolChoice::Specific(vec!["file.patch".into()]),
+                ToolChoice::Auto,
             ),
         ] {
             let repo = Arc::new(InMemoryRepository::default());
@@ -5177,7 +5201,7 @@ mod tests {
         );
         assert_eq!(
             repo.task(parent.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
+            TaskStatus::Blocked
         );
     }
 
@@ -5215,10 +5239,14 @@ mod tests {
             TaskStatus::Blocked
         );
         assert!(repo.approvals(session).await.unwrap().is_empty());
-        assert!(repo.events(session).await.unwrap().iter().any(|event| {
-            matches!(&event.kind, CanonicalEventKind::ProviderFailed(message)
-                if message.contains("No in-scope discoverable tests exist"))
-        }));
+        assert!(
+            !repo
+                .events(session)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(&event.kind, CanonicalEventKind::ProviderFailed(_)) })
+        );
         assert!(repo.events(session).await.unwrap().iter().any(|event| {
             matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason }
                 if reason.contains("No in-scope discoverable tests exist"))
@@ -6084,7 +6112,7 @@ mod tests {
         );
         assert_eq!(
             repo.task(parent.id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
+            TaskStatus::Blocked
         );
     }
 }

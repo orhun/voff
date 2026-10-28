@@ -1,5 +1,6 @@
 //! Contract-first plans and evidence-gated multi-step work.
 use super::*;
+use sha2::{Digest, Sha256};
 use voff_prompts::tool_descriptions;
 pub(super) use voff_prompts::workflow::WORK_INSTRUCTIONS;
 
@@ -106,6 +107,32 @@ pub(super) fn retry_lineage_ids(task: &Task, tasks: &[Task]) -> HashSet<TaskId> 
         newer = previous;
     }
     lineage
+}
+
+/// Artifacts available to a task include its own valid retries and the
+/// explicit context inherited from its ancestors. Sibling and descendant
+/// artifacts are never part of this evidence scope.
+fn completion_context_task_ids(task: &Task, tasks: &[Task]) -> HashSet<TaskId> {
+    let mut ids = retry_lineage_ids(task, tasks);
+    let mut parent = task.parent;
+    while let Some(parent_id) = parent {
+        if !ids.insert(parent_id) {
+            break;
+        }
+        parent = tasks
+            .iter()
+            .find(|candidate| candidate.id == parent_id)
+            .and_then(|candidate| candidate.parent);
+    }
+    ids
+}
+
+pub(super) fn completion_proposal_digest(json: &str) -> String {
+    let normalized = serde_json::from_str::<serde_json::Value>(json)
+        .and_then(|value| serde_json::to_string(&value))
+        .unwrap_or_else(|_| json.trim().to_owned());
+    let digest = Sha256::digest(normalized.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub(super) fn verification_kind(task: &Task) -> Option<VerificationKind> {
@@ -368,6 +395,22 @@ mod tests {
         let repo = Arc::new(InMemoryRepository::default());
         let (tx, mut rx) = mpsc::channel(128);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let owner = AgentId::new();
+        repo.save_agent(AgentProfile {
+            id: owner,
+            name: "Verifier".into(),
+            role: "Verifier".into(),
+            provider: "mock".into(),
+            model: "mock-v1".into(),
+            system_prompt: String::new(),
+            tools: vec!["process.test".into()],
+            max_output_tokens: 4096,
+            enabled: true,
+            allowed_targets: vec![],
+            delegation_limits: None,
+        })
+        .await
+        .unwrap();
         let engine = Engine::new(
             repo.clone(),
             Arc::new(MockProvider::success("unused")),
@@ -376,7 +419,7 @@ mod tests {
         )
         .with_verified_workflow();
         let mut task = engine
-            .create_task(AgentId::new(), "implement", vec!["connected app".into()])
+            .create_task(owner, "implement", vec!["connected app".into()])
             .await
             .unwrap();
         task.parent = Some(TaskId::new());
@@ -509,19 +552,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_work_still_answers_simple_questions_without_tools() {
+    async fn verified_work_answers_simple_questions_with_task_answer() {
         let repo = Arc::new(InMemoryRepository::default());
         let (tx, mut rx) = mpsc::channel(32);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let owner = AgentId::new();
-        let engine = Engine::new(
-            repo.clone(),
-            Arc::new(MockProvider::success("Use the documented run command.")),
-            SessionId::new(),
-            tx,
-        )
-        .with_team_lead(owner)
-        .with_verified_workflow();
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "task.answer".into(),
+                arguments_json: r#"{"summary":"Use the documented run command."}"#.into(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), SessionId::new(), tx)
+            .with_team_lead(owner)
+            .with_verified_workflow();
         let task = engine
             .create_task(owner, "How do I run it?", vec![])
             .await
@@ -1353,14 +1399,6 @@ impl<R: Repository + 'static> Engine<R> {
         if completion.summary.trim().is_empty() {
             return Err(invalid("completion summary cannot be empty"));
         }
-        if completion.evidence.len() != task.acceptance_criteria.len() {
-            return Err(invalid(format!(
-                "completion needs exactly {} evidence entries, one for each criterion index 0 through {}; received {}",
-                task.acceptance_criteria.len(),
-                task.acceptance_criteria.len().saturating_sub(1),
-                completion.evidence.len()
-            )));
-        }
         let tasks = self.repo.tasks().await?;
         let mut requested_superseded = HashSet::new();
         for child in &completion.superseded_children {
@@ -1417,45 +1455,106 @@ impl<R: Repository + 'static> Engine<R> {
             }
         }
         let retry_lineage = retry_lineage_ids(task, &tasks);
+        let evidence_scope = completion_context_task_ids(task, &tasks);
         let artifacts = self.repo.artifacts().await?;
+        let available_artifacts = artifacts
+            .iter()
+            .filter(|artifact| evidence_scope.contains(&artifact.producer))
+            .collect::<Vec<_>>();
         let mut criteria = HashSet::new();
         let mut evidence = Vec::new();
         for item in completion.evidence {
+            if item.criterion >= task.acceptance_criteria.len() {
+                return Err(invalid(format!(
+                    "evidence entry uses criterion index {}, but valid indices are 0 through {}",
+                    item.criterion,
+                    task.acceptance_criteria.len().saturating_sub(1)
+                )));
+            }
+            if !criteria.insert(item.criterion) {
+                return Err(invalid(format!(
+                    "criterion {} has more than one evidence entry; provide exactly one entry per criterion",
+                    item.criterion
+                )));
+            }
+            if item.artifact_ids.is_empty() {
+                return Err(invalid(format!(
+                    "criterion {} has no artifact IDs; cite at least one ID from the Artifact index",
+                    item.criterion
+                )));
+            }
+            if item.explanation.trim().is_empty() {
+                return Err(invalid(format!(
+                    "criterion {} has an empty explanation; briefly explain how its cited artifacts support it",
+                    item.criterion
+                )));
+            }
             let artifact_ids = item
                 .artifact_ids
                 .iter()
                 .map(|id| {
                     id.parse::<ArtifactId>().map_err(|_| {
-                        invalid("use the exact art_ prefixed IDs from the artifact list")
+                        invalid(format!(
+                            "criterion {} cites an invalid artifact ID {id:?}; use the exact art_ prefixed ID shown in the Artifact index",
+                            item.criterion
+                        ))
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if item.criterion >= task.acceptance_criteria.len()
-                || !criteria.insert(item.criterion)
-                || item.artifact_ids.is_empty()
-                || item.explanation.trim().is_empty()
-                || artifact_ids.iter().any(|id| {
-                    !artifacts.iter().any(|artifact| {
-                        artifact.id == *id && retry_lineage.contains(&artifact.producer)
-                    })
-                })
-            {
-                return Err(invalid(
-                    "completion evidence must cite this task's artifacts once per criterion with an explanation",
-                ));
+            for (raw_id, artifact_id) in item.artifact_ids.iter().zip(&artifact_ids) {
+                let Some(artifact) = artifacts
+                    .iter()
+                    .find(|artifact| artifact.id == *artifact_id)
+                else {
+                    return Err(invalid(format!(
+                        "criterion {} cites unknown artifact ID {raw_id:?}; copy an exact ID from the Artifact index",
+                        item.criterion
+                    )));
+                };
+                if !evidence_scope.contains(&artifact.producer) {
+                    let available = available_artifacts
+                        .iter()
+                        .rev()
+                        .take(20)
+                        .map(|artifact| {
+                            format!("{} ({}, {})", artifact.id, artifact.kind, artifact.location)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(invalid(format!(
+                        "criterion {} cites artifact {raw_id}, which is outside this task's evidence context. Cite an artifact from this task, its retry attempts, or the supplied ancestor context. Available IDs: {}",
+                        item.criterion,
+                        if available.is_empty() {
+                            "none"
+                        } else {
+                            &available
+                        }
+                    )));
+                }
             }
             evidence.extend(artifact_ids);
+        }
+        let missing_criteria = (0..task.acceptance_criteria.len())
+            .filter(|criterion| !criteria.contains(criterion))
+            .map(|criterion| format!("{criterion} ({})", task.acceptance_criteria[criterion]))
+            .collect::<Vec<_>>();
+        if !missing_criteria.is_empty() {
+            return Err(invalid(format!(
+                "missing evidence entries for criterion(s): {}. Provide exactly one entry for each criterion index 0 through {}",
+                missing_criteria.join(", "),
+                task.acceptance_criteria.len().saturating_sub(1)
+            )));
         }
         // A later patch anywhere in this shared session invalidates earlier
         // verification. Failed and incomplete checks still fail closed.
         let approvals = self.repo.approvals(self.session).await?;
         let delegated_verification = has_integration_sibling(task, &tasks);
+        let owner_can_verify = self.repo.agent(task.owner).await?.is_some_and(|owner| {
+            owner.enabled && owner.tools.iter().any(|tool| tool == "process.test")
+        });
         let mut verification = false;
-        let mut required_verification = if delegated_verification {
-            None
-        } else {
-            verification_kind(task)
-        };
+        let mut required_verification =
+            (!delegated_verification && owner_can_verify).then_some(VerificationKind::Tests);
         for event in self.repo.events(self.session).await? {
             match event.kind {
                 CanonicalEventKind::ApprovalDecided {

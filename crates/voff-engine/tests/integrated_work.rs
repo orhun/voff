@@ -419,6 +419,6 @@ async fn incomplete_completion_feedback_keeps_work_active_for_correction() {
     assert!(
         requests[1].messages[0]
             .content
-            .contains("needs exactly 2 evidence entries")
+            .contains("missing evidence entries for criterion(s): 1")
     );
 }
