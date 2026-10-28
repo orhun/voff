@@ -24,6 +24,6 @@ tracing.workspace = true
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 eventsource-stream = "0.2"
-voff-prompts = { version = "0.1.0", path = "../voff-prompts" }
+voff-prompts = { version = "0.1.1", path = "../voff-prompts" }
 [lints]
 workspace = true
