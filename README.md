@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/voff/assets/logo.gif" width="180" alt="voff logo">
+  <img src="https://raw.githubusercontent.com/orhun/voff/main/assets/logo.gif" width="180" alt="voff logo">
   <br>
   <b>Workflow builder for coding agents 🐶</b>
   <br><br>
@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="crates/voff/assets/demo.gif" alt="Voff demo">
+  <img src="https://raw.githubusercontent.com/orhun/voff/main/assets/demo.gif" alt="Voff demo">
 </p>
 
 Watch tasks move from plan to implementation with coordinated coding agents! 🦴
@@ -113,45 +113,15 @@ Available tools depend on the agent:
 
 ## Configuration
 
-After setup, Voff saves the team to `.voff/config.toml` and this file can be edited to customize the team.
-
-The following is an example configuration:
-
-```toml
-workspace = ".."
-
-[[agent]]
-name = "Lead"
-provider = "codex_cli"
-model = "default"
-prompt = "Plan the work, delegate tasks, and review the results."
-max_output_tokens = 32768
-
-[[agent]]
-name = "Implementer"
-provider = "claude_cli"
-model = "default"
-prompt = "Implement the assigned task and report changes and checks."
-reports_to = "Lead"
-max_output_tokens = 16384
-
-[[agent]]
-name = "Reviewer"
-provider = "ollama"
-model = "qwen2.5-coder"
-prompt = "Review the implementation against its acceptance criteria."
-reports_to = "Lead"
-
-[setup_prompts]
-scan_workspace = "Inspect this project and suggest a useful agent team."
-build_from_description = "Create a team for the user's project description."
-```
+After setup, Voff saves the team to `.voff/config.toml`; edit this file to
+customize your team. See [`config/example.toml`](config/example.toml) for an
+example you can copy to `.voff/config.toml` and adapt.
 
 ## Logo
 
 Meet **Pasha** 🧡 Voff's mascot and unofficial moral supporter.
 
-<img src="crates/voff/assets/pasha.png" width="360" alt="Pasha, Voff's mascot">
+<img src="https://raw.githubusercontent.com/orhun/voff/main/assets/pasha.png" width="360" alt="Pasha, Voff's mascot">
 
 ## License
 
