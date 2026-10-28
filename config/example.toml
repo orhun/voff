@@ -1,0 +1,29 @@
+# Copy this file to .voff/config.toml and customize it for your team.
+# Relative workspace paths are resolved from the config file's directory.
+workspace = ".."
+
+[[agent]]
+name = "Lead"
+provider = "codex_cli"
+model = "default"
+prompt = "Plan the work, delegate tasks, and review the results."
+max_output_tokens = 32768
+
+[[agent]]
+name = "Implementer"
+provider = "claude_cli"
+model = "default"
+prompt = "Implement the assigned task and report changes and checks."
+reports_to = "Lead"
+max_output_tokens = 16384
+
+[[agent]]
+name = "Reviewer"
+provider = "ollama"
+model = "qwen2.5-coder"
+prompt = "Review the implementation against its acceptance criteria."
+reports_to = "Lead"
+
+[setup_prompts]
+scan_workspace = "Inspect this project and suggest a useful agent team."
+build_from_description = "Create a team for the user's project description."
