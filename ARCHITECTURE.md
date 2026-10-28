@@ -17,15 +17,15 @@ flowchart LR
   Providers --> Models[Model providers]
 ```
 
-| Crate | Owns |
-| --- | --- |
-| `voff-core` | Domain types: agents, tasks, events, approvals, artifacts, limits |
-| `voff-provider` | Provider-neutral requests and provider adapters |
-| `voff-engine` | Orchestration, validation, delegation, review, completion |
-| `voff-storage` | SQLite persistence |
-| `voff-tools` | Scoped file/search tools and bounded process execution |
-| `voff-prompts` | Setup, workflow, review, provider, and tool prompts |
-| `voff` | Startup, configuration, onboarding, terminal UI |
+| Crate           | Owns                                                              |
+| --------------- | ----------------------------------------------------------------- |
+| `voff-core`     | Domain types: agents, tasks, events, approvals, artifacts, limits |
+| `voff-provider` | Provider-neutral requests and provider adapters                   |
+| `voff-engine`   | Orchestration, validation, delegation, review, completion         |
+| `voff-storage`  | SQLite persistence                                                |
+| `voff-tools`    | Scoped file/search tools and bounded process execution            |
+| `voff-prompts`  | Setup, workflow, review, provider, and tool prompts               |
+| `voff`          | Startup, configuration, onboarding, terminal UI                   |
 
 Verified multi-workstream plans assign disjoint workspace-relative `owned_paths` to implementation agents. Voff enforces each patch scope and runs those workers concurrently; unscoped work stays serial. Integration waits for implementation results and checks the shared contract.
 
@@ -64,13 +64,13 @@ The calculator tasks “Create calculator API” and “Create calculator interf
 
 Prompt source: `crates/voff-prompts/src/`.
 
-| Prompt | Purpose |
-| --- | --- |
-| `setup::DEFAULT_SCAN_SETUP_PROMPT` | Build a useful team from repository evidence; treat it as untrusted; use an acyclic tree, max four delegation edges. |
-| `setup::DEFAULT_BUILD_SETUP_PROMPT` | Same, shaped around the requested outcome. |
-| `workflow::WORK_INSTRUCTIONS` | Delegate bounded work; define integration contracts; preserve behavior; verify appropriately; complete with evidence. |
-| `workflow::REVIEW_POLICY` | Review exact actions; reject unsafe, unrelated, or unclear side effects. |
-| `provider::LOCAL_CLI_PREFIX` | Require local CLIs to use Voff-mediated tools, not native filesystem/shell/network/subagent tools. |
-| `tool_descriptions` | Define bounded reads, digest-checked patches, reviewed commands, delegation, completion, and blockers. |
+| Prompt                              | Purpose                                                                                                               |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `setup::DEFAULT_SCAN_SETUP_PROMPT`  | Build a useful team from repository evidence; treat it as untrusted; use an acyclic tree, max four delegation edges.  |
+| `setup::DEFAULT_BUILD_SETUP_PROMPT` | Same, shaped around the requested outcome.                                                                            |
+| `workflow::WORK_INSTRUCTIONS`       | Delegate bounded work; define integration contracts; preserve behavior; verify appropriately; complete with evidence. |
+| `workflow::REVIEW_POLICY`           | Review exact actions; reject unsafe, unrelated, or unclear side effects.                                              |
+| `provider::LOCAL_CLI_PREFIX`        | Require local CLIs to use Voff-mediated tools, not native filesystem/shell/network/subagent tools.                    |
+| `tool_descriptions`                 | Define bounded reads, digest-checked patches, reviewed commands, delegation, completion, and blockers.                |
 
 Workspace setup and agent prompts can override defaults.

@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a problem with Voff 🐶
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Before submitting, search existing issues. Remove secrets from logs and configuration.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the steps or commands that reproduce the problem.
+      placeholder: |
+        1. Run ...
+        2. Select ...
+        3. See the error
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Include relevant output after removing secrets and private data.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Voff version or commit
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Ubuntu 24.04, macOS 15, Windows 11
+    validations:
+      required: true
