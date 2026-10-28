@@ -238,7 +238,10 @@ impl Task {
                     | TaskStatus::Cancelled
                     | TaskStatus::Blocked
                     | TaskStatus::Failed
-            ) | (TaskStatus::Blocked | TaskStatus::Failed, TaskStatus::Ready)
+            ) | (
+                TaskStatus::Blocked | TaskStatus::Failed,
+                TaskStatus::Ready | TaskStatus::Cancelled
+            )
         );
         if !valid {
             return Err(DomainError::InvalidTransition {

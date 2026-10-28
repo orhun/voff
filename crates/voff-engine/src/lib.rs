@@ -2226,10 +2226,35 @@ impl<R: Repository + 'static> Engine<R> {
                         ) {
                             self.finalize_parent_tasks().await?;
                         } else if parent.work.is_some() && approval.action == "task.complete" {
-                            let (summary, evidence) =
-                                self.validate_completion(&parent, &approval.reason).await?;
-                            self.finish_task(parent.id, summary, evidence).await?;
-                            self.finalize_parent_tasks().await?;
+                            let completion = async {
+                                let (summary, evidence) =
+                                    self.validate_completion(&parent, &approval.reason).await?;
+                                self.finish_task(parent.id, summary, evidence).await
+                            }
+                            .await;
+                            match completion {
+                                Ok(_) => self.finalize_parent_tasks().await?,
+                                Err(error) => {
+                                    let recovery = self.route_work_error(parent.id, &error).await?;
+                                    let feedback = format!(
+                                        "The Team Lead approved task.complete, but Voff could not finalize it: {error}. Resolve the delegated-task state shown in the task context, then submit completion again with exact superseded_children IDs only for blocked or failed work that is no longer needed."
+                                    );
+                                    self.record(
+                                        Some(parent.id),
+                                        CanonicalEventKind::ProviderWarning(feedback),
+                                    )
+                                    .await?;
+                                    self.transition(
+                                        parent.id,
+                                        if recovery {
+                                            TaskStatus::Blocked
+                                        } else {
+                                            TaskStatus::Ready
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            }
                         } else {
                             let evidence = self
                                 .repo
@@ -2522,6 +2547,23 @@ impl<R: Repository + 'static> Engine<R> {
     ) -> Result<Task, EngineError> {
         let current = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
         if current.work.is_some() {
+            let completion_approval = self
+                .repo
+                .approvals(self.session)
+                .await?
+                .into_iter()
+                .filter(|approval| {
+                    approval.task_id == id
+                        && approval.action == "task.complete"
+                        && approval.decision == ApprovalDecision::ApprovedOnce
+                })
+                .max_by_key(|approval| approval.created_at);
+            if let Some(approval) = completion_approval {
+                let superseded = integrated::completion_superseded_children(&approval.reason)?;
+                if !superseded.is_empty() {
+                    self.cancel_superseded_children(id, &superseded).await?;
+                }
+            }
             let tasks = self.repo.tasks().await?;
             let children = tasks
                 .iter()
@@ -2533,12 +2575,17 @@ impl<R: Repository + 'static> Engine<R> {
                 })
                 .collect::<Vec<_>>();
             if !children.is_empty() {
-                let incomplete_child = children
+                let incomplete_child = children.iter().any(|child| {
+                    !matches!(child.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                });
+                let active_children = children
                     .iter()
-                    .any(|child| child.status != TaskStatus::Completed);
-                let missing_integration = children.len() > 1
+                    .filter(|child| child.status != TaskStatus::Cancelled)
+                    .count();
+                let missing_integration = active_children > 1
                     && !children
                         .iter()
+                        .filter(|child| child.status != TaskStatus::Cancelled)
                         .any(|child| child.work.as_ref().is_some_and(|work| work.integration));
                 if incomplete_child || missing_integration {
                     return Err(EngineError::InvalidDelegationPlan(
@@ -2587,6 +2634,64 @@ impl<R: Repository + 'static> Engine<R> {
             .await
             .map_err(|_| EngineError::ChannelClosed)?;
         Ok(task)
+    }
+    async fn cancel_superseded_children(
+        &self,
+        parent: TaskId,
+        selected: &[TaskId],
+    ) -> Result<(), EngineError> {
+        let _start_guard = self.task_start_lock.lock().await;
+        let tasks = self.repo.tasks().await?;
+        let roots = selected.iter().copied().collect::<HashSet<_>>();
+        for root in &roots {
+            if !tasks
+                .iter()
+                .any(|task| task.id == *root && task.parent == Some(parent))
+            {
+                return Err(EngineError::InvalidDelegationPlan(format!(
+                    "superseded task {root} is not a direct child of this task"
+                )));
+            }
+        }
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
+        let mut subtree = Vec::new();
+        while let Some(id) = pending.pop() {
+            if subtree.contains(&id) {
+                continue;
+            }
+            subtree.push(id);
+            pending.extend(
+                tasks
+                    .iter()
+                    .filter(|task| task.parent == Some(id))
+                    .map(|task| task.id),
+            );
+        }
+        if let Some(active) = subtree.iter().find(|id| {
+            tasks.iter().any(|task| {
+                task.id == **id
+                    && matches!(
+                        task.status,
+                        TaskStatus::Running | TaskStatus::WaitingApproval
+                    )
+            })
+        }) {
+            return Err(EngineError::InvalidDelegationPlan(format!(
+                "cannot supersede delegated task {active} while it is active"
+            )));
+        }
+        for id in subtree.iter().rev() {
+            let Some(task) = tasks.iter().find(|task| task.id == *id) else {
+                continue;
+            };
+            if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+                self.transition(*id, TaskStatus::Cancelled).await?;
+                self.record(Some(*id), CanonicalEventKind::TaskCancelled)
+                    .await?;
+                self.close_pending_approvals(*id).await?;
+            }
+        }
+        Ok(())
     }
     pub async fn child_results(&self, parent: TaskId) -> Result<Vec<TaskResult>, EngineError> {
         Ok(self

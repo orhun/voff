@@ -25,6 +25,39 @@ struct Verdict {
     transient: bool,
 }
 
+fn has_approved_verification(approval: &Approval, approvals: &[Approval]) -> bool {
+    if approval.action != "process.test" {
+        return false;
+    }
+    let Ok(current) = serde_json::from_str::<TestArguments>(&approval.reason) else {
+        return false;
+    };
+    let Ok((program, args, _, verification)) = current.invocation() else {
+        return false;
+    };
+    if !verification {
+        return false;
+    }
+
+    approvals.iter().any(|prior| {
+        if prior.task_id != approval.task_id
+            || prior.action != "process.test"
+            || prior.decision != ApprovalDecision::ApprovedOnce
+            || prior.working_directory != approval.working_directory
+        {
+            return false;
+        }
+        let Ok(prior) = serde_json::from_str::<TestArguments>(&prior.reason) else {
+            return false;
+        };
+        matches!(
+            prior.invocation(),
+            Ok((prior_program, prior_args, _, true))
+                if prior_program == program && prior_args == args
+        )
+    })
+}
+
 impl<R: Repository + 'static> Engine<R> {
     async fn reporting_reviewer(&self, task: &Task) -> Result<AgentId, EngineError> {
         if let Some(parent) = task.parent {
@@ -83,6 +116,30 @@ impl<R: Repository + 'static> Engine<R> {
                     ),
                 )
                 .await?;
+                continue;
+            }
+            if has_approved_verification(&approval, &approvals) {
+                self.record(
+                    Some(task.id),
+                    CanonicalEventKind::LeadReviewStarted {
+                        lead: reviewer,
+                        approval_id: Some(approval.id),
+                    },
+                )
+                .await?;
+                verdicts.push((
+                    approval,
+                    task,
+                    reviewer,
+                    Verdict {
+                        approve: true,
+                        reason: "Reused the Team Lead's approval for this identical task-scoped verification command.".into(),
+                        reassign_to: None,
+                        owned_paths: None,
+                        validated: true,
+                        transient: false,
+                    },
+                ));
                 continue;
             }
             let events = self.repo.events(self.session).await?;
@@ -153,7 +210,7 @@ impl<R: Repository + 'static> Engine<R> {
                 },
             )
             .await?;
-            let evidence = self
+            let mut evidence = self
                 .repo
                 .artifacts()
                 .await?
@@ -162,6 +219,23 @@ impl<R: Repository + 'static> Engine<R> {
                 .map(|artifact| artifact.preview)
                 .collect::<Vec<_>>()
                 .join("\n");
+            if approval.action == "task.complete" {
+                let tasks = self.repo.tasks().await?;
+                let delegated = tasks
+                    .iter()
+                    .filter(|candidate| candidate.parent == Some(task.id))
+                    .map(|candidate| {
+                        format!(
+                            "{} · {:?} · {}",
+                            candidate.id, candidate.status, candidate.objective
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !delegated.is_empty() {
+                    evidence.push_str("\nDelegated child task states (authoritative):\n");
+                    evidence.push_str(&delegated.join("\n"));
+                }
+            }
             let context = prompts::exact_action_review(
                 &approval.action,
                 &approval.working_directory,
@@ -357,7 +431,7 @@ impl<R: Repository + 'static> Engine<R> {
                 },
             )
             .await?;
-            let evidence = self
+            let mut evidence = self
                 .repo
                 .artifacts()
                 .await?
@@ -366,6 +440,53 @@ impl<R: Repository + 'static> Engine<R> {
                 .map(|artifact| artifact.preview)
                 .collect::<Vec<_>>()
                 .join("\n");
+            let child_states = self
+                .repo
+                .tasks()
+                .await?
+                .into_iter()
+                .filter(|child| child.parent == Some(task.id))
+                .map(|child| format!("{} · {:?} · {}", child.id, child.status, child.objective))
+                .collect::<Vec<_>>();
+            if !child_states.is_empty() {
+                evidence.push_str("\nDirect delegated tasks (authoritative):\n");
+                evidence.push_str(&child_states.join("\n"));
+            }
+            let recovery_history = self
+                .repo
+                .events(self.session)
+                .await?
+                .into_iter()
+                .filter(|event| event.task_id == Some(task.id))
+                .filter_map(|event| match event.kind {
+                    CanonicalEventKind::WorkRecoveryRequested { reason } => {
+                        Some(format!("Recovery requested: {reason}"))
+                    }
+                    CanonicalEventKind::LeadReviewFinished {
+                        approval_id: None,
+                        approved,
+                        reason,
+                        ..
+                    } => Some(format!(
+                        "Recovery plan {}: {reason}",
+                        if approved { "approved" } else { "rejected" }
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !recovery_history.is_empty() {
+                evidence.push_str("\nPrevious recovery attempts (authoritative; newest last):\n");
+                evidence.push_str(
+                    &recovery_history
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
             let capability_evidence = if let Some(owner) = self.repo.agent(task.owner).await? {
                 let reports = self
                     .enabled_delegation_targets(&owner.allowed_targets)
@@ -473,6 +594,13 @@ impl<R: Repository + 'static> Engine<R> {
             };
             if verdict.reassign_to.is_some() && reassignment.is_none() {
                 verdict.approve = false;
+            }
+            // A valid structured reassignment is an actionable recovery plan.
+            // Some providers phrase their rationale as a rejection even when
+            // they populate reassign_to; honor the bounded owner selection
+            // instead of leaving a recoverable task blocked indefinitely.
+            if reassignment.is_some() {
+                verdict.approve = true;
             }
             if verdict.transient || !verdict.approve {
                 self.record(

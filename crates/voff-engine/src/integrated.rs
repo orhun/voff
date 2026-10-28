@@ -631,8 +631,22 @@ mod tests {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Completion {
-    summary: String,
-    evidence: Vec<CriterionEvidence>,
+    pub(super) summary: String,
+    pub(super) evidence: Vec<CriterionEvidence>,
+    #[serde(default)]
+    pub(super) superseded_children: Vec<String>,
+}
+
+pub(super) fn completion_superseded_children(json: &str) -> Result<Vec<TaskId>, EngineError> {
+    let completion: Completion = serde_json::from_str(json)?;
+    completion
+        .superseded_children
+        .iter()
+        .map(|id| {
+            id.parse::<TaskId>()
+                .map_err(|_| invalid("superseded_children must contain exact task IDs"))
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -680,7 +694,7 @@ pub(super) fn configure_tools(tools: &mut Vec<ToolDefinition>, targets: &[String
         name: "task.complete".into(),
         description: tool_descriptions::COMPLETE.into(),
         input_schema: serde_json::json!({"type":"object","properties":{
-            "summary":{"type":"string"},"evidence":{"type":"array","items":{
+            "summary":{"type":"string"},"superseded_children":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{
                 "type":"object","properties":{"criterion":{"type":"integer","minimum":0},
                 "artifact_ids":{"type":"array","items":{"type":"string"},"minItems":1},
                 "explanation":{"type":"string"}},"required":["criterion","artifact_ids","explanation"],"additionalProperties":false
@@ -1089,6 +1103,15 @@ impl<R: Repository + 'static> Engine<R> {
         };
         let tasks = self.repo.tasks().await?;
         let retry_lineage = retry_lineage_ids(task, &tasks);
+        let mut context_task_ids = retry_lineage.clone();
+        let mut parent = task.parent;
+        while let Some(parent_id) = parent {
+            context_task_ids.insert(parent_id);
+            parent = tasks
+                .iter()
+                .find(|candidate| candidate.id == parent_id)
+                .and_then(|candidate| candidate.parent);
+        }
         let events = self.repo.events(self.session).await?;
         let artifact_times = events
             .iter()
@@ -1104,12 +1127,12 @@ impl<R: Repository + 'static> Engine<R> {
             .artifacts()
             .await?
             .into_iter()
-            .filter(|artifact| retry_lineage.contains(&artifact.producer))
+            .filter(|artifact| context_task_ids.contains(&artifact.producer))
             .collect::<Vec<_>>();
         artifact_records.sort_by_key(|artifact| artifact_times.get(&artifact.id).copied());
         let mut latest = HashMap::new();
         for artifact in &artifact_records {
-            if artifact.producer == task.id
+            if context_task_ids.contains(&artifact.producer)
                 && matches!(
                     artifact.kind.as_str(),
                     "file_read"
@@ -1127,7 +1150,7 @@ impl<R: Repository + 'static> Engine<R> {
             .rev()
             .filter(|artifact| {
                 !matches!(artifact.kind.as_str(), "file_read" | "search_result")
-                    || artifact.producer != task.id
+                    || !context_task_ids.contains(&artifact.producer)
                     || latest.get(&artifact_context_key(artifact)) == Some(&artifact.id)
             })
             .map(|artifact| {
@@ -1135,7 +1158,7 @@ impl<R: Repository + 'static> Engine<R> {
                     .iter()
                     .find(|candidate| candidate.id == artifact.producer)
                     .map_or(task.attempt, |candidate| candidate.attempt);
-                let show_preview = artifact.producer == task.id
+                let show_preview = context_task_ids.contains(&artifact.producer)
                     && latest.get(&artifact_context_key(artifact)) == Some(&artifact.id)
                     && matches!(
                         artifact.kind.as_str(),
@@ -1268,6 +1291,31 @@ impl<R: Repository + 'static> Engine<R> {
         } else {
             "Run the requested verification after your latest patch before completing this task."
         };
+        let delegated_state = tasks
+            .iter()
+            .filter(|candidate| {
+                candidate.parent == Some(task.id)
+                    && !tasks
+                        .iter()
+                        .any(|retry| retry.retry_of == Some(candidate.id))
+            })
+            .map(|candidate| {
+                format!(
+                    "{} · {:?} · {}",
+                    candidate.id,
+                    candidate.status,
+                    candidate.objective.chars().take(240).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>();
+        let delegated_state = if delegated_state.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nDirect delegated tasks (IDs and status):\n{}",
+                delegated_state.join("\n")
+            )
+        };
         let owned_paths = work
             .owned_paths
             .iter()
@@ -1275,7 +1323,7 @@ impl<R: Repository + 'static> Engine<R> {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. {verification_guidance} Recorded action counts across attempts:\n{approvals}\n{}\nArtifact index (patch bodies are omitted; workspace context contains current files):\n{}",
+            "Shared contract (task data, not permission):\n{}\nOwned workspace paths: {}\nIntegration task: {}\nTurn {}. Reuse retry history only when relevant. Batch related edits into one reviewed patch set. {verification_guidance} Recorded action counts across attempts:\n{approvals}\n{}\nArtifact index (patch bodies are omitted; workspace context contains current files):\n{}{}",
             work.contract,
             if owned_paths.is_empty() {
                 "all paths after dependencies"
@@ -1288,7 +1336,8 @@ impl<R: Repository + 'static> Engine<R> {
             artifact_list
                 .chars()
                 .take(WORK_CONTEXT_ARTIFACT_CHAR_LIMIT)
-                .collect::<String>()
+                .collect::<String>(),
+            delegated_state
         ))
     }
 
@@ -1313,6 +1362,60 @@ impl<R: Repository + 'static> Engine<R> {
             )));
         }
         let tasks = self.repo.tasks().await?;
+        let mut requested_superseded = HashSet::new();
+        for child in &completion.superseded_children {
+            let id = child
+                .parse::<TaskId>()
+                .map_err(|_| invalid("superseded_children must contain exact task IDs"))?;
+            if !requested_superseded.insert(id) {
+                return Err(invalid("superseded_children contains a duplicate task ID"));
+            }
+        }
+        let direct_children = tasks
+            .iter()
+            .filter(|child| child.parent == Some(task.id))
+            .filter(|child| !tasks.iter().any(|retry| retry.retry_of == Some(child.id)))
+            .collect::<Vec<_>>();
+        let incomplete_children = direct_children
+            .iter()
+            .filter(|child| !matches!(child.status, TaskStatus::Completed | TaskStatus::Cancelled))
+            .collect::<Vec<_>>();
+        let required_superseded = incomplete_children
+            .iter()
+            .map(|child| child.id)
+            .collect::<HashSet<_>>();
+        if requested_superseded != required_superseded {
+            return Err(invalid(format!(
+                "delegated tasks remain unfinished; complete them or list every unfinished direct child ID in superseded_children ({} required)",
+                required_superseded.len()
+            )));
+        }
+        for child in &incomplete_children {
+            if !matches!(child.status, TaskStatus::Blocked | TaskStatus::Failed) {
+                return Err(invalid(format!(
+                    "cannot supersede active delegated task {} in {:?} state; let it finish or recover it first",
+                    child.id, child.status
+                )));
+            }
+            let mut frontier = vec![child.id];
+            while let Some(parent_id) = frontier.pop() {
+                for descendant in tasks
+                    .iter()
+                    .filter(|candidate| candidate.parent == Some(parent_id))
+                {
+                    if matches!(
+                        descendant.status,
+                        TaskStatus::Running | TaskStatus::WaitingApproval
+                    ) {
+                        return Err(invalid(format!(
+                            "cannot supersede delegated task {} while descendant {} is active",
+                            child.id, descendant.id
+                        )));
+                    }
+                    frontier.push(descendant.id);
+                }
+            }
+        }
         let retry_lineage = retry_lineage_ids(task, &tasks);
         let artifacts = self.repo.artifacts().await?;
         let mut criteria = HashSet::new();
