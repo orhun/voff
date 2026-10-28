@@ -2,8 +2,7 @@
   <img src="crates/voff/assets/logo.gif" width="180" alt="voff logo">
   <br>
   <b>Workflow builder for coding agents 🐶</b>
-  <br><hr></p>
-<p align="center">
+  <br><br>
   <a href="https://github.com/voffsh/voff/releases"><img src="https://img.shields.io/github/v/release/voffsh/voff?include_prereleases&style=flat&labelColor=17253C&color=466C98&logo=github&logoColor=white" alt="GitHub release"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-466C98?style=flat&labelColor=17253C" alt="MIT or Apache-2.0 license"></a>
   <br>
