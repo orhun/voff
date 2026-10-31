@@ -101,6 +101,11 @@ enum RunMode {
     Conversation,
 }
 
+/// Hard safety bounds for autonomous verified-work loops. These are persisted
+/// through retries so restarting the UI cannot reset an unproductive task.
+const MAX_WORK_TURNS: u16 = 64;
+const MAX_COMPLETION_REJECTIONS: usize = 3;
+
 /// Persisted, task-local consent to regenerate an output-limited response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutputContinuation {
@@ -905,6 +910,38 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?
                 .is_some_and(|task| task.status == TaskStatus::Running);
             if still_running {
+                if let EngineError::Provider(provider_error) = error
+                    && provider_error.retryable
+                    && matches!(
+                        provider_error.kind,
+                        ProviderErrorKind::RateLimit
+                            | ProviderErrorKind::Timeout
+                            | ProviderErrorKind::Internal
+                    )
+                {
+                    self.record(
+                        Some(id),
+                        CanonicalEventKind::ApplicationIssue(format!(
+                            "Temporary provider {:?} failure. The task and its dependencies were preserved; retry after provider availability recovers.",
+                            provider_error.kind
+                        )),
+                    )
+                    .await?;
+                    self.request_approval(
+                        id,
+                        ToolCallId::new(),
+                        "provider.retry".into(),
+                        "current task only".into(),
+                        serde_json::json!({
+                            "kind": format!("{:?}", provider_error.kind),
+                            "retryable": true,
+                            "scope": "current task only"
+                        })
+                        .to_string(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 let recovery_review = self.route_work_error(id, error).await?;
                 if !recovery_review {
                     self.record(
@@ -936,6 +973,22 @@ impl<R: Repository + 'static> Engine<R> {
         }
         if task.status != TaskStatus::Ready {
             return Err(EngineError::NotRunnable(task.status));
+        }
+        if task
+            .work
+            .as_ref()
+            .is_some_and(|work| work.turns >= MAX_WORK_TURNS)
+        {
+            self.transition(id, TaskStatus::Running).await?;
+            drop(start_guard);
+            self.pause_for_loop_recovery(
+                id,
+                format!(
+                    "Autonomous work reached the safety limit of {MAX_WORK_TURNS} provider turns. Review the existing artifacts, narrow or reassign the task, then explicitly retry it."
+                ),
+            )
+            .await?;
+            return Ok(());
         }
         let agent = self.repo.agent(task.owner).await?.unwrap_or(AgentProfile {
             id: task.owner,
@@ -1421,15 +1474,30 @@ impl<R: Repository + 'static> Engine<R> {
                         if let Err(error) =
                             self.validate_completion(&task, &call.arguments_json).await
                         {
-                            let repeated = self.repo.artifacts().await?.iter().any(|artifact| {
+                            let artifacts = self.repo.artifacts().await?;
+                            let completion_rejections = artifacts
+                                .iter()
+                                .filter(|artifact| {
+                                    artifact.producer == id
+                                        && artifact.kind == "workflow_feedback"
+                                        && artifact.location == "task.complete"
+                                })
+                                .count();
+                            let repeated = artifacts.iter().any(|artifact| {
                                 artifact.producer == id
                                     && artifact.kind == "workflow_feedback"
                                     && artifact.location == "task.complete"
                                     && artifact.digest == proposal_digest
                             });
+                            let rejection_budget_exhausted =
+                                completion_rejections + 1 >= MAX_COMPLETION_REJECTIONS;
                             let feedback = if repeated {
                                 format!(
                                     "Voff rejected this task.complete proposal again: {error}. This proposal is identical to the previously rejected completion, so Voff will not automatically retry it. A recovery request has been sent to the parent Team Lead; revise the evidence or task plan before submitting completion again."
+                                )
+                            } else if rejection_budget_exhausted {
+                                format!(
+                                    "Voff rejected this task.complete proposal: {error}. The task reached the safety limit of {MAX_COMPLETION_REJECTIONS} rejected completion proposals and will pause for recovery instead of retrying automatically."
                                 )
                             } else {
                                 format!(
@@ -1447,11 +1515,12 @@ impl<R: Repository + 'static> Engine<R> {
                             .await?;
                             self.record(Some(id), CanonicalEventKind::ProviderWarning(feedback))
                                 .await?;
-                            if repeated {
+                            if repeated || rejection_budget_exhausted {
                                 self.pause_for_loop_recovery(
                                     id,
                                     format!(
-                                        "The same task.complete proposal was rejected more than once: {error}. Review the evidence scope and provide a different completion proposal or recovery plan."
+                                        "Completion could not be validated after {} proposal(s): {error}. Review the exact artifact IDs and verification evidence, then provide a recovery plan before resuming.",
+                                        completion_rejections + 1
                                     ),
                                 )
                                 .await?;
@@ -2126,6 +2195,34 @@ impl<R: Repository + 'static> Engine<R> {
                     "Continuing by regenerating the incomplete response with {} output tokens; partial proposals were discarded",
                     continuation.next_tokens
                 ))).await?;
+                self.transition(approval.task_id, TaskStatus::Ready).await?;
+            }
+            self.events
+                .send(EngineEvent::ApprovalUpdated(approval.clone()))
+                .await
+                .map_err(|_| EngineError::ChannelClosed)?;
+            return Ok(approval);
+        }
+        if approval.action == "provider.retry" {
+            if decision == ApprovalDecision::Denied {
+                self.record(
+                    Some(approval.task_id),
+                    CanonicalEventKind::WorkRecoveryRequested {
+                        reason: "Provider retry was declined; the task remains blocked without failing its history.".into(),
+                    },
+                )
+                .await?;
+                self.transition(approval.task_id, TaskStatus::Blocked)
+                    .await?;
+            } else {
+                self.record(
+                    Some(approval.task_id),
+                    CanonicalEventKind::ProviderWarning(
+                        "Retrying the same task after a temporary provider failure; scope and permissions are unchanged."
+                            .into(),
+                    ),
+                )
+                .await?;
                 self.transition(approval.task_id, TaskStatus::Ready).await?;
             }
             self.events
@@ -3949,6 +4046,68 @@ mod tests {
         tools: Arc<Mutex<Option<Vec<ToolDefinition>>>>,
     }
 
+    struct TemporarilyRateLimited;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for TemporarilyRateLimited {
+        fn descriptor(&self) -> ProviderDescriptor {
+            MockProvider::success("").descriptor()
+        }
+
+        async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn start(
+            &self,
+            _: CanonicalRequest,
+            _: ProviderEventSink,
+            _: CancellationToken,
+        ) -> Result<ProviderCompletion, ProviderError> {
+            Err(ProviderError {
+                kind: ProviderErrorKind::RateLimit,
+                message: "temporary account limit".into(),
+                retryable: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_provider_failure_waits_for_retry_without_failing_task() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let session = SessionId::new();
+        let (tx, _rx) = mpsc::channel(32);
+        let engine = Engine::new(repo.clone(), Arc::new(TemporarilyRateLimited), session, tx);
+        let task = engine
+            .create_task(AgentId::new(), "provider work", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::WaitingApproval
+        );
+        let approval = repo.approvals(session).await.unwrap().pop().unwrap();
+        assert_eq!(approval.action, "provider.retry");
+        assert_eq!(approval.decision, ApprovalDecision::Pending);
+        assert!(!repo.events(session).await.unwrap().iter().any(|event| {
+            event.task_id == Some(task.id)
+                && matches!(event.kind, CanonicalEventKind::ProviderFailed(_))
+        }));
+
+        engine
+            .decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+    }
+
     struct OutputLimited {
         limits: Arc<Mutex<Vec<u64>>>,
     }
@@ -4854,6 +5013,107 @@ mod tests {
         assert_eq!(
             repo.task(t.id).await.unwrap().unwrap().status,
             TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_work_pauses_before_exceeding_the_provider_turn_limit() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("must not run")),
+            SessionId::new(),
+            tx,
+        );
+        let mut task = engine
+            .create_task(AgentId::new(), "bounded work", vec!["verified".into()])
+            .await
+            .unwrap();
+        task.work = Some(WorkProgress {
+            contract: "bounded contract".into(),
+            owned_paths: vec![],
+            integration: false,
+            turns: MAX_WORK_TURNS,
+        });
+        repo.save_task(task.clone()).await.unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+
+        let saved = repo.task(task.id).await.unwrap().unwrap();
+        assert_eq!(saved.status, TaskStatus::Blocked);
+        assert_eq!(saved.work.unwrap().turns, MAX_WORK_TURNS);
+        assert!(
+            repo.events(engine.session)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason }
+                if reason.contains("safety limit"))
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_invalid_completion_proposals_share_one_rejection_budget() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let provider = MockProvider::new(vec![
+            MockStep::Event(ProviderEvent::ToolRequest(StructuredToolRequest {
+                id: ToolCallId::new(),
+                name: "task.complete".into(),
+                arguments_json: r#"{"summary":"third distinct proposal","evidence":[]}"#.into(),
+            })),
+            MockStep::Event(ProviderEvent::Completed),
+        ]);
+        let engine = Engine::new(repo.clone(), Arc::new(provider), SessionId::new(), tx)
+            .with_verified_workflow();
+        let mut task = engine
+            .create_task(
+                AgentId::new(),
+                "bounded completion",
+                vec!["verified".into()],
+            )
+            .await
+            .unwrap();
+        task.work = Some(WorkProgress {
+            contract: "completion contract".into(),
+            owned_paths: vec![],
+            integration: false,
+            turns: 0,
+        });
+        repo.save_task(task.clone()).await.unwrap();
+        for digest in ["first", "second"] {
+            repo.save_artifact(Artifact {
+                id: ArtifactId::new(),
+                producer: task.id,
+                kind: "workflow_feedback".into(),
+                location: "task.complete".into(),
+                digest: digest.into(),
+                preview: "prior rejection".into(),
+            })
+            .await
+            .unwrap();
+        }
+        engine.mark_ready(task.id).await.unwrap();
+
+        engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            repo.task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
+        assert!(
+            repo.events(engine.session)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason }
+                if reason.contains("3 proposal(s)"))
+                })
         );
     }
     #[tokio::test]

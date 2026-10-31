@@ -1216,6 +1216,23 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
             current = tasks.iter().find(|task| task.id == parent);
         }
     }
+    // Provider generation has no direct workspace side effects: tools are
+    // persisted and approved separately. Therefore a process restart can
+    // safely resume interrupted leaf work instead of poisoning the dependency
+    // graph with a synthetic failure. Keep running coordinators alive while
+    // their interrupted descendants are made runnable again.
+    for task in tasks
+        .iter()
+        .filter(|task| task_ids.contains(&task.id) && task.status == TaskStatus::Running)
+    {
+        let mut current = Some(task);
+        while let Some(parent) = current.and_then(|task| task.parent) {
+            if !task_ids.contains(&parent) || !waiting_ancestors.insert(parent) {
+                break;
+            }
+            current = tasks.iter().find(|task| task.id == parent);
+        }
+    }
     for task in tasks.into_iter().filter(|task| {
         task_ids.contains(&task.id)
             && task.status == TaskStatus::Running
@@ -1226,11 +1243,12 @@ async fn recover_interrupted<R: Repository>(repo: &R, session: SessionId) -> Res
             session_id: session,
             task_id: Some(task.id),
             created_at: chrono::Utc::now(),
-            kind: CanonicalEventKind::ProviderFailed(
-                "interrupted by previous process termination; retry or cancel explicitly".into(),
+            kind: CanonicalEventKind::ApplicationIssue(
+                "Provider work was interrupted by the previous process termination. Persisted task history and approvals were preserved; resuming this task automatically with unchanged scope and permissions."
+                    .into(),
             ),
         };
-        repo.transition_task_with_event(task.id, TaskStatus::Failed, event)
+        repo.transition_task_with_event(task.id, TaskStatus::Ready, event)
             .await?;
     }
     Ok(())
@@ -1424,6 +1442,57 @@ mod tests {
             ],
             working_directory: std::env::current_dir().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_interrupted_leaf_without_failing_its_dependency_chain() {
+        let repo = SqliteRepository::open_in_memory().await.unwrap();
+        let session = SessionId::new();
+        let owner = AgentId::new();
+        let mut parent = Task::root(owner, "coordinate", vec![], TaskLimits::default());
+        parent.transition(TaskStatus::Ready).unwrap();
+        parent.transition(TaskStatus::Running).unwrap();
+        let mut child = Task::root(owner, "implement", vec![], TaskLimits::default());
+        child.parent = Some(parent.id);
+        child.depth = 1;
+        child.transition(TaskStatus::Ready).unwrap();
+        child.transition(TaskStatus::Running).unwrap();
+        repo.save_task(parent.clone()).await.unwrap();
+        repo.save_task(child.clone()).await.unwrap();
+        for task_id in [parent.id, child.id] {
+            repo.append_event(CanonicalEvent {
+                id: EventId::new(),
+                session_id: session,
+                task_id: Some(task_id),
+                created_at: chrono::Utc::now(),
+                kind: CanonicalEventKind::TaskCreated,
+            })
+            .await
+            .unwrap();
+        }
+
+        recover_interrupted(&repo, session).await.unwrap();
+
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            repo.task(child.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        assert!(repo.events(session).await.unwrap().iter().any(|event| {
+            event.task_id == Some(child.id)
+                && matches!(event.kind, CanonicalEventKind::ApplicationIssue(_))
+        }));
+        assert!(
+            !repo
+                .events(session)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(event.kind, CanonicalEventKind::ProviderFailed(_)) })
+        );
     }
 
     #[test]

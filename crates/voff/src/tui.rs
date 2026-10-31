@@ -1585,7 +1585,11 @@ impl AppModel {
             .iter()
             .filter(|approval| {
                 approval.decision == ApprovalDecision::Pending
-                    && (!self.automatic_review || approval.action == "provider.continue")
+                    && (!self.automatic_review
+                        || matches!(
+                            approval.action.as_str(),
+                            "provider.continue" | "provider.retry"
+                        ))
             })
             .nth(selected)
     }
@@ -1594,7 +1598,11 @@ impl AppModel {
             .iter()
             .filter(|approval| {
                 approval.decision == ApprovalDecision::Pending
-                    && (!self.automatic_review || approval.action == "provider.continue")
+                    && (!self.automatic_review
+                        || matches!(
+                            approval.action.as_str(),
+                            "provider.continue" | "provider.retry"
+                        ))
             })
             .count()
     }
@@ -6121,11 +6129,15 @@ fn render_compact_approval(frame: &mut ratatui::Frame<'_>, app: &AppModel, appro
                 )
             })
             .unwrap_or_else(|_| "Output limit · continue or cancel?".into())
+    } else if approval.action == "provider.retry" {
+        "Provider temporarily unavailable · retry task?".into()
     } else {
         format!("{} · {}", sanitize(owner), sanitize(&approval.action))
     };
     let subtitle = if approval.action == "provider.continue" {
         "Regenerate output? y continue / n cancel".to_owned()
+    } else if approval.action == "provider.retry" {
+        "Retry same task? y retry / n keep blocked".to_owned()
     } else {
         let summary = serde_json::from_str::<serde_json::Value>(&approval.reason)
             .ok()
