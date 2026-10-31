@@ -526,6 +526,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_truncated_artifact_id_suggests_the_exact_scoped_id() {
+        let (engine, _repo, task, artifact) = fixture().await;
+        let exact = artifact.id.to_string();
+        let truncated = exact[..exact.len() - 1].to_owned();
+        let json = serde_json::json!({
+            "summary":"done",
+            "evidence":[{
+                "criterion":0,
+                "artifact_ids":[truncated],
+                "explanation":"actual check"
+            }]
+        })
+        .to_string();
+
+        let error = engine.validate_completion(&task, &json).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("did you mean \"{exact}\"?"))
+        );
+    }
+
+    #[tokio::test]
     async fn prose_or_patch_cannot_bypass_acceptance_and_turn_count_survives_retry() {
         let (engine, repo, mut task, _) = fixture().await;
         task.status = TaskStatus::Running;
@@ -1494,9 +1518,23 @@ impl<R: Repository + 'static> Engine<R> {
                 .iter()
                 .map(|id| {
                     id.parse::<ArtifactId>().map_err(|_| {
+                        let suggestion = available_artifacts
+                            .iter()
+                            .map(|artifact| artifact.id.to_string())
+                            .filter(|candidate| {
+                                candidate.starts_with(id.as_str())
+                                    || id.starts_with(candidate.as_str())
+                            })
+                            .take(2)
+                            .collect::<Vec<_>>();
                         invalid(format!(
-                            "criterion {} cites an invalid artifact ID {id:?}; use the exact art_ prefixed ID shown in the Artifact index",
-                            item.criterion
+                            "criterion {} cites an invalid artifact ID {id:?}; use the exact art_ prefixed ID shown in the Artifact index{}",
+                            item.criterion,
+                            if suggestion.len() == 1 {
+                                format!("; did you mean {:?}?", suggestion[0])
+                            } else {
+                                String::new()
+                            }
                         ))
                     })
                 })

@@ -93,7 +93,10 @@ impl<R: Repository + 'static> Engine<R> {
         let mut verdicts = Vec::new();
         for approval in approvals
             .iter()
-            .filter(|a| a.decision == ApprovalDecision::Pending && a.action != "provider.continue")
+            .filter(|a| {
+                a.decision == ApprovalDecision::Pending
+                    && !matches!(a.action.as_str(), "provider.continue" | "provider.retry")
+            })
             .cloned()
         {
             let task = self
