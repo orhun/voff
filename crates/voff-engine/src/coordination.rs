@@ -35,18 +35,17 @@ impl<R: Repository + 'static> Engine<R> {
         }
     }
 
-    /// Review pending work once, outside the render loop and approval lock.
+    /// Resolve pending workflow actions once, outside the render loop and approval lock.
     pub async fn coordinate_pending(&self) -> Result<(), EngineError> {
-        if !self.automatic_review {
-            return Ok(());
-        }
         let _guard = self.coordinator_lock.lock().await;
-        let _lead = self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
+        if self.automatic_review {
+            self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
+        }
         let mut approvals = self.repo.approvals(self.session).await?;
         approvals.sort_by_key(|approval| approval.created_at);
         for approval in approvals
             .iter()
-            .filter(|a| a.decision == ApprovalDecision::Pending && a.action != "provider.continue")
+            .filter(|a| a.decision == ApprovalDecision::Pending)
             .cloned()
         {
             let task = self
@@ -70,22 +69,18 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?;
                 continue;
             }
-            // Match the provider's permission model: workspace edits and
-            // bounded workflow actions run under the authority already
-            // granted to this task. Commands remain an explicit person-level
-            // approval, without an extra model review in front of that yes.
-            if approval.action == "process.test" {
-                continue;
-            }
-            // Deterministic validation in dispatch_approved checks patches,
-            // plans, and completion evidence before applying any action.
+            // Resolve supported workflow actions without a person-level
+            // confirmation. Dispatch still enforces workspace scope, command
+            // grants, delegation limits, schemas, and completion evidence.
             let auto_approve = matches!(
                 approval.action.as_str(),
-                "task.delegate"
+                "provider.continue"
+                    | "task.delegate"
                     | "review.request"
                     | "task.plan"
                     | "file.read"
                     | "file.patch"
+                    | "process.test"
                     | "task.complete"
             );
             if auto_approve {
@@ -103,6 +98,10 @@ impl<R: Repository + 'static> Engine<R> {
             .await?;
             self.decide_approval(approval.id, ApprovalDecision::Denied)
                 .await?;
+        }
+
+        if !self.automatic_review {
+            return Ok(());
         }
 
         let events = self.repo.events(self.session).await?;

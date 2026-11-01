@@ -167,7 +167,7 @@ async fn scoped_workspace_patch_applies_after_validation_without_model_review() 
 }
 
 #[tokio::test]
-async fn process_commands_remain_visible_for_person_approval() {
+async fn process_commands_auto_approve_without_person_confirmation() {
     let request = call(
         "process.test",
         serde_json::json!({
@@ -192,7 +192,7 @@ async fn process_commands_remain_visible_for_person_approval() {
 
     let approval = repo.approvals(session).await.unwrap().remove(0);
     assert_eq!(approval.action, "process.test");
-    assert_eq!(approval.decision, ApprovalDecision::Pending);
+    assert_eq!(approval.decision, ApprovalDecision::ApprovedOnce);
     assert_eq!(provider.requests.lock().await.len(), 1);
 }
 
@@ -904,17 +904,28 @@ async fn automatic_repairs_reuse_the_task_and_record_retry_attempts() {
 }
 
 #[tokio::test]
-async fn authentication_informs_user_and_output_limit_stays_human_owned() {
+async fn authentication_informs_user_and_output_limit_continues_automatically() {
     for kind in [
         ProviderErrorKind::Authentication,
         ProviderErrorKind::OutputLimit,
     ] {
-        let (engine, repo, provider, _dir, session, lead) = setup(vec![error(kind)], false).await;
+        let responses = if kind == ProviderErrorKind::OutputLimit {
+            vec![
+                error(kind),
+                Ok(vec![
+                    ProviderEvent::TextDelta("Completed after bounded continuation.".into()),
+                    ProviderEvent::Completed,
+                ]),
+            ]
+        } else {
+            vec![error(kind)]
+        };
+        let (engine, repo, provider, _dir, session, lead) = setup(responses, false).await;
         let task = engine.create_task(lead, "Build", vec![]).await.unwrap();
         engine.mark_ready(task.id).await.unwrap();
         engine.run_task_and_schedule(task.id, 2).await.unwrap();
-        assert_eq!(provider.requests.lock().await.len(), 1);
         if kind == ProviderErrorKind::Authentication {
+            assert_eq!(provider.requests.lock().await.len(), 1);
             assert!(
                 repo.events(session)
                     .await
@@ -925,7 +936,12 @@ async fn authentication_informs_user_and_output_limit_stays_human_owned() {
         } else {
             let approvals = repo.approvals(session).await.unwrap();
             assert_eq!(approvals[0].action, "provider.continue");
-            assert_eq!(approvals[0].decision, ApprovalDecision::Pending);
+            assert_eq!(approvals[0].decision, ApprovalDecision::ApprovedOnce);
+            assert_eq!(provider.requests.lock().await.len(), 2);
+            assert_eq!(
+                repo.task(task.id).await.unwrap().unwrap().status,
+                TaskStatus::Completed
+            );
         }
     }
 }

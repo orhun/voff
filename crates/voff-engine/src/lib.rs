@@ -6061,7 +6061,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn structured_delegation_enforces_allowed_target() {
+    async fn structured_delegation_dispatches_without_review_gate() {
         let repo = Arc::new(InMemoryRepository::default());
         let lead = AgentProfile {
             id: AgentId::new(),
@@ -6109,18 +6109,15 @@ mod tests {
         let (tx, _rx) = mpsc::channel(128);
         let session = SessionId::new();
         let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
-            .with_formation_agents(&[lead.clone(), worker.clone()]);
+            .with_formation_agents(&[lead.clone(), worker.clone()])
+            .with_automatic_review(false);
         let parent = engine
             .create_task(lead.id, "lead task", vec![])
             .await
             .unwrap();
         engine.mark_ready(parent.id).await.unwrap();
         engine.run_task(parent.id).await.unwrap();
-        let approval = repo.approvals(session).await.unwrap().pop().unwrap();
-        engine
-            .decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
-            .await
-            .unwrap();
+        engine.coordinate_pending().await.unwrap();
         let child = repo
             .tasks()
             .await
@@ -6131,6 +6128,10 @@ mod tests {
         assert_eq!(child.owner, worker.id);
         assert_ne!(child.owner, stale_worker.id);
         assert_eq!(child.objective, "bounded child");
+        assert_eq!(
+            repo.approvals(session).await.unwrap()[0].decision,
+            ApprovalDecision::ApprovedOnce
+        );
     }
 
     #[tokio::test]

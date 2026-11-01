@@ -61,7 +61,7 @@ Other installation methods:
 - Mix providers and models from **Codex**, **Claude**, and **Ollama** in one team.
 - Delegate through nested teams and run independent tasks in parallel.
 - Keep one long-lived local Codex or Claude process per agent, and resume its session after a Voff restart.
-- Apply validated workspace edits and bounded delegation directly; ask you before running proposed commands.
+- Apply validated workspace edits and bounded delegation directly; run scoped commands automatically within the configured execution limits.
 - Track token usage and per-agent cost estimates.
 
 ### How it works
@@ -70,8 +70,8 @@ Other installation methods:
 flowchart LR
     You --> Lead --> Agents
     Agents -->|scoped edits and delegation| Workspace
-    Agents -->|process commands| Approval
-    Approval --> Agents
+    Agents -->|scoped commands| Execution
+    Execution --> Agents
     Agents --> Lead --> You
     Lead -. saves tasks and activity .-> State[(Local state)]
 ```
@@ -79,7 +79,7 @@ flowchart LR
 #### Why use a team workflow?
 
 **Q:** Why not just ask a single agent to do everything?  
-**A:** A team splits independent work across agents and runs it in parallel. The lead checks each result against its acceptance criteria and integrates the verified work. Workspace edits use Voff's scoped patch checks; proposed commands wait for your approval.
+**A:** A team splits independent work across agents and runs it in parallel. The lead checks each result against its acceptance criteria and integrates the verified work. Workspace edits and commands run through Voff's scope, schema, and execution-limit checks without approval prompts.
 
 ## Usage
 
