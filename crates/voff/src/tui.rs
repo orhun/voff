@@ -2483,6 +2483,7 @@ pub enum TuiError {
     Io(#[from] io::Error),
 }
 pub(crate) struct ConfiguredRun {
+    pub awake: bool,
     pub automatic_review: bool,
     pub repo: Arc<SqliteRepository>,
     pub provider: Arc<dyn voff_provider::ModelProvider>,
@@ -2576,6 +2577,7 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
         engine,
         LoopConfig {
             owner: config.owner,
+            awake: config.awake,
             max_parallel_tasks: config.max_parallel_tasks,
             credential_repository,
             startup_scan_provider,
@@ -2622,6 +2624,7 @@ fn restore_initial_history(
     }
 }
 struct LoopConfig {
+    awake: bool,
     owner: AgentId,
     max_parallel_tasks: usize,
     credential_repository: Arc<SqliteRepository>,
@@ -2745,6 +2748,7 @@ async fn terminal_loop<R: Repository + 'static>(
     mut event_rx: mpsc::Receiver<EngineEvent>,
 ) -> Result<(), TuiError> {
     let LoopConfig {
+        awake: keep_awake,
         owner,
         max_parallel_tasks,
         credential_repository,
@@ -2809,6 +2813,7 @@ async fn terminal_loop<R: Repository + 'static>(
         });
     }
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut awake = crate::awake::Awake::new(keep_awake, crate::awake::command(std::process::id()));
     let mut loop_result = Ok(());
     'terminal: while !model.quit {
         tokio::select! {
@@ -3206,6 +3211,9 @@ async fn terminal_loop<R: Repository + 'static>(
             }
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
+                if let Err(error) = awake.hold(model.tasks.iter().any(|task| task.status == TaskStatus::Running)) {
+                    model.warn(&format!("Could not keep the machine awake: {error}"));
+                }
                 model.startup_scan_frame = model.startup_scan_frame.wrapping_add(1);
                 if model.startup_scan_pending
                     && let Some(result) = model.startup_scan_result.take()

@@ -1,3 +1,4 @@
+mod awake;
 mod credential;
 mod logging;
 mod model_catalog;
@@ -51,6 +52,12 @@ struct Cli {
     /// Start the setup flow over for the selected workspace.
     #[arg(long, conflicts_with = "config")]
     setup: bool,
+    /// Keep the machine awake while an agent is generating a response.
+    #[arg(long)]
+    awake: bool,
+    /// Maximum duration for one agent turn, in seconds (10–3600; default 1800).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(10..=3600))]
+    run_timeout: Option<u64>,
     /// Workspace directory (defaults to the current directory).
     workspace: Option<PathBuf>,
 }
@@ -289,6 +296,8 @@ async fn application(cli: Cli) -> Result<()> {
             startup_notice,
             startup,
             startup_terminal_handoff.take(),
+            cli.awake,
+            cli.run_timeout,
         )
         .await?
         else {
@@ -809,11 +818,16 @@ async fn run(
     mut startup_notice: Option<String>,
     mut startup: StartupState,
     mut startup_terminal_handoff: Option<onboarding::TerminalHandoff>,
+    awake: bool,
+    run_timeout: Option<u64>,
 ) -> Result<Option<PathBuf>> {
     let repository = SqliteRepository::open(state_path).await?;
     let mut session = None;
     loop {
-        let config = config_from_setup(&draft)?;
+        let mut config = config_from_setup(&draft)?;
+        if let Some(seconds) = run_timeout {
+            config.runtime.default_timeout_seconds = seconds;
+        }
         store_setup_credentials(&draft, &config, &repository).await?;
         let developer_count = draft.developers.len();
         for (index, developer) in draft.developers.iter_mut().enumerate() {
@@ -834,6 +848,7 @@ async fn run(
             startup_notice.take(),
             session_startup,
             startup_terminal_handoff.take(),
+            awake,
         )
         .await?;
         match outcome {
@@ -873,6 +888,7 @@ async fn run_session(
     startup_notice: Option<String>,
     startup: StartupState,
     startup_terminal_handoff: Option<onboarding::TerminalHandoff>,
+    awake: bool,
 ) -> Result<Option<(tui::TuiExit, SessionId)>> {
     let default_provider = default_provider_id(&config);
     let repo = Arc::new(SqliteRepository::open(state_path).await?);
@@ -1082,6 +1098,7 @@ async fn run_session(
         startup_notice,
         startup_scan_pending: startup.scan_pending,
         startup_task_id,
+        awake,
         setup_prompts: startup.setup_prompts,
         startup_goal: startup.goal,
         startup_popup_size: startup.popup_size,
@@ -1436,6 +1453,25 @@ mod tests {
     #[test]
     fn setup_flag_cannot_be_combined_with_an_explicit_config() {
         assert!(Cli::try_parse_from(["voff", "--setup", "--config", "team.toml"]).is_err());
+    }
+
+    #[test]
+    fn awake_flag_is_opt_in() {
+        assert!(!Cli::try_parse_from(["voff"]).unwrap().awake);
+        assert!(Cli::try_parse_from(["voff", "--awake"]).unwrap().awake);
+    }
+
+    #[test]
+    fn run_timeout_is_bounded_and_optional() {
+        assert_eq!(Cli::try_parse_from(["voff"]).unwrap().run_timeout, None);
+        assert_eq!(
+            Cli::try_parse_from(["voff", "--run-timeout", "3600"])
+                .unwrap()
+                .run_timeout,
+            Some(3600)
+        );
+        assert!(Cli::try_parse_from(["voff", "--run-timeout", "5"]).is_err());
+        assert!(Cli::try_parse_from(["voff", "--run-timeout", "3601"]).is_err());
     }
 
     #[test]
