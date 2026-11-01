@@ -26,6 +26,28 @@ pub async fn collect_response_with_preview(
     timeout: Duration,
     preview: Option<ProviderEventSink>,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
+    collect_response_with_optional_deadline(provider, request, cancellation, Some(timeout), preview)
+        .await
+}
+
+/// Collect an inner resilient-provider attempt until its caller cancels it.
+/// The outer task collector owns the configured task deadline.
+pub(crate) async fn collect_response_with_preview_until_cancelled(
+    provider: &dyn ModelProvider,
+    request: CanonicalRequest,
+    cancellation: CancellationToken,
+    preview: Option<ProviderEventSink>,
+) -> Result<Vec<ProviderEvent>, ProviderError> {
+    collect_response_with_optional_deadline(provider, request, cancellation, None, preview).await
+}
+
+async fn collect_response_with_optional_deadline(
+    provider: &dyn ModelProvider,
+    request: CanonicalRequest,
+    cancellation: CancellationToken,
+    timeout: Option<Duration>,
+    preview: Option<ProviderEventSink>,
+) -> Result<Vec<ProviderEvent>, ProviderError> {
     let (tx, mut rx) = mpsc::channel(64);
     let run = provider.start(request, tx, cancellation.clone());
     let drain = async {
@@ -39,6 +61,11 @@ pub async fn collect_response_with_preview(
                 | ProviderEvent::OutputDelta(s)
                 | ProviderEvent::Warning(s) => s.len(),
                 ProviderEvent::ToolRequest(call) => call.name.len() + call.arguments_json.len(),
+                ProviderEvent::Session(session) => {
+                    session.provider.len()
+                        + session.session_id.as_deref().unwrap_or_default().len()
+                        + session.workspace_id.len()
+                }
                 _ => 0,
             });
             if bytes > MAX_RESPONSE_BYTES || events.len() >= MAX_RESPONSE_EVENTS || count > 131_072
@@ -52,6 +79,7 @@ pub async fn collect_response_with_preview(
                 &event,
                 ProviderEvent::TextDelta(_)
                     | ProviderEvent::OutputDelta(_)
+                    | ProviderEvent::Session(_)
                     | ProviderEvent::Retrying { .. }
             ) && let Some(sink) = &preview
             {
@@ -78,10 +106,17 @@ pub async fn collect_response_with_preview(
         }
         Ok(events)
     };
+    let deadline = async {
+        if let Some(timeout) = timeout {
+            tokio::time::sleep(timeout).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(crate::adapters::cancelled()),
-        () = tokio::time::sleep(timeout) => {
+        () = deadline => {
             cancellation.cancel();
             Err(ProviderError { kind: ProviderErrorKind::Timeout, message: "provider request deadline exceeded".into(), retryable: true })
         }

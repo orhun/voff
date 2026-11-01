@@ -367,11 +367,19 @@ impl ModelProvider for OpenAiProvider {
     }
 
     async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
-        self.client()?
-            .list_models()
-            .await
-            .map(model_descriptors)
-            .map_err(model_listing_error)
+        tokio::time::timeout(Duration::from_secs(30), async {
+            self.client()?
+                .list_models()
+                .await
+                .map(model_descriptors)
+                .map_err(model_listing_error)
+        })
+        .await
+        .map_err(|_| ProviderError {
+            kind: ProviderErrorKind::Timeout,
+            message: "OpenAI model listing deadline exceeded".into(),
+            retryable: true,
+        })?
     }
 
     async fn start(
@@ -791,6 +799,7 @@ mod tests {
     fn request() -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
+            provider_session: None,
             model: "mock-v1".into(),
             messages: vec![CanonicalMessage {
                 id: MessageId::new(),

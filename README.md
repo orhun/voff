@@ -60,6 +60,8 @@ Other installation methods:
 
 - Mix providers and models from **Codex**, **Claude**, and **Ollama** in one team.
 - Delegate through nested teams and run independent tasks in parallel.
+- Keep one long-lived local Codex or Claude process per agent, and resume its session after a Voff restart.
+- Apply validated workspace edits and bounded delegation directly; run scoped commands automatically within the configured execution limits.
 - Track token usage and per-agent cost estimates.
 
 ### How it works
@@ -67,8 +69,9 @@ Other installation methods:
 ```mermaid
 flowchart LR
     You --> Lead --> Agents
-    Agents -->|proposals| Approval
-    Approval --> Workspace
+    Agents -->|scoped edits and delegation| Workspace
+    Agents -->|scoped commands| Execution
+    Execution --> Agents
     Agents --> Lead --> You
     Lead -. saves tasks and activity .-> State[(Local state)]
 ```
@@ -76,11 +79,13 @@ flowchart LR
 #### Why use a team workflow?
 
 **Q:** Why not just ask a single agent to do everything?  
-**A:** A team splits independent work across agents and runs it in parallel. The lead checks each result against its acceptance criteria, requests fixes where needed, and integrates the verified work. **Voff gives you a coordinated, visible workflow with built in reviews.**
+**A:** A team splits independent work across agents and runs it in parallel. The lead checks each result against its acceptance criteria and integrates the verified work. Workspace edits and commands run through Voff's scope, schema, and execution-limit checks without approval prompts.
 
 ## Usage
 
 Run `voff --setup [PROJECT_DIR]` to start team setup again for an existing project. It ignores the saved team and keeps the project's task history.
+
+Pass `--awake` to hold the machine awake while an agent is generating a response. This uses `systemd-inhibit` on Linux or `caffeinate` on macOS and is off by default. Set `--run-timeout SECONDS` to change the maximum duration of each new agent turn (10–3600 seconds; default 1800). Existing tasks keep their saved limit.
 
 ### Key bindings
 

@@ -2964,6 +2964,7 @@ pub(crate) async fn build_workspace_team(
     let user_context = voff_prompts::setup::user_context(user_goal, &project_context);
     let request = CanonicalRequest {
         task_id: TaskId::new(),
+        provider_session: None,
         model: model.clone(),
         messages: vec![
             CanonicalMessage {

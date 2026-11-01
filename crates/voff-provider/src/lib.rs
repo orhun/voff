@@ -57,6 +57,8 @@ pub enum MessageRole {
 #[derive(Clone, Debug)]
 pub struct CanonicalRequest {
     pub task_id: TaskId,
+    /// Persisted provider session, when the selected adapter supports resume.
+    pub provider_session: Option<voff_core::ProviderSession>,
     pub model: String,
     pub messages: Vec<CanonicalMessage>,
     pub tools: Vec<ToolDefinition>,
@@ -96,6 +98,8 @@ pub struct Usage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderEvent {
     TextDelta(String),
+    /// Provider-native session ID, emitted as soon as it can be resumed.
+    Session(voff_core::ProviderSession),
     /// Display-only generated tool/structured-output fragments. Never actionable.
     OutputDelta(String),
     /// Starts a new bounded attempt; previous previews are not completed output.
@@ -318,11 +322,10 @@ impl ModelProvider for ResilientProvider {
         for attempt in 1..=self.policy.max_attempts.max(1) {
             let (attempt_tx, mut attempt_rx) = mpsc::channel(64);
             tracing::info!(task_id = %request.task_id, attempt, "provider attempt");
-            let run = collect_response_with_preview(
+            let run = response::collect_response_with_preview_until_cancelled(
                 self.inner.as_ref(),
                 request.clone(),
                 cancellation.child_token(),
-                Duration::from_secs(300),
                 Some(attempt_tx),
             );
             let forward = async {
@@ -407,6 +410,7 @@ pub mod contract {
     pub fn request(model: impl Into<String>) -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
+            provider_session: None,
             model: model.into(),
             messages: vec![CanonicalMessage {
                 id: MessageId::new(),
@@ -561,6 +565,7 @@ mod tests {
     fn request() -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
+            provider_session: None,
             model: "x".into(),
             messages: vec![],
             tools: vec![],
