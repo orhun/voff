@@ -1585,7 +1585,11 @@ impl AppModel {
             .iter()
             .filter(|approval| {
                 approval.decision == ApprovalDecision::Pending
-                    && (!self.automatic_review || approval.action == "provider.continue")
+                    && (!self.automatic_review
+                        || matches!(
+                            approval.action.as_str(),
+                            "provider.continue" | "process.test"
+                        ))
             })
             .nth(selected)
     }
@@ -1594,7 +1598,11 @@ impl AppModel {
             .iter()
             .filter(|approval| {
                 approval.decision == ApprovalDecision::Pending
-                    && (!self.automatic_review || approval.action == "provider.continue")
+                    && (!self.automatic_review
+                        || matches!(
+                            approval.action.as_str(),
+                            "provider.continue" | "process.test"
+                        ))
             })
             .count()
     }
@@ -6614,7 +6622,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_approvals_do_not_prompt_but_application_limits_do() {
+    fn automatic_actions_skip_review_but_commands_and_application_limits_prompt() {
         let mut app = AppModel::new(SessionId::new());
         app.automatic_review = true;
         let approval = Approval {
@@ -6631,10 +6639,16 @@ mod tests {
         assert!(app.pending_approval().is_none());
         app.approvals.push(Approval {
             action: "provider.continue".into(),
+            ..approval.clone()
+        });
+        app.approvals.push(Approval {
+            action: "process.test".into(),
             ..approval
         });
-        assert_eq!(app.pending_approval_count(), 1);
+        assert_eq!(app.pending_approval_count(), 2);
         assert_eq!(app.pending_approval().unwrap().action, "provider.continue");
+        app.approval_selected = 1;
+        assert_eq!(app.pending_approval().unwrap().action, "process.test");
     }
 
     #[test]
