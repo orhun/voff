@@ -11,8 +11,6 @@ use serde_json::Value;
 pub(crate) fn client() -> Result<reqwest::Client, ProviderError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
-        .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(http_error)

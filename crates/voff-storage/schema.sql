@@ -8,6 +8,11 @@ CREATE TABLE IF NOT EXISTS agents (
     data TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS provider_sessions (
+    agent_id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL

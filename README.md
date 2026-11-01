@@ -60,6 +60,7 @@ Other installation methods:
 
 - Mix providers and models from **Codex**, **Claude**, and **Ollama** in one team.
 - Delegate through nested teams and run independent tasks in parallel.
+- Keep one long-lived local Codex or Claude process per agent, and resume its session after a Voff restart.
 - Track token usage and per-agent cost estimates.
 
 ### How it works
@@ -81,6 +82,8 @@ flowchart LR
 ## Usage
 
 Run `voff --setup [PROJECT_DIR]` to start team setup again for an existing project. It ignores the saved team and keeps the project's task history.
+
+Pass `--awake` to hold the machine awake while an agent is generating a response. This uses `systemd-inhibit` on Linux or `caffeinate` on macOS and is off by default. Set `--run-timeout SECONDS` to change the maximum duration of each new agent turn (10–3600 seconds; default 1800). Existing tasks keep their saved limit.
 
 ### Key bindings
 

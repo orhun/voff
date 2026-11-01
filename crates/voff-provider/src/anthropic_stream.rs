@@ -16,8 +16,6 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) fn client() -> Result<reqwest::Client, ProviderError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
-        .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(http_error)
@@ -28,41 +26,49 @@ pub(crate) async fn models(
     base_url: &str,
     key: &str,
 ) -> Result<Vec<ModelDescriptor>, ProviderError> {
-    let response = client
-        .get(format!("{base_url}/v1/models?limit=100"))
-        .bearer_auth(key)
-        .header("anthropic-version", API_VERSION)
-        .send()
-        .await
-        .map_err(http_error)?;
-    ensure_success(response.status().as_u16())?;
-    let mut stream = response.bytes_stream();
-    let mut body = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(http_error)?;
-        if body.len().saturating_add(chunk.len()) > MAX_OUTPUT_BYTES {
-            return Err(invalid("Anthropic model list exceeded four MiB"));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let response = client
+            .get(format!("{base_url}/v1/models?limit=100"))
+            .bearer_auth(key)
+            .header("anthropic-version", API_VERSION)
+            .send()
+            .await
+            .map_err(http_error)?;
+        ensure_success(response.status().as_u16())?;
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(http_error)?;
+            if body.len().saturating_add(chunk.len()) > MAX_OUTPUT_BYTES {
+                return Err(invalid("Anthropic model list exceeded four MiB"));
+            }
+            body.extend_from_slice(&chunk);
         }
-        body.extend_from_slice(&chunk);
-    }
-    let value: Value =
-        serde_json::from_slice(&body).map_err(|_| invalid("Anthropic model list was malformed"))?;
-    let models = value["data"]
-        .as_array()
-        .ok_or_else(|| invalid("Anthropic model list omitted data"))?;
-    Ok(models
-        .iter()
-        .filter_map(|model| {
-            Some(ModelDescriptor {
-                id: model["id"].as_str()?.to_owned(),
-                display_name: model["display_name"]
-                    .as_str()
-                    .unwrap_or_else(|| model["id"].as_str().unwrap_or_default())
-                    .to_owned(),
-                context_limit: model["max_input_tokens"].as_u64(),
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| invalid("Anthropic model list was malformed"))?;
+        let models = value["data"]
+            .as_array()
+            .ok_or_else(|| invalid("Anthropic model list omitted data"))?;
+        Ok(models
+            .iter()
+            .filter_map(|model| {
+                Some(ModelDescriptor {
+                    id: model["id"].as_str()?.to_owned(),
+                    display_name: model["display_name"]
+                        .as_str()
+                        .unwrap_or_else(|| model["id"].as_str().unwrap_or_default())
+                        .to_owned(),
+                    context_limit: model["max_input_tokens"].as_u64(),
+                })
             })
-        })
-        .collect())
+            .collect())
+    })
+    .await
+    .map_err(|_| ProviderError {
+        kind: ProviderErrorKind::Timeout,
+        message: "Anthropic model listing deadline exceeded".into(),
+        retryable: true,
+    })?
 }
 
 pub(crate) async fn run(

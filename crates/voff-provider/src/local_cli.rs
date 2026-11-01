@@ -7,14 +7,17 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    env,
+    collections::HashMap,
+    env, fs,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
 use voff_prompts::{provider::LOCAL_CLI_PREFIX, tool_descriptions};
@@ -63,11 +66,26 @@ impl LocalCliKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalCliProvider {
     kind: LocalCliKind,
     executable: PathBuf,
     probed: Arc<tokio::sync::OnceCell<()>>,
+    claude_sessions: Arc<ClaudeSessionPool>,
+    codex_sessions: Arc<crate::codex_server::CodexSessionPool>,
+}
+
+#[derive(Default)]
+struct ClaudeSessionPool {
+    sessions: Mutex<HashMap<String, Arc<Mutex<ClaudeSession>>>>,
+}
+
+struct ClaudeSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    model: String,
+    session_id: Option<String>,
 }
 
 impl LocalCliProvider {
@@ -91,6 +109,8 @@ impl LocalCliProvider {
             kind,
             executable: kind.executable().into(),
             probed: Arc::new(tokio::sync::OnceCell::new()),
+            claude_sessions: Arc::new(ClaudeSessionPool::default()),
+            codex_sessions: Arc::new(crate::codex_server::CodexSessionPool::default()),
         })
     }
 }
@@ -127,17 +147,49 @@ impl ModelProvider for LocalCliProvider {
         cancellation: CancellationToken,
     ) -> Result<ProviderCompletion, ProviderError> {
         self.probe(&cancellation).await?;
+        let provider_id = self.kind.id();
+        let mut provider_session =
+            request
+                .provider_session
+                .clone()
+                .unwrap_or_else(|| voff_core::ProviderSession {
+                    provider: provider_id.into(),
+                    session_id: None,
+                    workspace_id: uuid::Uuid::new_v4().to_string(),
+                });
+        if provider_session.provider != provider_id {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Authorization,
+                message: "saved local CLI session belongs to a different provider".into(),
+                retryable: false,
+            });
+        }
+        session_directory(&provider_session.workspace_id)?;
         let (schema, tools) = output_schema(&request)?;
         let prompt = local_prompt(&request, &tools)?;
         let tool_required = matches!(request.tool_choice, ToolChoice::Specific(_));
         let (output, usage) = match self.kind {
             LocalCliKind::Codex => {
-                self.run_codex(&request.model, &prompt, &schema, &sink, &cancellation)
-                    .await
+                self.run_codex(
+                    &request.model,
+                    &prompt,
+                    &schema,
+                    &mut provider_session,
+                    &sink,
+                    &cancellation,
+                )
+                .await
             }
             LocalCliKind::Claude => {
-                self.run_claude(&request.model, &prompt, &schema, &sink, &cancellation)
-                    .await
+                self.run_claude(
+                    &request.model,
+                    &prompt,
+                    &schema,
+                    &mut provider_session,
+                    &sink,
+                    &cancellation,
+                )
+                .await
             }
         }
         .inspect_err(|error| {
@@ -206,23 +258,26 @@ impl LocalCliProvider {
             }
         }
         configure_environment(&mut command);
-        let output =
-            tokio::time::timeout(PROBE_TIMEOUT, run_process(command, b"", cancellation, None))
-                .await
-                .map_err(|_| ProviderError {
-                    kind: ProviderErrorKind::Timeout,
-                    message: format!("{} capability probe timed out", self.executable.display()),
-                    retryable: false,
-                })??;
+        let output = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            run_process(command, b"", cancellation, None, None),
+        )
+        .await
+        .map_err(|_| ProviderError {
+            kind: ProviderErrorKind::Timeout,
+            message: format!("{} capability probe timed out", self.executable.display()),
+            retryable: false,
+        })??;
         let help = String::from_utf8_lossy(&output);
         let required: &[&str] = match self.kind {
             LocalCliKind::Codex => &["--listen"],
             LocalCliKind::Claude => &[
+                "--input-format",
                 "--json-schema",
                 "--restricted",
                 "--safe-mode",
                 "--permission-prompts",
-                "--no-session-persistence",
+                "--resume",
                 "--include-partial-messages",
             ],
         };
@@ -251,10 +306,21 @@ impl LocalCliProvider {
         model: &str,
         prompt: &[u8],
         schema: &Value,
+        provider_session: &mut voff_core::ProviderSession,
         sink: &ProviderEventSink,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
-        crate::codex_server::run(&self.executable, model, prompt, schema, sink, cancellation).await
+        self.codex_sessions
+            .run(
+                &self.executable,
+                model,
+                prompt,
+                schema,
+                provider_session,
+                sink,
+                cancellation,
+            )
+            .await
     }
 
     async fn run_claude(
@@ -262,16 +328,148 @@ impl LocalCliProvider {
         model: &str,
         prompt: &[u8],
         schema: &Value,
+        provider_session: &mut voff_core::ProviderSession,
         sink: &ProviderEventSink,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
-        let schema = serde_json::to_string(schema).map_err(|error| {
-            invalid_cli_response(&format!("could not encode local output schema: {error}"))
-        })?;
-        let execution_directory = tempfile::tempdir().map_err(local_io_error)?;
-        let mut command = Command::new(&self.executable);
-        command.current_dir(execution_directory.path()).args([
+        let _ = schema;
+        self.claude_sessions
+            .run(
+                &self.executable,
+                model,
+                prompt,
+                provider_session,
+                sink,
+                cancellation,
+            )
+            .await
+    }
+}
+
+impl ClaudeSessionPool {
+    async fn run(
+        &self,
+        executable: &Path,
+        model: &str,
+        prompt: &[u8],
+        provider_session: &mut voff_core::ProviderSession,
+        sink: &ProviderEventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
+        let key = provider_session.workspace_id.clone();
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(&key) {
+                Arc::clone(session)
+            } else {
+                if sessions.len() >= 128 {
+                    return Err(ProviderError {
+                        kind: ProviderErrorKind::Authorization,
+                        message: "local Claude session limit reached; restart Voff to release idle sessions".into(),
+                        retryable: false,
+                    });
+                }
+                let session = Arc::new(Mutex::new(
+                    ClaudeSession::open(executable, model, provider_session).await?,
+                ));
+                sessions.insert(key.clone(), Arc::clone(&session));
+                session
+            }
+        };
+
+        let mut session_guard = session.lock().await;
+        let process_ended = session_guard
+            .child
+            .try_wait()
+            .map_or(true, |status| status.is_some());
+        let saved_session_changed = provider_session
+            .session_id
+            .as_deref()
+            .zip(session_guard.session_id.as_deref())
+            .is_some_and(|(saved, active)| saved != active);
+        if session_guard.model != model || process_ended || saved_session_changed {
+            if provider_session.session_id.is_none() {
+                provider_session.session_id = session_guard.session_id.clone();
+            }
+            match ClaudeSession::open(executable, model, provider_session).await {
+                Ok(reopened) => *session_guard = reopened,
+                Err(error) => {
+                    let _ = session_guard.child.start_kill();
+                    let _ = session_guard.child.wait().await;
+                    drop(session_guard);
+                    let mut sessions = self.sessions.lock().await;
+                    if sessions
+                        .get(&key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &session))
+                    {
+                        sessions.remove(&key);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let result = session_guard
+            .turn(prompt, provider_session, sink, cancellation)
+            .await;
+        if result.is_err() {
+            let _ = session_guard.child.start_kill();
+            let _ = session_guard.child.wait().await;
+            drop(session_guard);
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                sessions.remove(&key);
+            }
+        }
+        result
+    }
+}
+
+impl ClaudeSession {
+    async fn open(
+        executable: &Path,
+        model: &str,
+        provider_session: &voff_core::ProviderSession,
+    ) -> Result<Self, ProviderError> {
+        if let Some(session_id) = &provider_session.session_id
+            && uuid::Uuid::parse_str(session_id).is_err()
+        {
+            return Err(invalid_cli_response("saved Claude session ID is malformed"));
+        }
+        let directory = session_directory(&provider_session.workspace_id)?;
+        // Keep the response contract fixed for the life of the process. The
+        // adapter validates the chosen tool against this specific turn before
+        // Voff receives an actionable tool request.
+        let schema = json!({
+            "type":"object",
+            "properties":{
+                "text":{"type":"string"},
+                "tool_calls":{
+                    "type":"array",
+                    "items":{
+                        "type":"object",
+                        "properties":{
+                            "name":{"type":"string"},
+                            "arguments":{"type":"string"}
+                        },
+                        "required":["name","arguments"],
+                        "additionalProperties":false
+                    },
+                    "maxItems":1
+                }
+            },
+            "required":["text","tool_calls"],
+            "additionalProperties":false
+        });
+        let schema = serde_json::to_string(&schema)
+            .map_err(|_| invalid_cli_response("could not encode Claude output schema"))?;
+        let mut command = Command::new(executable);
+        command.current_dir(&directory).args([
             "-p",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -286,25 +484,196 @@ impl LocalCliProvider {
             "mcp__*",
             "--permission-prompts",
             "none",
-            "--no-session-persistence",
             "--no-chrome",
         ]);
+        if let Some(session_id) = &provider_session.session_id {
+            command.arg("--resume").arg(session_id);
+        }
         if model != "default" {
             command.arg("--model").arg(model);
         }
         configure_environment(&mut command);
-        let envelope = run_process(command, prompt, cancellation, Some(sink)).await?;
-        let envelope: Value = serde_json::from_slice(&envelope).map_err(|error| {
-            invalid_cli_response(&format!("Claude CLI returned invalid JSON: {error}"))
+        let program = command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        let mut child = command.spawn().map_err(|error| ProviderError {
+            kind: ProviderErrorKind::Authorization,
+            message: format!("could not start {program}: {error}"),
+            retryable: false,
         })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| invalid_cli_response("Claude stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| invalid_cli_response("Claude stdout unavailable"))?;
+        if let Some(mut stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 8192];
+                while stderr.read(&mut buffer).await.is_ok_and(|size| size > 0) {}
+            });
+        }
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            model: model.to_owned(),
+            session_id: provider_session.session_id.clone(),
+        })
+    }
+
+    async fn turn(
+        &mut self,
+        prompt: &[u8],
+        provider_session: &mut voff_core::ProviderSession,
+        sink: &ProviderEventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
+        if self.child.try_wait().map_err(local_io_error)?.is_some() {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Internal,
+                message: "Claude session process exited between turns".into(),
+                retryable: true,
+            });
+        }
+        let text = std::str::from_utf8(prompt)
+            .map_err(|_| invalid_cli_response("Claude prompt was not UTF-8"))?;
+        let mut line = serde_json::to_vec(&json!({
+            "type":"user",
+            "message":{"role":"user","content":text}
+        }))
+        .map_err(|_| invalid_cli_response("could not encode Claude session prompt"))?;
+        line.push(b'\n');
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(cancelled()),
+            result = async {
+                self.stdin.write_all(&line).await.map_err(local_io_error)?;
+                self.stdin.flush().await.map_err(local_io_error)
+            } => result?,
+        }
+        let envelope = read_claude_turn(&mut self.stdout, sink, provider_session, cancellation);
+        let envelope = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(cancelled()),
+            result = envelope => result?,
+        };
+        if let Some(session_id) = provider_session.session_id.clone() {
+            self.session_id = Some(session_id);
+        }
+        let session_id = envelope["session_id"].as_str();
+        if let Some(session_id) = session_id {
+            validate_claude_session_id(provider_session, session_id)?;
+            let publish_session = provider_session.session_id.as_deref() != Some(session_id);
+            provider_session.session_id = Some(session_id.to_owned());
+            self.session_id = Some(session_id.to_owned());
+            if publish_session {
+                send(
+                    sink,
+                    ProviderEvent::Session(provider_session.clone()),
+                    cancellation,
+                )
+                .await?;
+            }
+        }
         let usage = claude_usage(&envelope["usage"]);
         let output = serde_json::to_vec(
             envelope
                 .get("structured_output")
                 .ok_or_else(|| invalid_cli_response("Claude CLI omitted structured_output"))?,
         )
-        .map_err(|error| invalid_cli_response(&format!("Claude structured output: {error}")))?;
+        .map_err(|_| invalid_cli_response("Claude structured output was invalid"))?;
         Ok((output, usage))
+    }
+}
+
+fn validate_claude_session_id(
+    provider_session: &voff_core::ProviderSession,
+    session_id: &str,
+) -> Result<(), ProviderError> {
+    if uuid::Uuid::parse_str(session_id).is_err()
+        || provider_session
+            .session_id
+            .as_deref()
+            .is_some_and(|asked| asked != session_id)
+    {
+        return Err(invalid_cli_response(
+            "Claude returned a different or malformed session ID",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_claude_turn<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    sink: &ProviderEventSink,
+    provider_session: &mut voff_core::ProviderSession,
+    cancellation: &CancellationToken,
+) -> Result<Value, ProviderError> {
+    let mut total = 0usize;
+    loop {
+        let mut line = Vec::new();
+        let size = (&mut *reader)
+            .take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(local_io_error)?;
+        if size == 0 {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Internal,
+                message: "Claude session ended before completing the turn".into(),
+                retryable: true,
+            });
+        }
+        total = total.saturating_add(size);
+        if size > MAX_CLI_OUTPUT_BYTES || total > 16 * MAX_CLI_OUTPUT_BYTES {
+            return Err(invalid_cli_response(
+                "Claude stream exceeded bounded output limits",
+            ));
+        }
+        let value: Value = serde_json::from_slice(&line)
+            .map_err(|_| invalid_cli_response("Claude returned malformed stream JSON"))?;
+        match value["type"].as_str() {
+            Some("system") if value["subtype"] == "init" => {
+                if let Some(session_id) = value["session_id"].as_str() {
+                    validate_claude_session_id(provider_session, session_id)?;
+                    provider_session.session_id = Some(session_id.to_owned());
+                    send(
+                        sink,
+                        ProviderEvent::Session(provider_session.clone()),
+                        cancellation,
+                    )
+                    .await?;
+                }
+            }
+            Some("stream_event") => {
+                let delta = &value["event"]["delta"];
+                let text = match delta["type"].as_str() {
+                    Some("text_delta") => delta["text"].as_str(),
+                    Some("input_json_delta") => delta["partial_json"].as_str(),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    send(sink, ProviderEvent::OutputDelta(text.into()), cancellation).await?;
+                }
+            }
+            Some("result") => {
+                if value["is_error"] == true || value["subtype"] != "success" {
+                    return Err(invalid_cli_response(
+                        "Claude failed its structured turn; check login, model availability and limits",
+                    ));
+                }
+                if value.get("structured_output").is_none() {
+                    return Err(invalid_cli_response("Claude omitted structured_output"));
+                }
+                return Ok(value);
+            }
+            _ => {} // Metadata and reasoning are never interpreted as Voff actions.
+        }
     }
 }
 
@@ -330,6 +699,53 @@ fn claude_usage(usage: &Value) -> Option<Usage> {
     })
 }
 
+/// Stable private cwd for a resumable CLI session. It contains no project
+/// files, so native read-only tools cannot bypass Voff's workspace scoping.
+pub(super) fn session_directory(workspace_id: &str) -> Result<PathBuf, ProviderError> {
+    let id = uuid::Uuid::parse_str(workspace_id)
+        .map_err(|_| invalid_cli_response("provider session workspace ID is malformed"))?;
+    let base = env::temp_dir().join("voff-agent-sessions");
+    match fs::create_dir(&base) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(local_io_error(error)),
+    }
+    let metadata = fs::symlink_metadata(&base).map_err(local_io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::Authorization,
+            message: "local CLI session directory is not a private directory".into(),
+            retryable: false,
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).map_err(local_io_error)?;
+    }
+    let base = base.canonicalize().map_err(local_io_error)?;
+    let path = base.join(id.to_string());
+    match fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(local_io_error(error)),
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(local_io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::Authorization,
+            message: "local CLI session workspace is not a directory".into(),
+            retryable: false,
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(local_io_error)?;
+    }
+    path.canonicalize().map_err(local_io_error)
+}
+
 pub(super) fn configure_environment(command: &mut Command) {
     command
         .env_clear()
@@ -349,6 +765,7 @@ async fn run_process(
     prompt: &[u8],
     cancellation: &CancellationToken,
     preview: Option<&ProviderEventSink>,
+    provider_session: Option<&voff_core::ProviderSession>,
 ) -> Result<Vec<u8>, ProviderError> {
     let program = command
         .as_std()
@@ -376,7 +793,9 @@ async fn run_process(
         };
         let read_stdout = async {
             match (stdout, preview) {
-                (Some(stdout), Some(sink)) => read_claude_stream(stdout, sink, cancellation).await,
+                (Some(stdout), Some(sink)) => {
+                    read_claude_stream(stdout, sink, cancellation, provider_session).await
+                }
                 (stdout, _) => read_pipe(stdout).await,
             }
         };
@@ -392,11 +811,6 @@ async fn run_process(
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(cancelled()),
-        () = tokio::time::sleep(Duration::from_secs(300)) => Err(ProviderError {
-            kind: ProviderErrorKind::Timeout,
-            message: "local CLI exceeded the five-minute request deadline".into(),
-            retryable: true,
-        }),
         result = io => result,
     }
 }
@@ -405,6 +819,7 @@ async fn read_claude_stream<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     sink: &ProviderEventSink,
     cancellation: &CancellationToken,
+    provider_session: Option<&voff_core::ProviderSession>,
 ) -> Result<Vec<u8>, ProviderError> {
     let mut reader = BufReader::new(stdout);
     let mut total = 0usize;
@@ -428,6 +843,25 @@ async fn read_claude_stream<R: tokio::io::AsyncRead + Unpin>(
         let value: Value = serde_json::from_slice(&line)
             .map_err(|_| invalid_cli_response("Claude returned malformed stream JSON"))?;
         match value["type"].as_str() {
+            Some("system") if value["subtype"] == "init" => {
+                if let (Some(session), Some(session_id)) =
+                    (provider_session, value["session_id"].as_str())
+                {
+                    if uuid::Uuid::parse_str(session_id).is_err()
+                        || session
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|asked| asked != session_id)
+                    {
+                        return Err(invalid_cli_response(
+                            "Claude returned a different or malformed session ID",
+                        ));
+                    }
+                    let mut resumed = session.clone();
+                    resumed.session_id = Some(session_id.to_owned());
+                    send(sink, ProviderEvent::Session(resumed), cancellation).await?;
+                }
+            }
             Some("stream_event") if result.is_none() => {
                 let delta = &value["event"]["delta"];
                 let text = match delta["type"].as_str() {
@@ -749,6 +1183,7 @@ mod tests {
     fn request(choice: ToolChoice) -> CanonicalRequest {
         CanonicalRequest {
             task_id: TaskId::new(),
+            provider_session: None,
             model: "default".into(),
             messages: vec![CanonicalMessage {
                 id: MessageId::new(),
@@ -889,13 +1324,22 @@ if [ "$2" = "--help" ]; then
   printf '%s\n' '--listen'
   exit 0
 fi
+printf x >> 'COUNT_FILE_TOKEN'
+turns=0
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
     *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{"notify":[],"web_search":"disabled","features":{"hooks":false,"shell_tool":false,"plugins":false,"enable_mcp_apps":false,"unified_exec":false,"shell_snapshot":false,"multi_agent":false,"multi_agent_v2":false,"code_mode":false,"js_repl":false,"memories":false,"view_image":false}}}}' ;;
-    *'"method":"thread/start"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-test","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}' ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"00000000-0000-4000-8000-000000000001","ephemeral":false},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}' ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn-test"}}}' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","delta":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"type":"agentMessage","text":"{\"text\":\"codex ok\",\"tool_calls\":[]}"}}}' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-test","turnId":"turn-test","tokenUsage":{"last":{"inputTokens":8,"cachedInputTokens":1,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":11},"total":{"inputTokens":8,"cachedInputTokens":1,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":11}}}}' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-test","turnId":"turn-test","tokenUsage":{"last":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":19},"total":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":19}}}}' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
+      turns=$((turns + 1))
+      request_id=$((turns + 3))
+      turn_id="turn-test-$turns"
+      printf '{"id":%s,"result":{"turn":{"id":"%s"}}}\n' "$request_id" "$turn_id"
+      printf '{"method":"item/agentMessage/delta","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"%s","delta":"{\\"text\\":\\"codex ok\\",\\"tool_calls\\":[]}"}}\n' "$turn_id"
+      printf '{"method":"item/completed","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"%s","item":{"type":"agentMessage","text":"{\\"text\\":\\"codex ok\\",\\"tool_calls\\":[]}"}}}\n' "$turn_id"
+      printf '{"method":"thread/tokenUsage/updated","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"%s","tokenUsage":{"total":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":7}}}}\n' "$turn_id"
+      printf '{"method":"turn/completed","params":{"threadId":"00000000-0000-4000-8000-000000000001","turn":{"id":"%s","status":"completed"}}}\n' "$turn_id"
       ;;
   esac
 done
@@ -906,16 +1350,25 @@ done
                 LocalCliKind::Claude,
                 r#"#!/bin/sh
 if [ "$1" = '--help' ]; then
-  printf '%s\n' '--json-schema --restricted --safe-mode --permission-prompts --no-session-persistence --include-partial-messages'
+  printf '%s\n' '--input-format --json-schema --restricted --safe-mode --permission-prompts --resume --include-partial-messages'
   exit 0
 fi
-cat >/dev/null
-printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"claude"}}}' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":6,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"structured_output":{"text":"claude ok","tool_calls":[]}}'
+printf x >> 'COUNT_FILE_TOKEN'
+sent_init=0
+while IFS= read -r line; do
+  if [ "$sent_init" -eq 0 ]; then
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000002"}'
+    sent_init=1
+  fi
+  printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"claude"}}}' '{"type":"result","subtype":"success","is_error":false,"session_id":"00000000-0000-4000-8000-000000000002","usage":{"input_tokens":6,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"structured_output":{"text":"claude ok","tool_calls":[]}}'
+done
 "#,
                 (11, 4),
             ),
         ] {
             let executable = directory.path().join(kind.id());
+            let start_count = directory.path().join(format!("{}-starts", kind.id()));
+            let script = script.replace("COUNT_FILE_TOKEN", &start_count.display().to_string());
             fs::write(&executable, script).unwrap();
             let mut permissions = fs::metadata(&executable).unwrap().permissions();
             permissions.set_mode(0o700);
@@ -943,6 +1396,25 @@ printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","tex
                     (input + next_input, output + next_output)
                 });
             assert_eq!(actual_usage, expected_usage);
+
+            let mut resumed_request = request(ToolChoice::Auto);
+            resumed_request.provider_session = Some(
+                events
+                    .iter()
+                    .find_map(|event| match event {
+                        ProviderEvent::Session(session) => Some(session.clone()),
+                        _ => None,
+                    })
+                    .expect("local CLI must publish resumable session state"),
+            );
+            let (resumed_events, resumed) = crate::contract::run(
+                std::sync::Arc::clone(&provider),
+                resumed_request,
+                CancellationToken::new(),
+            )
+            .await;
+            crate::contract::assert_successful_stream(&resumed_events, &resumed.unwrap());
+            assert_eq!(fs::read_to_string(&start_count).unwrap(), "x");
 
             let cancellation = CancellationToken::new();
             cancellation.cancel();

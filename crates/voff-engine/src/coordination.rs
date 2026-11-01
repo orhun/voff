@@ -916,6 +916,7 @@ impl<R: Repository + 'static> Engine<R> {
             .insert(task.id, cancel.clone());
         let request = CanonicalRequest {
             task_id: task.id,
+            provider_session: None,
             model: lead.model,
             max_output_tokens: Some(lead.max_output_tokens.min(4096)),
             messages: vec![

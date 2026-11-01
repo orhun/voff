@@ -127,6 +127,17 @@ pub struct TaskResult {
     pub evidence: Vec<ArtifactId>,
 }
 
+/// Provider-owned conversation state persisted so local CLI workers can
+/// continue the same session after a retry or process restart.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ProviderSession {
+    pub provider: String,
+    /// Opaque session identifier returned by the provider CLI.
+    pub session_id: Option<String>,
+    /// Stable Voff-owned private working directory key for CLI session resume.
+    pub workspace_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Queued,
@@ -176,6 +187,9 @@ pub struct Task {
     /// Agent explicitly selected by the user for this root task, if any.
     #[serde(default)]
     pub requested_target: Option<AgentId>,
+    /// Provider-native conversation and isolated CLI working directory state.
+    #[serde(default)]
+    pub provider_session: Option<Box<ProviderSession>>,
     pub parent: Option<TaskId>,
     pub owner: AgentId,
     pub objective: String,
@@ -202,6 +216,7 @@ impl Task {
             retry_of: None,
             work: None,
             requested_target: None,
+            provider_session: None,
             parent: None,
             owner,
             objective: objective.into(),
@@ -444,6 +459,7 @@ impl TaskGraph {
                 turns: 0,
             }),
             requested_target: None,
+            provider_session: None,
             parent: Some(parent),
             owner,
             objective: objective.into(),
