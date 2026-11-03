@@ -1,3 +1,4 @@
+mod awake;
 mod credential;
 mod logging;
 mod model_catalog;
@@ -51,6 +52,12 @@ struct Cli {
     /// Start the setup flow over for the selected workspace.
     #[arg(long, conflicts_with = "config")]
     setup: bool,
+    /// Keep the machine awake while an agent is generating a response.
+    #[arg(long)]
+    awake: bool,
+    /// Maximum duration for one agent turn, in seconds (10–3600; default 1800).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(10..=3600))]
+    run_timeout: Option<u64>,
     /// Workspace directory (defaults to the current directory).
     workspace: Option<PathBuf>,
 }
@@ -108,6 +115,7 @@ struct GeneratedFileAgent {
 #[derive(Clone)]
 struct StartupState {
     scan_pending: bool,
+    auto_start_pending: bool,
     setup_prompts: onboarding::SetupPrompts,
     goal: Option<String>,
     popup_size: Option<(u16, u16)>,
@@ -181,6 +189,7 @@ async fn application(cli: Cli) -> Result<()> {
         let mut startup_notice = None;
         let mut startup = StartupState {
             scan_pending: false,
+            auto_start_pending: false,
             setup_prompts: setup_prompts.clone(),
             goal: None,
             popup_size: None,
@@ -289,6 +298,8 @@ async fn application(cli: Cli) -> Result<()> {
             startup_notice,
             startup,
             startup_terminal_handoff.take(),
+            cli.awake,
+            cli.run_timeout,
         )
         .await?
         else {
@@ -315,6 +326,20 @@ fn requested_workspace(argument: Option<PathBuf>, configured: Option<PathBuf>) -
         workspace.display()
     );
     Ok(workspace)
+}
+
+fn recover_project_goal(tasks: &[Task]) -> Option<String> {
+    const MARKER: &str = "Requested outcome:\n";
+    tasks
+        .iter()
+        .filter_map(|task| {
+            task.objective
+                .split_once(MARKER)
+                .map(|(_, goal)| (task.created_at, goal.trim()))
+        })
+        .filter(|(_, goal)| !goal.is_empty())
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, goal)| goal.to_owned())
 }
 
 fn load_workspace_setup_config(
@@ -809,11 +834,16 @@ async fn run(
     mut startup_notice: Option<String>,
     mut startup: StartupState,
     mut startup_terminal_handoff: Option<onboarding::TerminalHandoff>,
+    awake: bool,
+    run_timeout: Option<u64>,
 ) -> Result<Option<PathBuf>> {
     let repository = SqliteRepository::open(state_path).await?;
     let mut session = None;
     loop {
-        let config = config_from_setup(&draft)?;
+        let mut config = config_from_setup(&draft)?;
+        if let Some(seconds) = run_timeout {
+            config.runtime.default_timeout_seconds = seconds;
+        }
         store_setup_credentials(&draft, &config, &repository).await?;
         let developer_count = draft.developers.len();
         for (index, developer) in draft.developers.iter_mut().enumerate() {
@@ -827,6 +857,7 @@ async fn run(
         }
         save_team(&repository, &draft).await?;
         let session_startup = startup.clone();
+        startup.auto_start_pending = false;
         let outcome = run_session(
             config,
             state_path,
@@ -834,6 +865,7 @@ async fn run(
             startup_notice.take(),
             session_startup,
             startup_terminal_handoff.take(),
+            awake,
         )
         .await?;
         match outcome {
@@ -841,12 +873,14 @@ async fn run(
                 draft = edited;
                 session = Some(session_id);
                 startup_notice = notice;
+                let completed_goal_scan = startup.scan_pending && startup.goal.is_some();
                 let default_notice = if startup.scan_pending {
                     "Workspace scan completed."
                 } else {
                     "Agent settings updated."
                 };
                 startup.scan_pending = false;
+                startup.auto_start_pending |= completed_goal_scan;
                 let update_notice = startup_notice
                     .take()
                     .unwrap_or_else(|| default_notice.into());
@@ -873,6 +907,7 @@ async fn run_session(
     startup_notice: Option<String>,
     startup: StartupState,
     startup_terminal_handoff: Option<onboarding::TerminalHandoff>,
+    awake: bool,
 ) -> Result<Option<(tui::TuiExit, SessionId)>> {
     let default_provider = default_provider_id(&config);
     let repo = Arc::new(SqliteRepository::open(state_path).await?);
@@ -1076,14 +1111,28 @@ async fn run_session(
     let workspace = ScopedWorkspace::new(&workspace_root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
     let team_setup = setup_draft_for_team(&config, &agent_profiles);
+    let project_goal = if let Some(goal) = startup.goal.as_ref() {
+        repo.save_setting("project_goal", goal).await?;
+        Some(goal.clone())
+    } else if let Some(goal) = repo.setting("project_goal").await? {
+        Some(goal)
+    } else {
+        let recovered = recover_project_goal(&repo.tasks().await?);
+        if let Some(goal) = recovered.as_ref() {
+            repo.save_setting("project_goal", goal).await?;
+        }
+        recovered
+    };
     let edited = tui::run_configured(tui::ConfiguredRun {
         startup_terminal_handoff,
         team_setup,
         startup_notice,
         startup_scan_pending: startup.scan_pending,
+        startup_auto_start: startup.auto_start_pending,
         startup_task_id,
+        awake,
         setup_prompts: startup.setup_prompts,
-        startup_goal: startup.goal,
+        startup_goal: project_goal,
         startup_popup_size: startup.popup_size,
         automatic_review: config.runtime.automatic_review,
         repo,
@@ -1404,6 +1453,18 @@ fn provider(
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_formation_task_recovers_the_exact_project_goal() {
+        let goal = "Build a construction operations application.\n- Include daily reports.";
+        let task = Task::root(
+            AgentId::new(),
+            format!("Design a team.\n\nRequested outcome:\n{goal}"),
+            vec![],
+            TaskLimits::default(),
+        );
+        assert_eq!(recover_project_goal(&[task]).as_deref(), Some(goal));
+    }
+
     fn draft() -> SetupDraft {
         SetupDraft {
             developers: vec![
@@ -1436,6 +1497,25 @@ mod tests {
     #[test]
     fn setup_flag_cannot_be_combined_with_an_explicit_config() {
         assert!(Cli::try_parse_from(["voff", "--setup", "--config", "team.toml"]).is_err());
+    }
+
+    #[test]
+    fn awake_flag_is_opt_in() {
+        assert!(!Cli::try_parse_from(["voff"]).unwrap().awake);
+        assert!(Cli::try_parse_from(["voff", "--awake"]).unwrap().awake);
+    }
+
+    #[test]
+    fn run_timeout_is_bounded_and_optional() {
+        assert_eq!(Cli::try_parse_from(["voff"]).unwrap().run_timeout, None);
+        assert_eq!(
+            Cli::try_parse_from(["voff", "--run-timeout", "3600"])
+                .unwrap()
+                .run_timeout,
+            Some(3600)
+        );
+        assert!(Cli::try_parse_from(["voff", "--run-timeout", "5"]).is_err());
+        assert!(Cli::try_parse_from(["voff", "--run-timeout", "3601"]).is_err());
     }
 
     #[test]

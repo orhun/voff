@@ -1,13 +1,11 @@
 //! Bounded coordinator reviews. Model verdicts cannot enlarge runtime grants.
 use super::*;
-use futures_util::stream::{self, StreamExt, TryStreamExt};
 use voff_prompts::{
     tool_descriptions,
     workflow::{self as prompts, REVIEW_POLICY},
 };
 const REVIEW_TIMEOUT_SECONDS: u64 = 300;
 const REVIEW_RETRY_DELAY_SECONDS: i64 = 30;
-const MAX_PARALLEL_REVIEWS: usize = 4;
 const TEMPORARY_REVIEW_PREFIX: &str = "Reporting-agent review temporarily unavailable";
 
 #[derive(Deserialize)]
@@ -20,42 +18,7 @@ struct Verdict {
     #[serde(default)]
     owned_paths: Option<Vec<String>>,
     #[serde(skip)]
-    validated: bool,
-    #[serde(skip)]
     transient: bool,
-}
-
-fn has_approved_verification(approval: &Approval, approvals: &[Approval]) -> bool {
-    if approval.action != "process.test" {
-        return false;
-    }
-    let Ok(current) = serde_json::from_str::<TestArguments>(&approval.reason) else {
-        return false;
-    };
-    let Ok((program, args, _, verification)) = current.invocation() else {
-        return false;
-    };
-    if !verification {
-        return false;
-    }
-
-    approvals.iter().any(|prior| {
-        if prior.task_id != approval.task_id
-            || prior.action != "process.test"
-            || prior.decision != ApprovalDecision::ApprovedOnce
-            || prior.working_directory != approval.working_directory
-        {
-            return false;
-        }
-        let Ok(prior) = serde_json::from_str::<TestArguments>(&prior.reason) else {
-            return false;
-        };
-        matches!(
-            prior.invocation(),
-            Ok((prior_program, prior_args, _, true))
-                if prior_program == program && prior_args == args
-        )
-    })
 }
 
 impl<R: Repository + 'static> Engine<R> {
@@ -72,28 +35,17 @@ impl<R: Repository + 'static> Engine<R> {
         }
     }
 
-    async fn approval_reviewer(&self, task: &Task, action: &str) -> Result<AgentId, EngineError> {
-        if action == "process.test" {
-            self.team_lead.ok_or(EngineError::TeamLeadRequired)
-        } else {
-            self.reporting_reviewer(task).await
-        }
-    }
-
-    /// Review pending work once, outside the render loop and approval lock.
+    /// Resolve pending workflow actions once, outside the render loop and approval lock.
     pub async fn coordinate_pending(&self) -> Result<(), EngineError> {
-        if !self.automatic_review {
-            return Ok(());
-        }
         let _guard = self.coordinator_lock.lock().await;
-        let _lead = self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
+        if self.automatic_review {
+            self.team_lead.ok_or(EngineError::TeamLeadRequired)?;
+        }
         let mut approvals = self.repo.approvals(self.session).await?;
         approvals.sort_by_key(|approval| approval.created_at);
-        let mut review_jobs = Vec::new();
-        let mut verdicts = Vec::new();
         for approval in approvals
             .iter()
-            .filter(|a| a.decision == ApprovalDecision::Pending && a.action != "provider.continue")
+            .filter(|a| a.decision == ApprovalDecision::Pending)
             .cloned()
         {
             let task = self
@@ -104,7 +56,6 @@ impl<R: Repository + 'static> Engine<R> {
             if task.status != TaskStatus::WaitingApproval {
                 continue;
             }
-            let reviewer = self.approval_reviewer(&task, &approval.action).await?;
             if self.repeats_rejected_proposal(&task, &approval).await? {
                 self.decide_approval(approval.id, ApprovalDecision::Denied)
                     .await?;
@@ -118,196 +69,39 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?;
                 continue;
             }
-            if has_approved_verification(&approval, &approvals) {
-                self.record(
-                    Some(task.id),
-                    CanonicalEventKind::LeadReviewStarted {
-                        lead: reviewer,
-                        approval_id: Some(approval.id),
-                    },
-                )
-                .await?;
-                verdicts.push((
-                    approval,
-                    task,
-                    reviewer,
-                    Verdict {
-                        approve: true,
-                        reason: "Reused the Team Lead's approval for this identical task-scoped verification command.".into(),
-                        reassign_to: None,
-                        owned_paths: None,
-                        validated: true,
-                        transient: false,
-                    },
-                ));
-                continue;
-            }
-            let events = self.repo.events(self.session).await?;
-            let last_review = events
-                .iter()
-                .filter(|event| match event.kind {
-                    CanonicalEventKind::LeadReviewStarted {
-                        approval_id: Some(id),
-                        ..
-                    }
-                    | CanonicalEventKind::LeadReviewFinished {
-                        approval_id: Some(id),
-                        ..
-                    } => id == approval.id,
-                    _ => false,
-                })
-                .max_by_key(|event| event.created_at);
-            // A crash during review must never replay an uncertain decision.
-            // A recorded temporary failure is safe to retry after a short pause.
-            let started = last_review.is_some_and(|event| {
-                matches!(event.kind, CanonicalEventKind::LeadReviewStarted { .. })
-            });
-            let retry_later = last_review.is_some_and(|event| {
-                matches!(
-                    &event.kind,
-                    CanonicalEventKind::LeadReviewFinished { reason, .. }
-                        if reason.starts_with(TEMPORARY_REVIEW_PREFIX)
-                            && (chrono::Utc::now() - event.created_at).num_seconds()
-                                < REVIEW_RETRY_DELAY_SECONDS
-                )
-            });
-            if retry_later {
-                continue;
-            }
-            // Task-start authority covers bounded workspace reads and
-            // validated delegation. Workspace edits still get lead review.
-            let auto_approve = !started
-                && matches!(
-                    approval.action.as_str(),
-                    "task.delegate" | "review.request" | "task.plan" | "file.read"
-                );
+            // Resolve supported workflow actions without a person-level
+            // confirmation. Dispatch still enforces workspace scope, command
+            // grants, delegation limits, schemas, and completion evidence.
+            let auto_approve = matches!(
+                approval.action.as_str(),
+                "provider.continue"
+                    | "task.delegate"
+                    | "review.request"
+                    | "task.plan"
+                    | "file.read"
+                    | "file.patch"
+                    | "process.test"
+                    | "task.complete"
+            );
             if auto_approve {
                 self.decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
                     .await?;
                 continue;
             }
-            if started {
-                verdicts.push((
-                    approval,
-                    task,
-                    reviewer,
-                    Verdict {
-                        approve: false,
-                        reason: "Interrupted review; proposal denied without execution. Re-run the task to obtain a fresh review.".into(),
-                        reassign_to: None,
-                        owned_paths: None,
-                        validated: false,
-                        transient: false,
-                    },
-                ));
-                continue;
-            }
             self.record(
                 Some(task.id),
-                CanonicalEventKind::LeadReviewStarted {
-                    lead: reviewer,
-                    approval_id: Some(approval.id),
-                },
+                CanonicalEventKind::ProviderFailed(format!(
+                    "unsupported approval action {:?}; denied without execution",
+                    approval.action
+                )),
             )
             .await?;
-            let mut evidence = self
-                .repo
-                .artifacts()
-                .await?
-                .into_iter()
-                .filter(|artifact| artifact.producer == task.id)
-                .map(|artifact| artifact.preview)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if approval.action == "task.complete" {
-                let tasks = self.repo.tasks().await?;
-                let delegated = tasks
-                    .iter()
-                    .filter(|candidate| candidate.parent == Some(task.id))
-                    .map(|candidate| {
-                        format!(
-                            "{} · {:?} · {}",
-                            candidate.id, candidate.status, candidate.objective
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                if !delegated.is_empty() {
-                    evidence.push_str("\nDelegated child task states (authoritative):\n");
-                    evidence.push_str(&delegated.join("\n"));
-                }
-            }
-            let context = prompts::exact_action_review(
-                &approval.action,
-                &approval.working_directory,
-                &approval.reason,
-                &evidence,
-            );
-            review_jobs.push((approval, task, reviewer, context));
-        }
-        let mut reviewed = stream::iter(review_jobs.into_iter().map(
-            |(approval, task, reviewer, context)| async move {
-                let verdict = self.review_verdict_as(&task, &context, reviewer).await?;
-                Ok::<_, EngineError>((approval, task, reviewer, verdict))
-            },
-        ))
-        .buffer_unordered(MAX_PARALLEL_REVIEWS)
-        .try_collect::<Vec<_>>()
-        .await?;
-        verdicts.append(&mut reviewed);
-        for (approval, task, reviewer, verdict) in verdicts {
-            self.record(
-                Some(task.id),
-                CanonicalEventKind::LeadReviewFinished {
-                    lead: reviewer,
-                    approval_id: Some(approval.id),
-                    approved: verdict.approve,
-                    reason: verdict.reason.clone(),
-                },
-            )
-            .await?;
-            if verdict.transient {
-                continue;
-            }
-            // Re-read and validate under decide_approval's lock. Cancellation
-            // or a prior decision during review cannot execute an action.
-            if self
-                .repo
-                .task(task.id)
-                .await?
-                .is_some_and(|t| t.status == TaskStatus::WaitingApproval)
-            {
-                self.decide_approval(
-                    approval.id,
-                    if verdict.approve {
-                        ApprovalDecision::ApprovedOnce
-                    } else {
-                        ApprovalDecision::Denied
-                    },
-                )
+            self.decide_approval(approval.id, ApprovalDecision::Denied)
                 .await?;
-                if !verdict.approve
-                    && verdict.validated
-                    && matches!(
-                        approval.action.as_str(),
-                        "file.patch" | "process.test" | "task.complete"
-                    )
-                {
-                    self.record(
-                        Some(task.id),
-                        CanonicalEventKind::RevisionRequested {
-                            approval_id: approval.id,
-                            feedback: verdict.reason.clone(),
-                        },
-                    )
-                    .await?;
-                    if approval.action == "task.complete"
-                        && verdict.reason.starts_with("EVIDENCE_ONLY:")
-                    {
-                        self.resume_evidence_revision(&task, &approval, &verdict.reason)
-                            .await?;
-                    }
-                }
-            }
+        }
+
+        if !self.automatic_review {
+            return Ok(());
         }
 
         let events = self.repo.events(self.session).await?;
@@ -364,12 +158,58 @@ impl<R: Repository + 'static> Engine<R> {
                     continue;
                 }
                 let guidance = format!("{}{feedback}", prompts::REJECTED_PROPOSAL_RETRY_PREFIX);
-                self.schedule_repair(task, &guidance, None, None).await?;
+                self.schedule_repair(task, &guidance, None, None, None)
+                    .await?;
                 continue;
             }
             let Some(failure) = failure else {
                 continue;
             };
+            let duplicate_failures = events
+                .iter()
+                .filter(|event| event.task_id == Some(task.id))
+                .filter(|event| {
+                    matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason } if reason == failure)
+                })
+                .count();
+            if duplicate_failures >= 2 {
+                let already_stopped = events.iter().any(|event| {
+                    event.task_id == Some(task.id)
+                        && matches!(&event.kind, CanonicalEventKind::RevisionStopped(reason)
+                            if reason.contains("unchanged recovery failure"))
+                });
+                if !already_stopped {
+                    self.record(
+                        Some(task.id),
+                        CanonicalEventKind::RevisionStopped(
+                            "The unchanged recovery failure repeated without new workspace evidence. Voff stopped replaying the same action; this duplicate did not consume another recovery attempt."
+                                .into(),
+                        ),
+                    )
+                    .await?;
+                }
+                let mut ancestor = task.parent;
+                while let Some(parent_id) = ancestor {
+                    let Some(parent) = self.repo.task(parent_id).await? else {
+                        break;
+                    };
+                    ancestor = parent.parent;
+                    if parent.status == TaskStatus::Running {
+                        self.record(
+                            Some(parent.id),
+                            CanonicalEventKind::WorkRecoveryRequested {
+                                reason: format!(
+                                    "delegated task {} requires manual intervention after an unchanged recovery failure",
+                                    task.id
+                                ),
+                            },
+                        )
+                        .await?;
+                        self.transition(parent.id, TaskStatus::Blocked).await?;
+                    }
+                }
+                continue;
+            }
             if !children_have_settled_attempts(task.id, &tasks) {
                 continue;
             }
@@ -400,7 +240,8 @@ impl<R: Repository + 'static> Engine<R> {
                         // Older persisted sessions recorded approval before
                         // scheduling the in-place recovery. Finish that action
                         // after restart rather than leaving the task stranded.
-                        self.schedule_repair(task, reason, None, None).await?;
+                        self.schedule_repair(task, reason, None, None, Some(failure))
+                            .await?;
                         continue;
                     }
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
@@ -615,8 +456,14 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?;
                 continue;
             }
-            self.schedule_repair(task, &verdict.reason, reassignment, owned_paths)
-                .await?;
+            self.schedule_repair(
+                task,
+                &verdict.reason,
+                reassignment,
+                owned_paths,
+                Some(failure),
+            )
+            .await?;
             self.record(
                 Some(task.id),
                 CanonicalEventKind::LeadReviewFinished {
@@ -631,58 +478,13 @@ impl<R: Repository + 'static> Engine<R> {
         Ok(())
     }
 
-    async fn resume_evidence_revision(
-        &self,
-        task: &Task,
-        approval: &Approval,
-        feedback: &str,
-    ) -> Result<(), EngineError> {
-        let Some(current) = self.repo.task(task.id).await? else {
-            return Err(EngineError::TaskNotFound);
-        };
-        if current.status != TaskStatus::Blocked || approval.action != "task.complete" {
-            return Ok(());
-        }
-        self.publish_artifact(Artifact {
-            id: ArtifactId::new(),
-            producer: task.id,
-            kind: "workflow_feedback".into(),
-            location: "task.complete.evidence".into(),
-            digest: String::new(),
-            preview: format!(
-                "The completion report was denied for missing evidence only. Address this reviewer feedback in the current task attempt, then submit completion evidence again:\n{}",
-                feedback.chars().take(4_000).collect::<String>()
-            ),
-        })
-        .await?;
-        let attempt = next_work_retry_attempt(&self.repo.events(self.session).await?, task.id);
-        self.record(
-            Some(task.id),
-            CanonicalEventKind::WorkRetrying {
-                attempt,
-                owner: task.owner,
-            },
-        )
-        .await?;
-        self.transition(task.id, TaskStatus::Ready).await?;
-        self.events
-            .send(EngineEvent::TaskUpdated(
-                self.repo
-                    .task(task.id)
-                    .await?
-                    .ok_or(EngineError::TaskNotFound)?,
-            ))
-            .await
-            .map_err(|_| EngineError::ChannelClosed)?;
-        Ok(())
-    }
-
     async fn schedule_repair(
         &self,
         task: &Task,
         guidance: &str,
         new_owner: Option<AgentId>,
         owned_paths: Option<Vec<PathBuf>>,
+        failure: Option<&str>,
     ) -> Result<(), EngineError> {
         let _approval_guard = self.approval_lock.lock().await;
         if self.repo.events(self.session).await?.iter().any(|event| {
@@ -698,11 +500,26 @@ impl<R: Repository + 'static> Engine<R> {
             return Ok(());
         }
         let events = self.repo.events(self.session).await?;
-        let attempt = next_work_retry_attempt(&events, task.id);
+        let attempt = next_work_retry_attempt(&events, task.id, failure);
+        if attempt > 3 {
+            self.record(
+                Some(task.id),
+                CanonicalEventKind::ProviderFailed(
+                    "automatic recovery stopped after 3 attempts; manual review is required".into(),
+                ),
+            )
+            .await?;
+            self.transition(task.id, TaskStatus::Failed).await?;
+            return Ok(());
+        }
         let old_owner = current.owner;
         if let Some(new_owner) = new_owner {
             current.owner = new_owner;
         }
+        // A recovery must start a fresh provider turn. Reusing the failed
+        // continuation can replay the exact denied tool call before the model
+        // sees the corrective workflow feedback.
+        current.provider_session = None;
         let scope_note = owned_paths.as_ref().map(|paths| {
             if paths.is_empty() {
                 "all workspace paths".to_owned()
@@ -715,6 +532,18 @@ impl<R: Repository + 'static> Engine<R> {
             }
         });
         if let (Some(work), Some(owned_paths)) = (&mut current.work, owned_paths) {
+            if !work.owned_paths.is_empty()
+                && owned_paths.iter().any(|candidate| {
+                    !work
+                        .owned_paths
+                        .iter()
+                        .any(|scope| candidate == scope || candidate.starts_with(scope))
+                })
+            {
+                return Err(EngineError::InvalidDelegationPlan(
+                    "recovery cannot widen the task's persisted owned_paths".into(),
+                ));
+            }
             work.owned_paths = owned_paths;
         }
         self.repo.save_task(current.clone()).await?;
@@ -758,6 +587,25 @@ impl<R: Repository + 'static> Engine<R> {
             .await?;
         }
         self.transition(task.id, TaskStatus::Ready).await?;
+        let mut ancestor = current.parent;
+        while let Some(parent_id) = ancestor {
+            let Some(parent) = self.repo.task(parent_id).await? else {
+                break;
+            };
+            ancestor = parent.parent;
+            if parent.status == TaskStatus::Blocked {
+                self.transition(parent.id, TaskStatus::Ready).await?;
+                self.transition(parent.id, TaskStatus::Running).await?;
+                self.record(
+                    Some(parent.id),
+                    CanonicalEventKind::ProviderWarning(format!(
+                        "Delegated task {} recovered and is ready; the parent workflow resumed automatically.",
+                        task.id
+                    )),
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -865,7 +713,6 @@ impl<R: Repository + 'static> Engine<R> {
                     reason,
                     reassign_to: None,
                     owned_paths: None,
-                    validated: false,
                     transient: true,
                 })
             }
@@ -916,6 +763,7 @@ impl<R: Repository + 'static> Engine<R> {
             .insert(task.id, cancel.clone());
         let request = CanonicalRequest {
             task_id: task.id,
+            provider_session: None,
             model: lead.model,
             max_output_tokens: Some(lead.max_output_tokens.min(4096)),
             messages: vec![
@@ -950,7 +798,6 @@ impl<R: Repository + 'static> Engine<R> {
                 reason,
                 reassign_to: None,
                 owned_paths: None,
-                validated: false,
                 transient: true,
             });
         }
@@ -962,7 +809,6 @@ impl<R: Repository + 'static> Engine<R> {
                 reason: "Reporting-agent review cancelled; no action was authorized.".into(),
                 reassign_to: None,
                 owned_paths: None,
-                validated: false,
                 transient: false,
             });
         }
@@ -989,7 +835,6 @@ impl<R: Repository + 'static> Engine<R> {
                     reason: format!("{TEMPORARY_REVIEW_PREFIX}: {reason}"),
                     reassign_to: None,
                     owned_paths: None,
-                    validated: false,
                     transient: true,
                 });
             }
@@ -1023,11 +868,10 @@ impl<R: Repository + 'static> Engine<R> {
         if verdicts.len() != 1 {
             return Ok(invalid_verdict());
         }
-        let mut verdict = verdicts.remove(0);
+        let verdict = verdicts.remove(0);
         if verdict.reason.trim().is_empty() || verdict.reason.len() > 8000 {
             return Ok(invalid_verdict());
         }
-        verdict.validated = true;
         Ok(verdict)
     }
 
@@ -1064,7 +908,12 @@ impl<R: Repository + 'static> Engine<R> {
             EngineError::Tool(_)
                 | EngineError::InvalidDelegationPlan(_)
                 | EngineError::TeamLeadRequired
-                | EngineError::Executor(ExecutorError::Denied | ExecutorError::OutsideWorkspace)
+                | EngineError::Executor(
+                    ExecutorError::Denied
+                        | ExecutorError::OutsideWorkspace
+                        | ExecutorError::InvalidInvocation(_)
+                        | ExecutorError::Timeout
+                )
         ) || missing_test_program;
         let recovery_review = self.automatic_review && (recoverable || diagnosable);
         if recovery_review {
@@ -1079,13 +928,20 @@ impl<R: Repository + 'static> Engine<R> {
                 CanonicalEventKind::WorkRecoveryRequested { reason },
             )
             .await?;
+        } else if matches!(error, EngineError::Executor(ExecutorError::Io(_))) {
+            self.record(
+                Some(id),
+                CanonicalEventKind::ApplicationIssue(format!(
+                    "{error}. The local verification process could not be started or read; provider login and model availability are unrelated."
+                )),
+            )
+            .await?;
         } else if matches!(
             error,
             EngineError::Provider(_)
                 | EngineError::ContinuationLimit
                 | EngineError::ProviderRouteNotFound(_)
                 | EngineError::InvalidOutputTokenLimit(_)
-                | EngineError::Executor(ExecutorError::Io(_) | ExecutorError::Timeout)
         ) {
             self.record(Some(id), CanonicalEventKind::ApplicationIssue(format!("{error}. Check provider login, availability, and application limits; no automatic permission or token increase was made."))).await?;
         }
@@ -1168,15 +1024,50 @@ fn children_have_settled_attempts(task_id: TaskId, tasks: &[Task]) -> bool {
         })
 }
 
-fn next_work_retry_attempt(events: &[CanonicalEvent], task_id: TaskId) -> u32 {
+fn recovery_category(reason: &str) -> &'static str {
+    if reason.contains("sensitive path") {
+        "sensitive_path"
+    } else if reason.contains("outside the authorized root") {
+        "workspace_scope"
+    } else if reason.contains("invalid tool arguments") {
+        "tool_schema"
+    } else if reason.starts_with("provider:") {
+        "provider"
+    } else if reason.starts_with("verification command") {
+        "verification"
+    } else if reason.starts_with("worker-reported blocker") {
+        "worker_blocker"
+    } else {
+        "other"
+    }
+}
+
+fn next_work_retry_attempt(
+    events: &[CanonicalEvent],
+    task_id: TaskId,
+    failure: Option<&str>,
+) -> u32 {
+    let Some(failure) = failure else {
+        return events
+            .iter()
+            .filter(|event| {
+                event.task_id == Some(task_id)
+                    && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+            })
+            .count()
+            .saturating_add(1)
+            .min(u32::MAX as usize) as u32;
+    };
+    let category = recovery_category(failure);
     events
         .iter()
+        .filter(|event| event.task_id == Some(task_id))
         .filter(|event| {
-            event.task_id == Some(task_id)
-                && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+            matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason }
+                if recovery_category(reason) == category)
         })
         .count()
-        .saturating_add(1)
+        .max(1)
         .min(u32::MAX as usize) as u32
 }
 
@@ -1185,7 +1076,6 @@ fn invalid_verdict() -> Verdict {
         approve: false,
         reassign_to: None,
         owned_paths: None,
-        validated: false,
         reason: format!(
             "{TEMPORARY_REVIEW_PREFIX}: invalid review response; the proposal remains pending and will be reviewed again."
         ),
@@ -1196,22 +1086,10 @@ fn invalid_verdict() -> Verdict {
 fn validate_recovery_paths(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut validated = Vec::with_capacity(paths.len());
     for path in paths {
-        let path = PathBuf::from(path);
-        if path.as_os_str().is_empty()
-            || path.is_absolute()
-            || path.components().any(|component| {
-                !matches!(component, std::path::Component::Normal(_))
-                    || matches!(component, std::path::Component::Normal(name)
-                        if [".voff", ".ssh", ".aws", ".codex", ".claude"]
-                            .iter()
-                            .any(|denied| name == std::ffi::OsStr::new(denied)))
-            })
-        {
-            return Err(
-                "Recovery scope rejected: owned_paths must contain only safe workspace-relative paths."
-                    .into(),
-            );
-        }
+        let path = normalize_workspace_scope(Path::new(path)).map_err(|_| {
+            "Recovery scope rejected: owned_paths must contain only safe workspace-relative paths; only a trailing /** directory shorthand is supported."
+                .to_owned()
+        })?;
         validated.push(path);
     }
     Ok(validated)
@@ -1221,6 +1099,33 @@ fn validate_recovery_paths(paths: &[String]) -> Result<Vec<PathBuf>, String> {
 mod tests {
     use super::*;
     use voff_storage::InMemoryRepository;
+
+    #[test]
+    fn recovery_attempts_are_scoped_by_failure_category() {
+        let task_id = TaskId::new();
+        let event = |reason: &str| CanonicalEvent {
+            id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::WorkRecoveryRequested {
+                reason: reason.into(),
+            },
+        };
+        let events = vec![
+            event("tool: sensitive path is denied"),
+            event("tool: sensitive path is denied for another file"),
+            event("provider: provider InvalidResponse"),
+        ];
+        assert_eq!(
+            next_work_retry_attempt(&events, task_id, Some("tool: sensitive path is denied")),
+            2
+        );
+        assert_eq!(
+            next_work_retry_attempt(&events, task_id, Some("provider: provider InvalidResponse")),
+            1
+        );
+    }
     #[test]
     fn review_policy_allows_app_config_but_not_security_changes() {
         assert!(REVIEW_POLICY.contains("Vite proxies"));
@@ -1262,20 +1167,6 @@ mod tests {
         assert_eq!(
             engine.reporting_reviewer(&grandchild).await.unwrap(),
             manager
-        );
-        assert_eq!(
-            engine
-                .approval_reviewer(&grandchild, "file.patch")
-                .await
-                .unwrap(),
-            manager
-        );
-        assert_eq!(
-            engine
-                .approval_reviewer(&grandchild, "process.test")
-                .await
-                .unwrap(),
-            lead
         );
         grandchild.parent = Some(TaskId::new());
         assert!(matches!(

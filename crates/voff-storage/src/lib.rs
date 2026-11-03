@@ -23,6 +23,15 @@ pub trait Repository: Send + Sync {
     async fn save_agent(&self, v: AgentProfile) -> Result<(), RepositoryError>;
     async fn agent(&self, id: AgentId) -> Result<Option<AgentProfile>, RepositoryError>;
     async fn agents(&self) -> Result<Vec<AgentProfile>, RepositoryError>;
+    async fn save_provider_session(
+        &self,
+        agent: AgentId,
+        session: ProviderSession,
+    ) -> Result<(), RepositoryError>;
+    async fn provider_session(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<ProviderSession>, RepositoryError>;
     async fn save_task(&self, v: Task) -> Result<(), RepositoryError>;
     async fn task(&self, id: TaskId) -> Result<Option<Task>, RepositoryError>;
     async fn tasks(&self) -> Result<Vec<Task>, RepositoryError>;
@@ -48,6 +57,7 @@ pub trait Repository: Send + Sync {
 struct State {
     sessions: HashMap<SessionId, Session>,
     agents: HashMap<AgentId, AgentProfile>,
+    provider_sessions: HashMap<AgentId, ProviderSession>,
     tasks: HashMap<TaskId, Task>,
     events: Vec<CanonicalEvent>,
     approvals: HashMap<ApprovalId, Approval>,
@@ -79,6 +89,30 @@ impl Repository for InMemoryRepository {
     }
     async fn agents(&self) -> Result<Vec<AgentProfile>, RepositoryError> {
         Ok(self.state.read().await.agents.values().cloned().collect())
+    }
+    async fn save_provider_session(
+        &self,
+        agent: AgentId,
+        session: ProviderSession,
+    ) -> Result<(), RepositoryError> {
+        self.state
+            .write()
+            .await
+            .provider_sessions
+            .insert(agent, session);
+        Ok(())
+    }
+    async fn provider_session(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<ProviderSession>, RepositoryError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .provider_sessions
+            .get(&agent)
+            .cloned())
     }
     async fn save_task(&self, v: Task) -> Result<(), RepositoryError> {
         self.state.write().await.tasks.insert(v.id, v);
@@ -625,6 +659,44 @@ impl Repository for SqliteRepository {
         .await
     }
 
+    async fn save_provider_session(
+        &self,
+        agent: AgentId,
+        session: ProviderSession,
+    ) -> Result<(), RepositoryError> {
+        let agent_id = agent.to_string();
+        let data = Self::encode(&session)?;
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO provider_sessions(agent_id,data) VALUES(?1,?2)",
+                    rusqlite::params![agent_id, data],
+                )
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn provider_session(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<ProviderSession>, RepositoryError> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT data FROM provider_sessions WHERE agent_id=?1",
+                    [agent.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db)?
+                .map(Self::decode)
+                .transpose()
+        })
+        .await
+    }
+
     async fn save_task(&self, value: Task) -> Result<(), RepositoryError> {
         let id = value.id.to_string();
         let data = Self::encode(&value)?;
@@ -777,7 +849,12 @@ mod tests {
         };
         r.save_session(session.clone()).await.unwrap();
         assert!(r.session(session.id).await.unwrap().is_some());
-        let t = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());
+        let mut t = Task::root(AgentId::new(), "x", vec![], TaskLimits::default());
+        t.provider_session = Some(Box::new(ProviderSession {
+            provider: "codex_cli".into(),
+            session_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            workspace_id: "00000000-0000-4000-8000-000000000002".into(),
+        }));
         let id = t.id;
         r.save_task(t).await.unwrap();
         assert!(r.task(id).await.unwrap().is_some());
@@ -796,13 +873,34 @@ mod tests {
     #[tokio::test]
     async fn sqlite_contract_and_reopen() {
         let path = std::env::temp_dir().join(format!("voff-{}.db", uuid::Uuid::new_v4()));
+        let agent_id = AgentId::new();
+        let provider_session = ProviderSession {
+            provider: "codex_cli".into(),
+            session_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            workspace_id: "00000000-0000-4000-8000-000000000002".into(),
+        };
         {
             let r = SqliteRepository::open(&path).await.unwrap();
             contract(&r).await;
+            r.save_provider_session(agent_id, provider_session.clone())
+                .await
+                .unwrap();
         }
         {
             let r = SqliteRepository::open(&path).await.unwrap();
             assert_eq!(r.tasks().await.unwrap().len(), 1);
+            assert_eq!(
+                r.provider_session(agent_id).await.unwrap(),
+                Some(provider_session)
+            );
+            assert_eq!(
+                r.tasks().await.unwrap()[0]
+                    .provider_session
+                    .as_ref()
+                    .unwrap()
+                    .session_id,
+                Some("00000000-0000-4000-8000-000000000001".into())
+            );
         }
         let _ = std::fs::remove_file(path);
     }
@@ -872,6 +970,7 @@ mod tests {
                 "composer_history",
                 "credentials",
                 "events",
+                "provider_sessions",
                 "sessions",
                 "task_dependencies",
                 "tasks",

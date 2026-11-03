@@ -70,7 +70,7 @@ impl AgentCard {
         let status_label = match self.status {
             "working" => "RUNNING",
             "reviewing" => "REVIEW",
-            "approval" => "NEEDS APPROVAL",
+            "coordinating" => "COORDINATING",
             "ready" => "READY",
             "queued" => "QUEUED",
             "complete" => "DONE",
@@ -190,8 +190,8 @@ impl AgentCard {
 
 impl NodeContent for AgentCard {
     fn render(&self, ctx: &NodeRenderContext<'_>, buf: &mut Buffer) {
-        let live_pulse =
-            matches!(self.status, "working" | "reviewing") && ctx.animation_phase % 8 < 4;
+        let live_pulse = matches!(self.status, "working" | "reviewing" | "coordinating")
+            && ctx.animation_phase % 8 < 4;
         let border_style = if ctx.selected || live_pulse {
             Style::default()
                 .fg(if live_pulse {
@@ -200,7 +200,7 @@ impl NodeContent for AgentCard {
                     self.agent_color
                 })
                 .add_modifier(Modifier::BOLD)
-        } else if matches!(self.status, "approval" | "ready" | "queued") {
+        } else if matches!(self.status, "coordinating" | "ready" | "queued") {
             Style::default().fg(self.status_color)
         } else {
             Style::default().fg(theme::BORDER)
@@ -1171,12 +1171,9 @@ pub(super) fn handoff_summary(tasks: &[Task], approvals: &[Approval]) -> String 
         })
         .count();
     if active > 0 && pending > 0 {
-        format!("{active} active · {pending} awaiting approval")
+        format!("{active} active · {pending} dispatching")
     } else if pending > 0 {
-        format!(
-            "{pending} handoff{} awaiting approval",
-            plural_suffix(pending)
-        )
+        format!("{pending} handoff{} dispatching", plural_suffix(pending))
     } else if active > 0 {
         format!("{active} handoff active")
     } else if failed > 0 {
@@ -1324,7 +1321,7 @@ fn agent_status(tasks: &[Task], agent: &AgentProfile, pending: bool) -> (&'stati
         return task_status_presentation(task.status);
     }
     if pending {
-        return ("approval", theme::YELLOW);
+        return ("coordinating", theme::AQUA);
     }
     if let Some(task) = task {
         return task_status_presentation(task.status);
@@ -1372,7 +1369,7 @@ fn format_elapsed(duration: std::time::Duration) -> String {
 const fn task_status_presentation(status: TaskStatus) -> (&'static str, Color) {
     match status {
         TaskStatus::Running => ("working", theme::GREEN),
-        TaskStatus::WaitingApproval => ("approval", theme::YELLOW),
+        TaskStatus::WaitingApproval => ("coordinating", theme::AQUA),
         TaskStatus::Ready => ("ready", theme::AQUA),
         TaskStatus::Queued => ("queued", theme::BLUE),
         TaskStatus::Blocked => ("blocked", theme::YELLOW),
@@ -1387,7 +1384,7 @@ fn status_symbol(status: &str) -> &'static str {
         "complete" => "✓",
         "failed" => "!",
         "blocked" => "↻",
-        "approval" => "?",
+        "coordinating" => "↻",
         _ => "○",
     }
 }

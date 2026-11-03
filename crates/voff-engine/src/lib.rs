@@ -16,7 +16,7 @@ use voff_provider::*;
 use voff_storage::{Repository, RepositoryError};
 use voff_tools::{
     CommandSpec, ControlledExecutor, ExecutionGrant, ExecutorError, PatchProposal, ScopedWorkspace,
-    ToolError, validate_process_argv,
+    ToolError, is_long_running_server_command, normalize_workspace_scope, validate_process_argv,
 };
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -80,6 +80,10 @@ pub struct Engine<R: Repository> {
     session: SessionId,
     events: mpsc::Sender<EngineEvent>,
     cancellations: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
+    /// One in-process mailbox lane per agent. Tasks for the same agent are
+    /// accepted in parallel by the scheduler but run serially against that
+    /// agent's durable provider session.
+    agent_lanes: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
     default_model: String,
     system_prompt: String,
     workspace_context: Option<String>,
@@ -184,7 +188,34 @@ fn validate_patch_batch(patches: &PatchArguments) -> Result<(), EngineError> {
             "file.patch paths must be unique and cannot contain one another".into(),
         ));
     }
+    let unpinned_manifest = match patches {
+        PatchArguments::Single(patch) => {
+            patch.path == Path::new("package.json")
+                && package_manifest_uses_latest(&patch.replacement)
+        }
+        PatchArguments::Batch(batch) => batch.patches.iter().any(|patch| {
+            patch.path == Path::new("package.json")
+                && package_manifest_uses_latest(&patch.replacement)
+        }),
+    };
+    if unpinned_manifest {
+        return Err(EngineError::InvalidDelegationPlan(
+            "package.json dependencies must use explicit versions compatible with the detected runtime; the unbounded 'latest' tag is not allowed"
+                .into(),
+        ));
+    }
     Ok(())
+}
+
+fn package_manifest_uses_latest(replacement: &str) -> bool {
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(replacement) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .into_iter()
+        .filter_map(|name| manifest.get(name).and_then(serde_json::Value::as_object))
+        .flat_map(|section| section.values())
+        .any(|version| version.as_str() == Some("latest"))
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -395,6 +426,7 @@ impl<R: Repository + 'static> Engine<R> {
             session,
             events,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            agent_lanes: Mutex::new(HashMap::new()),
             default_model: "mock-v1".into(),
             system_prompt: String::new(),
             workspace_context: None,
@@ -577,11 +609,12 @@ impl<R: Repository + 'static> Engine<R> {
             .await?
             .and_then(|a| a.delegation_limits)
             .unwrap_or_default();
+        let root_contract = root_work_contract(&objective, &criteria);
         let mut t = Task::root(owner, objective, criteria, limits);
         t.requested_target = requested_target;
         if self.verified_workflow {
             t.work = Some(WorkProgress {
-                contract: String::new(),
+                contract: root_contract,
                 owned_paths: Vec::new(),
                 integration: false,
                 turns: 0,
@@ -627,6 +660,7 @@ impl<R: Repository + 'static> Engine<R> {
             retry_of: Some(previous.id),
             work: previous.work.clone(),
             requested_target: previous.requested_target,
+            provider_session: previous.provider_session.clone(),
             parent: previous.parent,
             owner: previous.owner,
             objective: guidance.map_or_else(
@@ -889,6 +923,19 @@ impl<R: Repository + 'static> Engine<R> {
         self.run_task_with_mode(id, RunMode::Conversation).await
     }
     async fn run_task_with_mode(&self, id: TaskId, mode: RunMode) -> Result<(), EngineError> {
+        let task = self.repo.task(id).await?.ok_or(EngineError::TaskNotFound)?;
+        let lane = {
+            let mut lanes = self.agent_lanes.lock().await;
+            Arc::clone(
+                lanes
+                    .entry(task.owner)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        // A provider session belongs to an agent, so only one task may use it
+        // at a time. This is the engine's mailbox boundary: independent agents
+        // still run concurrently, while same-agent tasks wait in order.
+        let _lane_guard = lane.lock().await;
         let result = self.execute_task_with_mode(id, mode).await;
         if let Err(error) = &result {
             // Another runner may already own this task. A rejected duplicate
@@ -966,6 +1013,28 @@ impl<R: Repository + 'static> Engine<R> {
             ));
         }
         let mut task = self.transition(id, TaskStatus::Running).await?;
+        let provider_id = provider.descriptor().id;
+        if matches!(provider_id.as_str(), "codex_cli" | "claude_cli") {
+            let saved = self.repo.provider_session(task.owner).await?;
+            let provider_session = saved
+                .filter(|session| session.provider == provider_id)
+                .or_else(|| {
+                    task.provider_session
+                        .as_deref()
+                        .filter(|session| session.provider == provider_id)
+                        .cloned()
+                })
+                .unwrap_or_else(|| ProviderSession {
+                    provider: provider_id.clone(),
+                    session_id: None,
+                    workspace_id: uuid::Uuid::new_v4().to_string(),
+                });
+            task.provider_session = Some(Box::new(provider_session.clone()));
+            self.repo.save_task(task.clone()).await?;
+            self.repo
+                .save_provider_session(task.owner, provider_session.clone())
+                .await?;
+        }
         if let Some(work) = &mut task.work {
             work.turns = work.turns.saturating_add(1);
             self.repo.save_task(task.clone()).await?;
@@ -1117,6 +1186,19 @@ impl<R: Repository + 'static> Engine<R> {
             |context| prompts::dependency_results(&task.objective, &context),
         );
         let user_content = if let Some(previous) = task.retry_of {
+            let previous_task = self
+                .repo
+                .task(previous)
+                .await?
+                .ok_or(EngineError::TaskNotFound)?;
+            let artifacts = self
+                .repo
+                .artifacts()
+                .await?
+                .into_iter()
+                .filter(|artifact| artifact.producer == previous)
+                .collect::<Vec<_>>();
+            let briefing = retry_briefing(&previous_task, &artifacts);
             let proposals = self
                 .repo
                 .approvals(self.session)
@@ -1147,7 +1229,7 @@ impl<R: Repository + 'static> Engine<R> {
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "{user_content}\n\n{}",
+                "{user_content}\n\n{briefing}\n\n{}",
                 revision_context(&feedback, &proposals)
             )
         } else {
@@ -1208,6 +1290,11 @@ impl<R: Repository + 'static> Engine<R> {
             .unwrap_or(agent.max_output_tokens);
         let request = CanonicalRequest {
             task_id: id,
+            provider_session: task
+                .provider_session
+                .as_ref()
+                .filter(|session| session.provider == provider_id)
+                .map(|session| (**session).clone()),
             model: if agent.model.trim().is_empty() {
                 self.default_model.clone()
             } else {
@@ -1266,6 +1353,10 @@ impl<R: Repository + 'static> Engine<R> {
                     break;
                 };
                 let kind = match event {
+                    ProviderEvent::Session(session) => {
+                        self.persist_provider_session(id, session).await?;
+                        continue;
+                    }
                     ProviderEvent::TextDelta(text) => CanonicalEventKind::TextDelta(text),
                     ProviderEvent::OutputDelta(text) => CanonicalEventKind::GenerationDelta(text),
                     ProviderEvent::Retrying { attempt } => {
@@ -1580,6 +1671,10 @@ impl<R: Repository + 'static> Engine<R> {
         }
         for event in response {
             let kind = match event {
+                ProviderEvent::Session(session) => {
+                    self.persist_provider_session(id, session).await?;
+                    continue;
+                }
                 ProviderEvent::TextDelta(s) => {
                     response_text.push_str(&s);
                     continue; // Already persisted/displayed by the live publisher.
@@ -1995,6 +2090,33 @@ impl<R: Repository + 'static> Engine<R> {
             }
             self.finish_task(id, response_text, vec![]).await?;
         }
+        Ok(())
+    }
+
+    async fn persist_provider_session(
+        &self,
+        task_id: TaskId,
+        provider_session: ProviderSession,
+    ) -> Result<(), EngineError> {
+        let Some(mut task) = self.repo.task(task_id).await? else {
+            return Err(EngineError::TaskNotFound);
+        };
+        if task.status != TaskStatus::Running
+            || !task.provider_session.as_ref().is_some_and(|saved| {
+                saved.provider == provider_session.provider
+                    && saved.workspace_id == provider_session.workspace_id
+            })
+        {
+            return Ok(());
+        }
+        task.provider_session = Some(Box::new(provider_session));
+        let session = task
+            .provider_session
+            .as_deref()
+            .cloned()
+            .expect("provider session was just saved");
+        self.repo.save_provider_session(task.owner, session).await?;
+        self.repo.save_task(task).await?;
         Ok(())
     }
 
@@ -2880,6 +3002,21 @@ impl<R: Repository + 'static> Engine<R> {
                 .iter()
                 .all(|child| child.status == TaskStatus::Completed)
             {
+                let has_verified_integration = children
+                    .iter()
+                    .any(|child| child.work.as_ref().is_some_and(|work| work.integration));
+                if parent.work.is_some() && !has_verified_integration {
+                    self.record(
+                        Some(parent.id),
+                        CanonicalEventKind::ProviderWarning(
+                            "All delegated tasks completed. The parent must now verify the immutable root request and submit its own task.complete evidence; child completion alone is not final acceptance."
+                                .into(),
+                        ),
+                    )
+                    .await?;
+                    self.transition(parent.id, TaskStatus::Ready).await?;
+                    continue;
+                }
                 let results = children
                     .iter()
                     .filter_map(|child| child.result.as_ref())
@@ -2986,6 +3123,14 @@ impl<R: Repository + 'static> Engine<R> {
                 return Err(EngineError::InvalidDelegationPlan(
                     "child objective cannot be empty".into(),
                 ));
+            }
+            for path in &proposal.owned_paths {
+                normalize_workspace_scope(path).map_err(|_| {
+                    EngineError::InvalidDelegationPlan(
+                        "owned_paths conflict with workspace safety policy; use safe relative paths and only a trailing /** directory shorthand"
+                            .into(),
+                    )
+                })?;
             }
             let target = self
                 .delegation_target(&proposal.target_agent)
@@ -3328,6 +3473,18 @@ impl<R: Repository + 'static> Engine<R> {
             .map_err(|_| EngineError::ChannelClosed)
     }
 }
+
+fn root_work_contract(objective: &str, criteria: &[String]) -> String {
+    let criteria = criteria
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| format!("AC-{}: {criterion}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "IMMUTABLE ROOT REQUEST — preserve this product domain and every acceptance requirement across delegation and recovery.\nObjective:\n{objective}\nRoot acceptance:\n{criteria}"
+    )
+}
 fn latest_attempt(tasks: &[Task], id: TaskId) -> Option<&Task> {
     let mut task = tasks.iter().find(|task| task.id == id)?;
     // Bounded even for malformed imported history.
@@ -3512,6 +3669,12 @@ fn command_spec(
 ) -> Result<(CommandSpec, String, bool), EngineError> {
     let (program, args, purpose, verification) = request.invocation()?;
     validate_process_argv(&program, &args)?;
+    if is_long_running_server_command(&program, &args) {
+        return Err(ExecutorError::InvalidInvocation(
+            "persistent development servers cannot be bounded verification; run build/tests or a finite smoke test that starts and stops its own server",
+        )
+        .into());
+    }
     Ok((
         CommandSpec {
             program,
@@ -3540,6 +3703,56 @@ fn revision_context(feedback: &str, proposals: &str) -> String {
         feedback = bounded(feedback, 16_384),
         proposals = bounded(proposals, 49_152),
     )
+}
+
+/// Rebuild a compact "where you left off" briefing from durable task state.
+/// Provider sessions are intentionally disposable; retries receive the saved
+/// task outcome and safe evidence summaries instead of relying on provider
+/// specific session IDs or replaying tool calls.
+fn retry_briefing(previous: &Task, artifacts: &[Artifact]) -> String {
+    let mut briefing = format!(
+        "Persisted continuation briefing for attempt {} ({}): resume from the current workspace and durable evidence. Inspect current state before repeating an action; pending or denied actions are not authorized by this retry.",
+        previous.attempt,
+        match previous.status {
+            TaskStatus::Completed => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Blocked => "blocked",
+            TaskStatus::Queued => "queued",
+            TaskStatus::Ready => "ready",
+            TaskStatus::Running => "interrupted",
+            TaskStatus::WaitingApproval => "waiting for approval",
+        }
+    );
+    if let Some(result) = &previous.result {
+        let summary = result.summary.chars().take(2_000).collect::<String>();
+        if !summary.trim().is_empty() {
+            briefing.push_str("\nPrevious attempt summary:\n");
+            briefing.push_str(&summary);
+        }
+    }
+    let mut evidence = artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact.kind.as_str(),
+                "test_report" | "workflow_feedback" | "task_checkpoint"
+            )
+        })
+        .collect::<Vec<_>>();
+    evidence.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.location.cmp(&right.location))
+    });
+    for artifact in evidence.into_iter().take(5) {
+        let preview = artifact.preview.chars().take(1_200).collect::<String>();
+        briefing.push_str(&format!(
+            "\nSaved {} evidence at {} ({}):\n{}",
+            artifact.kind, artifact.location, artifact.id, preview
+        ));
+    }
+    briefing
 }
 
 fn compact_denied_action(action: &str, reason: &str) -> String {
@@ -3727,9 +3940,128 @@ fn delegation_tool(name: &str, description: &str, allowed_targets: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
     use voff_provider::{MockProvider, MockStep};
     use voff_storage::InMemoryRepository;
+
+    struct ConcurrencyProbe {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ConcurrencyProbe {
+        fn descriptor(&self) -> ProviderDescriptor {
+            MockProvider::success("").descriptor()
+        }
+
+        async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn start(
+            &self,
+            _: CanonicalRequest,
+            sink: ProviderEventSink,
+            cancellation: CancellationToken,
+        ) -> Result<ProviderCompletion, ProviderError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    return Err(ProviderError {
+                        kind: ProviderErrorKind::Cancelled,
+                        message: "cancelled".into(),
+                        retryable: false,
+                    });
+                }
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            sink.send(ProviderEvent::TextDelta("finished".into()))
+                .await
+                .map_err(|_| ProviderError {
+                    kind: ProviderErrorKind::Internal,
+                    message: "event receiver closed".into(),
+                    retryable: false,
+                })?;
+            sink.send(ProviderEvent::Completed)
+                .await
+                .map_err(|_| ProviderError {
+                    kind: ProviderErrorKind::Internal,
+                    message: "event receiver closed".into(),
+                    retryable: false,
+                })?;
+            Ok(ProviderCompletion { usage: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn tasks_for_one_agent_share_a_serial_session_lane() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (events, _rx) = mpsc::channel(64);
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(ConcurrencyProbe {
+            active: active.clone(),
+            maximum: maximum.clone(),
+        });
+        let engine = Arc::new(Engine::new(repo, provider, SessionId::new(), events));
+        let owner = AgentId::new();
+        let first = engine.create_task(owner, "first", vec![]).await.unwrap();
+        let second = engine.create_task(owner, "second", vec![]).await.unwrap();
+        engine.mark_ready(first.id).await.unwrap();
+        engine.mark_ready(second.id).await.unwrap();
+
+        let (first_result, second_result) =
+            tokio::join!(engine.run_task(first.id), engine.run_task(second.id),);
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retry_briefing_resumes_from_durable_safe_evidence() {
+        let mut previous = Task::root(
+            AgentId::new(),
+            "finish the implementation",
+            vec![],
+            TaskLimits::default(),
+        );
+        previous.attempt = 2;
+        previous.status = TaskStatus::Failed;
+        previous.result = Some(TaskResult {
+            summary: "The first part is complete.".into(),
+            evidence: vec![],
+        });
+        let report = Artifact {
+            id: ArtifactId::new(),
+            producer: previous.id,
+            kind: "test_report".into(),
+            location: "cargo test".into(),
+            digest: "digest".into(),
+            preview: "1 test failed".into(),
+        };
+        let private_read = Artifact {
+            kind: "file_read".into(),
+            preview: "must not be copied into the retry briefing".into(),
+            ..report.clone()
+        };
+
+        let briefing = retry_briefing(&previous, &[report, private_read]);
+
+        assert!(briefing.contains("attempt 2 (failed)"));
+        assert!(briefing.contains("The first part is complete."));
+        assert!(briefing.contains("1 test failed"));
+        assert!(!briefing.contains("must not be copied"));
+        assert!(briefing.contains("pending or denied actions are not authorized"));
+    }
 
     #[test]
     fn command_spec_accepts_reviewable_argv_and_legacy_approvals() {
@@ -3798,6 +4130,98 @@ mod tests {
         assert!(schema["properties"]["program"].is_object());
         assert!(schema["properties"]["args"]["items"]["type"].is_string());
         assert!(schema["properties"]["command"].is_null());
+
+        let persistent_server = TestArguments {
+            program: Some("npm".into()),
+            args: vec!["run".into(), "dev".into()],
+            purpose: Some("Check the development server".into()),
+            verification: Some(true),
+            command: None,
+        };
+        let error = command_spec(&persistent_server, Path::new(".")).unwrap_err();
+        assert!(error.to_string().contains("persistent development servers"));
+
+        let latest_manifest: PatchArguments = serde_json::from_value(serde_json::json!({
+            "path": "package.json",
+            "replacement": "{\"dependencies\":{\"react\":\"latest\"}}"
+        }))
+        .unwrap();
+        assert!(validate_patch_batch(&latest_manifest).is_err());
+        let pinned_manifest: PatchArguments = serde_json::from_value(serde_json::json!({
+            "path": "package.json",
+            "replacement": "{\"dependencies\":{\"react\":\"19.1.0\"}}"
+        }))
+        .unwrap();
+        assert!(validate_patch_batch(&pinned_manifest).is_ok());
+    }
+
+    #[tokio::test]
+    async fn verified_root_contract_preserves_objective_and_acceptance() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo,
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        )
+        .with_verified_workflow();
+        let task = engine
+            .create_task(
+                AgentId::new(),
+                "Build the Turkish construction operations application",
+                vec!["Daily reports persist locally".into()],
+            )
+            .await
+            .unwrap();
+        let contract = &task.work.unwrap().contract;
+        assert!(contract.contains("Build the Turkish construction operations application"));
+        assert!(contract.contains("Daily reports persist locally"));
+        assert!(contract.contains("IMMUTABLE ROOT REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn completed_children_return_verified_parent_for_final_acceptance() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        )
+        .with_verified_workflow();
+        let parent = engine
+            .create_task(AgentId::new(), "build product", vec!["works".into()])
+            .await
+            .unwrap();
+        engine.mark_ready(parent.id).await.unwrap();
+        engine
+            .transition(parent.id, TaskStatus::Running)
+            .await
+            .unwrap();
+        let mut child = engine
+            .delegate_task(
+                parent.id,
+                AgentId::new(),
+                "implement".into(),
+                vec!["done".into()],
+            )
+            .await
+            .unwrap();
+        child.status = TaskStatus::Completed;
+        child.result = Some(TaskResult {
+            summary: "implemented".into(),
+            evidence: vec![],
+        });
+        repo.save_task(child).await.unwrap();
+
+        engine.finalize_parent_tasks().await.unwrap();
+
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
     }
 
     #[tokio::test]
@@ -4503,6 +4927,13 @@ mod tests {
             .create_task(AgentId::new(), "repeatable work", vec!["done".into()])
             .await
             .unwrap();
+        let mut original = original;
+        original.provider_session = Some(Box::new(ProviderSession {
+            provider: "codex_cli".into(),
+            session_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            workspace_id: "00000000-0000-4000-8000-000000000002".into(),
+        }));
+        repo.save_task(original.clone()).await.unwrap();
         engine.mark_ready(original.id).await.unwrap();
         engine.run_task(original.id).await.unwrap();
 
@@ -4513,6 +4944,7 @@ mod tests {
         assert_eq!(retry.attempt, 2);
         assert_eq!(retry.status, TaskStatus::Queued);
         assert_eq!(retry.objective, original.objective);
+        assert_eq!(retry.provider_session, original.provider_session);
         assert_eq!(
             repo.task(original.id).await.unwrap().unwrap().status,
             TaskStatus::Completed
@@ -4534,6 +4966,47 @@ mod tests {
             repo.task(retry.id).await.unwrap().unwrap().status,
             TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn local_provider_session_is_saved_for_the_agent_across_tasks() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        );
+        let owner = AgentId::new();
+        let task = engine
+            .create_task(owner, "resume me", vec![])
+            .await
+            .unwrap();
+        engine.mark_ready(task.id).await.unwrap();
+        engine
+            .transition(task.id, TaskStatus::Running)
+            .await
+            .unwrap();
+        let session = ProviderSession {
+            provider: "codex_cli".into(),
+            session_id: None,
+            workspace_id: "00000000-0000-4000-8000-000000000002".into(),
+        };
+        let mut running = repo.task(task.id).await.unwrap().unwrap();
+        running.provider_session = Some(Box::new(session.clone()));
+        repo.save_task(running).await.unwrap();
+        let resumed = ProviderSession {
+            session_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            ..session
+        };
+
+        engine
+            .persist_provider_session(task.id, resumed.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(repo.provider_session(owner).await.unwrap(), Some(resumed));
     }
 
     #[tokio::test]
@@ -5749,7 +6222,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn structured_delegation_enforces_allowed_target() {
+    async fn structured_delegation_dispatches_without_review_gate() {
         let repo = Arc::new(InMemoryRepository::default());
         let lead = AgentProfile {
             id: AgentId::new(),
@@ -5797,18 +6270,15 @@ mod tests {
         let (tx, _rx) = mpsc::channel(128);
         let session = SessionId::new();
         let engine = Engine::new(repo.clone(), Arc::new(provider), session, tx)
-            .with_formation_agents(&[lead.clone(), worker.clone()]);
+            .with_formation_agents(&[lead.clone(), worker.clone()])
+            .with_automatic_review(false);
         let parent = engine
             .create_task(lead.id, "lead task", vec![])
             .await
             .unwrap();
         engine.mark_ready(parent.id).await.unwrap();
         engine.run_task(parent.id).await.unwrap();
-        let approval = repo.approvals(session).await.unwrap().pop().unwrap();
-        engine
-            .decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
-            .await
-            .unwrap();
+        engine.coordinate_pending().await.unwrap();
         let child = repo
             .tasks()
             .await
@@ -5819,6 +6289,10 @@ mod tests {
         assert_eq!(child.owner, worker.id);
         assert_ne!(child.owner, stale_worker.id);
         assert_eq!(child.objective, "bounded child");
+        assert_eq!(
+            repo.approvals(session).await.unwrap()[0].decision,
+            ApprovalDecision::ApprovedOnce
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,36 @@ use voff_engine::{Engine, EngineEvent};
 use voff_provider::*;
 use voff_storage::{InMemoryRepository, Repository};
 
+async fn approve_commands_and_continue(
+    engine: &Arc<Engine<InMemoryRepository>>,
+    repo: &InMemoryRepository,
+    session: SessionId,
+    parallel: usize,
+) {
+    for _ in 0..16 {
+        engine.run_until_idle_bounded(parallel).await.unwrap();
+        let pending = repo
+            .approvals(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|approval| {
+                approval.action == "process.test" && approval.decision == ApprovalDecision::Pending
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        for approval in pending {
+            engine
+                .decide_approval(approval.id, ApprovalDecision::ApprovedOnce)
+                .await
+                .unwrap();
+        }
+    }
+    panic!("workflow did not settle after approving its pending commands");
+}
+
 struct Team {
     repo: Arc<InMemoryRepository>,
     requests: Mutex<Vec<CanonicalRequest>>,
@@ -99,9 +129,9 @@ impl ModelProvider for CompletionRepair {
 
 fn plan() -> serde_json::Value {
     serde_json::json!({
-        "shared_contract":"Client and server must both use port=8000. Server owns server.txt; client owns client.txt. Integration verifies both together and preserves the app.",
+        "shared_contract":"Client and server must both use port=8000. The component implementation owns server.txt and client.txt. Integration verifies both together and preserves the app.",
         "proposals":[
-            {"target_agent":"Server","objective":"components","owned_paths":["server.txt"],"acceptance_criteria":["client and server components implemented"]}
+            {"target_agent":"Server","objective":"components","owned_paths":["server.txt","client.txt"],"acceptance_criteria":["client and server components implemented"]}
         ],
         "integration":{"target_agent":"Client","objective":"integrate","acceptance_criteria":["client and server use the same port"]}
     })
@@ -283,6 +313,7 @@ async fn related_outputs_are_integrated_and_tested_before_parent_completion() {
     // Both component files have one writer; the separate integration task
     // verifies their shared contract after implementation completes.
     engine.run_task_and_schedule(root.id, 3).await.unwrap();
+    approve_commands_and_continue(&engine, &repo, session, 3).await;
     let tasks = repo.tasks().await.unwrap();
     let events = repo.events(session).await.unwrap();
     assert_eq!(
@@ -362,8 +393,9 @@ async fn incomplete_completion_feedback_keeps_work_active_for_correction() {
     });
     let (tx, mut rx) = mpsc::channel::<EngineEvent>(128);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let session = SessionId::new();
     let engine = Arc::new(
-        Engine::new(repo.clone(), provider.clone(), SessionId::new(), tx)
+        Engine::new(repo.clone(), provider.clone(), session, tx)
             .with_team_lead(lead.id)
             .with_automatic_review(true)
             .with_verified_workflow()
@@ -404,13 +436,14 @@ async fn incomplete_completion_feedback_keeps_work_active_for_correction() {
     engine.mark_ready(task.id).await.unwrap();
 
     engine.run_task_and_schedule(task.id, 1).await.unwrap();
+    approve_commands_and_continue(&engine, &repo, session, 1).await;
 
     assert_eq!(
         repo.task(task.id).await.unwrap().unwrap().status,
         TaskStatus::Completed
     );
     let requests = provider.requests.lock().await;
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 2);
     assert!(
         requests[1].messages[0]
             .content

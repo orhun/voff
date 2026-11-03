@@ -66,6 +66,16 @@ impl WorkDelegation {
     }
 }
 
+fn inherited_contract(parent: &Task, handoff: &str) -> String {
+    let root = parent.work.as_ref().map_or_else(
+        || super::root_work_contract(&parent.objective, &parent.acceptance_criteria),
+        |work| work.contract.clone(),
+    );
+    format!(
+        "{root}\n\nCURRENT HANDOFF — may refine implementation but not replace the root request:\n{handoff}"
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerificationAssignment {
@@ -761,7 +771,7 @@ fn invalid(message: impl Into<String>) -> EngineError {
 }
 
 fn validate_plan_ownership(proposals: &[DelegationProposal]) -> Result<(), EngineError> {
-    let mut claimed = Vec::<&Path>::new();
+    let mut claimed = Vec::<PathBuf>::new();
     for proposal in proposals {
         if proposal.owned_paths.is_empty() {
             return Err(invalid(
@@ -769,23 +779,12 @@ fn validate_plan_ownership(proposals: &[DelegationProposal]) -> Result<(), Engin
             ));
         }
         for path in &proposal.owned_paths {
-            if path.as_os_str().is_empty()
-                || path.is_absolute()
-                || path.components().any(|component| {
-                    !matches!(component, std::path::Component::Normal(_))
-                        || matches!(component, std::path::Component::Normal(name)
-                            if [".voff", ".ssh", ".aws", ".codex", ".claude"]
-                                .iter()
-                                .any(|denied| name == std::ffi::OsStr::new(denied)))
-                })
-            {
-                return Err(invalid(
-                    "owned_paths must be safe, workspace-relative paths",
-                ));
-            }
+            let path = normalize_workspace_scope(path).map_err(|_| {
+                invalid("owned_paths must be safe workspace-relative paths; only a trailing /** directory shorthand is supported")
+            })?;
             if claimed
                 .iter()
-                .any(|existing| path.starts_with(existing) || existing.starts_with(path))
+                .any(|existing| path.starts_with(existing) || existing.starts_with(&path))
             {
                 return Err(invalid(
                     "parallel implementation owned_paths must not overlap",
@@ -932,6 +931,11 @@ impl<R: Repository + 'static> Engine<R> {
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
                 let changes_workspace = !proposal.owned_paths.is_empty();
+                if target.tools.iter().any(|tool| tool == "file.patch") && !changes_workspace {
+                    return Err(invalid(
+                        "a delegated implementation owner requires explicit workspace-relative owned_paths; use verification_handoff for read-only verification",
+                    ));
+                }
                 if changes_workspace && !target.tools.iter().any(|tool| tool == "file.patch") {
                     return Err(invalid(
                         "implementation owner must have file.patch to produce workspace changes",
@@ -950,6 +954,40 @@ impl<R: Repository + 'static> Engine<R> {
             ));
         }
         validate_plan_ownership(&plan.proposals)?;
+        if plan
+            .proposals
+            .iter()
+            .any(|proposal| proposal.target_agent == plan.integration.target_agent)
+        {
+            return Err(invalid(
+                "integration must be independently owned by an agent that did not implement a workstream",
+            ));
+        }
+        if let Some(work) = &task.work
+            && !work.owned_paths.is_empty()
+        {
+            let delegated_paths = plan
+                .proposals
+                .iter()
+                .flat_map(|proposal| proposal.owned_paths.iter())
+                .collect::<Vec<_>>();
+            let uncovered = work.owned_paths.iter().filter(|scope| {
+                !delegated_paths.iter().any(|delegated| {
+                    delegated.as_path() == scope.as_path()
+                        || delegated.starts_with(scope)
+                        || scope.starts_with(delegated)
+                })
+            });
+            let uncovered = uncovered
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            if !uncovered.is_empty() {
+                return Err(invalid(format!(
+                    "an integration plan cannot leave parent-owned implementation implicit; assign these scopes to implementation proposals: {}",
+                    uncovered.join(", ")
+                )));
+            }
+        }
         if self
             .repo
             .tasks()
@@ -1037,9 +1075,12 @@ impl<R: Repository + 'static> Engine<R> {
                     )
                     .await?;
                 child.work = Some(WorkProgress {
-                    contract: format!(
-                        "Verification handoff for task {}: {}",
-                        parent.id, parent.objective
+                    contract: inherited_contract(
+                        &parent,
+                        &format!(
+                            "Verification handoff for task {}: {}",
+                            parent.id, parent.objective
+                        ),
                     ),
                     owned_paths: Vec::new(),
                     integration: true,
@@ -1064,6 +1105,11 @@ impl<R: Repository + 'static> Engine<R> {
                     .delegation_target(&proposal.target_agent)
                     .await?
                     .ok_or(EngineError::TaskNotFound)?;
+                let owned_paths = proposal
+                    .owned_paths
+                    .iter()
+                    .map(|path| normalize_workspace_scope(path))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut child = self
                     .delegate_task(
                         parent.id,
@@ -1073,8 +1119,11 @@ impl<R: Repository + 'static> Engine<R> {
                     )
                     .await?;
                 child.work = Some(WorkProgress {
-                    contract: format!("Bounded handoff from parent task {}", parent.id),
-                    owned_paths: Vec::new(),
+                    contract: inherited_contract(
+                        &parent,
+                        &format!("Bounded handoff from parent task {}", parent.id),
+                    ),
+                    owned_paths,
                     integration: false,
                     turns: 0,
                 });
@@ -1103,7 +1152,11 @@ impl<R: Repository + 'static> Engine<R> {
             .chain(std::iter::once(plan.integration))
             .enumerate()
         {
-            let owned_paths = proposal.owned_paths.clone();
+            let owned_paths = proposal
+                .owned_paths
+                .iter()
+                .map(|path| normalize_workspace_scope(path))
+                .collect::<Result<Vec<_>, _>>()?;
             let owner = self
                 .delegation_target(&proposal.target_agent)
                 .await?
@@ -1117,7 +1170,7 @@ impl<R: Repository + 'static> Engine<R> {
                 )
                 .await?;
             child.work = Some(WorkProgress {
-                contract: plan.shared_contract.clone(),
+                contract: inherited_contract(&parent, &plan.shared_contract),
                 owned_paths: if index < count {
                     owned_paths
                 } else {
