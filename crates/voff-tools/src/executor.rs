@@ -62,6 +62,30 @@ pub enum ExecutorError {
     #[error("process I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// Persistent servers are not bounded verification commands. Sending one to
+/// `process.test` would only turn a healthy server into a misleading timeout.
+#[must_use]
+pub fn is_long_running_server_command(program: &str, args: &[String]) -> bool {
+    let program = program.to_ascii_lowercase();
+    let first = args.first().map(|arg| arg.to_ascii_lowercase());
+    let second = args.get(1).map(|arg| arg.to_ascii_lowercase());
+
+    matches!(program.as_str(), "vite" | "next" | "webpack-dev-server")
+        || matches!(
+            (program.as_str(), first.as_deref(), second.as_deref()),
+            (
+                "npm" | "npm.cmd",
+                Some("run"),
+                Some("dev" | "start" | "serve" | "preview")
+            ) | (
+                "pnpm" | "yarn" | "bun",
+                Some("dev" | "start" | "serve" | "preview"),
+                _
+            ) | ("dotnet", Some("run" | "watch"), _)
+                | ("cargo", Some("run" | "watch"), _)
+        )
+}
 #[derive(Clone)]
 pub struct ControlledExecutor {
     root: PathBuf,
@@ -306,6 +330,20 @@ impl ControlledExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_persistent_servers_but_not_bounded_checks() {
+        assert!(is_long_running_server_command(
+            "npm",
+            &["run".into(), "dev".into()]
+        ));
+        assert!(is_long_running_server_command("dotnet", &["watch".into()]));
+        assert!(!is_long_running_server_command("npm", &["test".into()]));
+        assert!(!is_long_running_server_command(
+            "npm",
+            &["run".into(), "build".into()]
+        ));
+    }
     #[tokio::test]
     async fn denial_prevents_execution() {
         let d = tempfile::tempdir().unwrap();

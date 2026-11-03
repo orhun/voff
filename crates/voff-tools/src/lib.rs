@@ -3,8 +3,25 @@ mod executor;
 
 pub use executor::{
     CommandSpec, ControlledExecutor, ExecutionGrant, ExecutorError, ProcessResult,
-    validate_process_argv,
+    is_long_running_server_command, validate_process_argv,
 };
+
+/// Normalize one workspace ownership scope. A trailing `/**` is accepted as a
+/// directory shorthand; other glob syntax is rejected so authorization never
+/// depends on ambiguous pattern matching.
+pub fn normalize_workspace_scope(path: &Path) -> Result<PathBuf, ToolError> {
+    let text = path.to_string_lossy();
+    let normalized = text.strip_suffix("/**").unwrap_or(&text);
+    if normalized.is_empty()
+        || normalized.contains(['*', '?', '[', ']'])
+        || Path::new(normalized).is_absolute()
+    {
+        return Err(ToolError::OutsideWorkspace);
+    }
+    let normalized = PathBuf::from(normalized);
+    ScopedWorkspace::validate_relative(&normalized)?;
+    Ok(normalized)
+}
 
 /// Reduce repetitive command output before it is added to model context.
 /// The original report remains stored as the artifact preview.
@@ -553,6 +570,12 @@ fn diff_preview(before: &str, after: &str) -> String {
 }
 fn sensitive_component(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy();
+    if matches!(
+        name.as_ref(),
+        ".env.example" | ".env.sample" | ".env.template"
+    ) {
+        return false;
+    }
     matches!(
         name.as_ref(),
         ".git" | ".env" | ".voff" | ".ssh" | ".aws" | ".codex" | ".claude"
@@ -712,10 +735,26 @@ mod tests {
             w.read_text(Path::new(".env")),
             Err(ToolError::SensitivePath)
         ));
+        fs::write(d.path().join(".env.example"), "x").unwrap();
+        assert_eq!(w.read_text(Path::new(".env.example")).unwrap(), "x");
         assert!(matches!(
             w.read_text(Path::new("big")),
             Err(ToolError::TooLarge(2))
         ));
+    }
+
+    #[test]
+    fn ownership_scope_normalizes_only_safe_directory_globs() {
+        assert_eq!(
+            normalize_workspace_scope(Path::new("src/**")).unwrap(),
+            PathBuf::from("src")
+        );
+        assert_eq!(
+            normalize_workspace_scope(Path::new(".env.example")).unwrap(),
+            PathBuf::from(".env.example")
+        );
+        assert!(normalize_workspace_scope(Path::new("src/*.rs")).is_err());
+        assert!(normalize_workspace_scope(Path::new(".env.production")).is_err());
     }
     #[test]
     fn context_is_bounded() {

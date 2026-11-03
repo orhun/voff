@@ -874,7 +874,7 @@ async fn delegated_failure_returns_to_lead_and_repair_completes_parent() {
 }
 
 #[tokio::test]
-async fn automatic_repairs_reuse_the_task_and_record_retry_attempts() {
+async fn unchanged_automatic_repair_failure_stops_without_replay_loop() {
     let (engine, repo, provider, _dir, session, lead) = setup(
         vec![
             error(ProviderErrorKind::InvalidResponse),
@@ -891,7 +891,7 @@ async fn automatic_repairs_reuse_the_task_and_record_retry_attempts() {
     engine.run_task_and_schedule(task.id, 2).await.unwrap();
     engine.run_until_idle_bounded(2).await.unwrap();
     assert_eq!(repo.tasks().await.unwrap().len(), 1);
-    assert_eq!(provider.requests.lock().await.len(), 5);
+    assert_eq!(provider.requests.lock().await.len(), 3);
     assert_eq!(
         repo.events(session)
             .await
@@ -899,7 +899,18 @@ async fn automatic_repairs_reuse_the_task_and_record_retry_attempts() {
             .iter()
             .filter(|event| matches!(event.kind, CanonicalEventKind::WorkRetrying { .. }))
             .count(),
-        2
+        1
+    );
+    assert!(
+        repo.events(session)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, CanonicalEventKind::RevisionStopped { .. }))
+    );
+    assert_eq!(
+        repo.task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Blocked
     );
 }
 

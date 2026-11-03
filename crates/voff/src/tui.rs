@@ -231,6 +231,7 @@ pub struct AppModel {
     startup_scan_frame: usize,
     startup_prompt_scroll: u16,
     startup_scan_error: Option<String>,
+    project_goal: Option<String>,
     workspace_editor: Option<crate::onboarding::Wizard>,
     workspace_result: Option<PathBuf>,
     team_flow: TeamFlow,
@@ -329,6 +330,7 @@ impl AppModel {
             startup_scan_frame: 0,
             startup_prompt_scroll: 0,
             startup_scan_error: None,
+            project_goal: None,
             workspace_editor: None,
             workspace_result: None,
             team_flow: TeamFlow::default(),
@@ -2033,6 +2035,95 @@ fn new_composer() -> TextArea<'static> {
     composer.set_placeholder_text("");
     composer
 }
+
+fn bind_project_goal(
+    objective: String,
+    project_goal: Option<&str>,
+) -> (String, Option<Vec<String>>) {
+    let normalized = objective
+        .trim()
+        .to_lowercase()
+        .replace(
+            |character: char| !character.is_alphanumeric() && !character.is_whitespace(),
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let launches = [
+        "start",
+        "start the task",
+        "start task",
+        "start to task",
+        "begin the task",
+        "begin",
+        "continue",
+        "başla",
+        "göreve başla",
+        "işe başla",
+        "görevi başlat",
+        "işi başlat",
+        "devam et",
+    ];
+    let Some(goal) = project_goal
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty() && launches.contains(&normalized.as_str()))
+    else {
+        return (objective, None);
+    };
+    (
+        format!(
+            "Execute the persisted project goal below without changing its product domain or dropping requirements.\n\nPERSISTED PROJECT GOAL:\n{goal}"
+        ),
+        Some(project_goal_criteria(goal)),
+    )
+}
+
+fn project_goal_criteria(goal: &str) -> Vec<String> {
+    let mut criteria = vec![
+        "Deliver all requirements in the immutable persisted project goal without changing its product domain or silently narrowing scope."
+            .into(),
+    ];
+    for line in goal.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with('#') {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        let listed = line.starts_with('-')
+            || line.starts_with('*')
+            || line
+                .split_once('.')
+                .is_some_and(|(prefix, _)| prefix.parse::<u16>().is_ok());
+        let critical = [
+            " must ",
+            " must not ",
+            "do not ",
+            "verify ",
+            "prevent ",
+            "cannot ",
+            "should be able to",
+        ]
+        .iter()
+        .any(|phrase| format!(" {lower}").contains(phrase));
+        if listed || critical {
+            let requirement = line
+                .trim_start_matches(['-', '*', ' '])
+                .split_once('.')
+                .filter(|(prefix, _)| prefix.parse::<u16>().is_ok())
+                .map_or(line.trim_start_matches(['-', '*', ' ']), |(_, rest)| {
+                    rest.trim()
+                });
+            let criterion = format!("Explicit project requirement: {requirement}");
+            if !criteria.contains(&criterion) {
+                criteria.push(criterion);
+            }
+        }
+        if criteria.len() >= 64 {
+            break;
+        }
+    }
+    criteria
+}
 #[must_use]
 pub const fn action_for_key(code: KeyCode) -> Action {
     match code {
@@ -2495,6 +2586,7 @@ pub(crate) struct ConfiguredRun {
     pub startup_notice: Option<String>,
     pub startup_terminal_handoff: Option<crate::onboarding::TerminalHandoff>,
     pub startup_scan_pending: bool,
+    pub startup_auto_start: bool,
     pub startup_task_id: Option<voff_core::TaskId>,
     pub setup_prompts: crate::onboarding::SetupPrompts,
     pub startup_goal: Option<String>,
@@ -2505,8 +2597,9 @@ pub(crate) enum TuiExit {
     Workspace(PathBuf),
 }
 
-pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiExit>, TuiError> {
+pub(crate) async fn run_configured(mut config: ConfiguredRun) -> Result<Option<TuiExit>, TuiError> {
     let (event_tx, event_rx) = mpsc::channel(config.capacity);
+    let mut initial_tasks = std::mem::take(&mut config.initial_tasks);
     let credential_repository = Arc::clone(&config.repo);
     let composer_history = credential_repository
         .prompt_history(&config.workspace_root)
@@ -2531,6 +2624,25 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
             .with_safe_workflow(&config.workspace_root)
             .map_err(|e| TuiError::Io(io::Error::other(e)))?,
     );
+    if config.startup_auto_start
+        && let Some(goal) = config.startup_goal.as_deref()
+    {
+        let task = engine
+            .create_task(
+                config.owner,
+                format!(
+                    "Execute the persisted project goal below without changing its product domain or dropping requirements.\n\nPERSISTED PROJECT GOAL:\n{goal}"
+                ),
+                project_goal_criteria(goal),
+            )
+            .await
+            .map_err(|error| TuiError::Io(io::Error::other(error)))?;
+        let task = engine
+            .mark_ready(task.id)
+            .await
+            .map_err(|error| TuiError::Io(io::Error::other(error)))?;
+        initial_tasks.push(task);
+    }
     let (input_tx, input_rx) = mpsc::channel(32);
     let mut app = AppModel::new(config.session);
     app.automatic_review = config.automatic_review;
@@ -2545,13 +2657,14 @@ pub(crate) async fn run_configured(config: ConfiguredRun) -> Result<Option<TuiEx
     app.team_setup = config.team_setup;
     app.startup_scan_pending = config.startup_scan_pending;
     app.startup_setup_prompt = startup_setup_prompt;
+    app.project_goal = config.startup_goal.clone();
     app.startup_popup_size = config.startup_popup_size;
     if let Some(notice) = config.startup_notice {
         let _ = app.notify("Team updated", &notice, Level::Info, theme::GREEN, false);
     }
     restore_initial_history(
         &mut app,
-        config.initial_tasks,
+        initial_tasks,
         config.initial_events,
         config.initial_approvals,
         config.initial_artifacts,
@@ -2760,6 +2873,7 @@ async fn terminal_loop<R: Repository + 'static>(
     if model.startup_scan_pending {
         let workspace = model.workspace_root.clone();
         let previous = model.team_setup.clone();
+        let startup_goal = startup_goal.clone();
         tokio::spawn(async move {
             let result = match (
                 startup_scan_provider,
@@ -2943,19 +3057,23 @@ async fn terminal_loop<R: Repository + 'static>(
                                     false,
                                 );
                             }
+                            let (objective, goal_criterion) = bind_project_goal(
+                                objective,
+                                model.project_goal.as_deref(),
+                            );
                             let role_target = model
                                 .composer_target()
                                 .filter(|agent| Some(agent.id) != model.team_lead)
                                 .map(|agent| (agent.id, agent.name.clone()));
                             let routed = model.routed_objective(&objective);
-                            let acceptance_criteria = vec![
+                            let acceptance_criteria = goal_criterion.unwrap_or_else(|| vec![
                                 if role_target.is_some() {
                                     "Team Lead delegates to the requested role and integrates its response, answers directly, or reports a blocker"
                                 } else {
                                     "Team Lead answers directly, completes the requested work, or delegates and integrates it"
                                 }
                                 .into(),
-                            ];
+                            ]);
                             model.pending_submissions += 1;
                             if let Some((id, name)) = &role_target {
                                 model.role_requests.push((*id, objective.clone()));
@@ -6511,6 +6629,51 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn launch_commands_bind_the_persisted_project_goal_but_new_tasks_do_not() {
+        let goal = "Build the Turkish construction-site operations application";
+        for command in [
+            "start the task",
+            "start to task",
+            "Start task!",
+            "görevi başlat",
+            "göreve başla",
+            "devam et",
+        ] {
+            let (objective, criterion) = bind_project_goal(command.into(), Some(goal));
+            assert!(objective.contains(goal));
+            assert!(criterion.unwrap()[0].contains("immutable persisted project goal"));
+        }
+        let (objective, criterion) =
+            bind_project_goal("Explain the current status".into(), Some(goal));
+        assert_eq!(objective, "Explain the current status");
+        assert!(criterion.is_none());
+    }
+
+    #[test]
+    fn persisted_goal_bullets_become_individual_acceptance_criteria() {
+        let criteria = project_goal_criteria(
+            "Build the application.\n- Task board with details\n- Daily reports with photos",
+        );
+        assert_eq!(criteria.len(), 3);
+        assert!(criteria[1].contains("Task board with details"));
+        assert!(criteria[2].contains("Daily reports with photos"));
+    }
+
+    #[test]
+    fn numbered_and_mandatory_requirements_become_acceptance_criteria() {
+        let criteria = project_goal_criteria(
+            "Users must only access their own orders.\n1. Verify concurrent purchase safety.\n## Delivery",
+        );
+        assert_eq!(criteria.len(), 3);
+        assert!(criteria.iter().any(|item| item.contains("own orders")));
+        assert!(
+            criteria
+                .iter()
+                .any(|item| item.contains("concurrent purchase"))
+        );
+    }
 
     #[tokio::test]
     async fn startup_builder_task_records_result_and_failure() {

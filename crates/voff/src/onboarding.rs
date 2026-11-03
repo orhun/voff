@@ -44,6 +44,18 @@ use voff_provider::{
 };
 
 const DEFAULT_OUTPUT_TOKENS: u64 = voff_core::DEFAULT_MAX_OUTPUT_TOKENS;
+const MAX_PROJECT_GOAL_CHARS: usize = 10_000;
+
+fn append_project_goal(description: &mut String, value: &str) {
+    let remaining = MAX_PROJECT_GOAL_CHARS.saturating_sub(description.chars().count());
+    let value = value.replace("\r\n", "\n").replace('\r', "\n");
+    description.extend(
+        value
+            .chars()
+            .filter(|character| *character == '\n' || !character.is_control())
+            .take(remaining),
+    );
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -1798,9 +1810,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     if focused == StartupField::Goal
                         && key.modifiers.contains(KeyModifiers::SHIFT) =>
                 {
-                    if description.chars().count() < 1200 {
-                        description.push('\n');
-                    }
+                    append_project_goal(&mut description, "\n");
                     error = None;
                 }
                 KeyCode::Tab => {
@@ -1886,9 +1896,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !character.is_control() =>
                 {
-                    if description.chars().count() < 1200 {
-                        description.push(character);
-                    }
+                    append_project_goal(&mut description, &character.to_string());
                     error = None;
                 }
                 KeyCode::Char(character)
@@ -1910,14 +1918,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                 _ => {}
             },
             Event::Paste(value) if focused == StartupField::Goal => {
-                let remaining = 1200usize.saturating_sub(description.chars().count());
-                let value = value.replace("\r\n", "\n").replace('\r', "\n");
-                description.extend(
-                    value
-                        .chars()
-                        .filter(|character| *character == '\n' || !character.is_control())
-                        .take(remaining),
-                );
+                append_project_goal(&mut description, &value);
                 error = None;
             }
             Event::Paste(value) if focused == StartupField::ApiKey => {
@@ -4345,6 +4346,15 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
 
+    #[test]
+    fn project_goal_accepts_ten_thousand_characters_without_silent_overflow() {
+        let mut goal = String::new();
+        append_project_goal(&mut goal, &"ğ".repeat(MAX_PROJECT_GOAL_CHARS + 25));
+        assert_eq!(goal.chars().count(), 10_000);
+        append_project_goal(&mut goal, "ignored");
+        assert_eq!(goal.chars().count(), 10_000);
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -4626,7 +4636,10 @@ mod tests {
         assert_eq!(picker.step, Step::WorkspacePicker);
         picker.handle_key(key(KeyCode::Char(' ')));
         assert!(picker.complete());
-        assert_eq!(picker.selected_workspace(), workspace.path());
+        assert_eq!(
+            picker.selected_workspace().canonicalize().unwrap(),
+            workspace.path().canonicalize().unwrap()
+        );
 
         let mut picker = Wizard::workspace(workspace.path());
         picker.handle_key(key(KeyCode::Esc));
@@ -5323,7 +5336,7 @@ mod tests {
         wizard.handle_key(key(KeyCode::Char(' ')));
 
         assert_eq!(
-            wizard.working_directory,
+            wizard.working_directory.canonicalize().unwrap(),
             directory.path().canonicalize().unwrap()
         );
     }

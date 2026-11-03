@@ -115,6 +115,7 @@ struct GeneratedFileAgent {
 #[derive(Clone)]
 struct StartupState {
     scan_pending: bool,
+    auto_start_pending: bool,
     setup_prompts: onboarding::SetupPrompts,
     goal: Option<String>,
     popup_size: Option<(u16, u16)>,
@@ -188,6 +189,7 @@ async fn application(cli: Cli) -> Result<()> {
         let mut startup_notice = None;
         let mut startup = StartupState {
             scan_pending: false,
+            auto_start_pending: false,
             setup_prompts: setup_prompts.clone(),
             goal: None,
             popup_size: None,
@@ -324,6 +326,20 @@ fn requested_workspace(argument: Option<PathBuf>, configured: Option<PathBuf>) -
         workspace.display()
     );
     Ok(workspace)
+}
+
+fn recover_project_goal(tasks: &[Task]) -> Option<String> {
+    const MARKER: &str = "Requested outcome:\n";
+    tasks
+        .iter()
+        .filter_map(|task| {
+            task.objective
+                .split_once(MARKER)
+                .map(|(_, goal)| (task.created_at, goal.trim()))
+        })
+        .filter(|(_, goal)| !goal.is_empty())
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, goal)| goal.to_owned())
 }
 
 fn load_workspace_setup_config(
@@ -841,6 +857,7 @@ async fn run(
         }
         save_team(&repository, &draft).await?;
         let session_startup = startup.clone();
+        startup.auto_start_pending = false;
         let outcome = run_session(
             config,
             state_path,
@@ -856,12 +873,14 @@ async fn run(
                 draft = edited;
                 session = Some(session_id);
                 startup_notice = notice;
+                let completed_goal_scan = startup.scan_pending && startup.goal.is_some();
                 let default_notice = if startup.scan_pending {
                     "Workspace scan completed."
                 } else {
                     "Agent settings updated."
                 };
                 startup.scan_pending = false;
+                startup.auto_start_pending |= completed_goal_scan;
                 let update_notice = startup_notice
                     .take()
                     .unwrap_or_else(|| default_notice.into());
@@ -1092,15 +1111,28 @@ async fn run_session(
     let workspace = ScopedWorkspace::new(&workspace_root, 256 * 1024)?;
     let workspace_context = workspace.context_bundle(200, 64 * 1024)?;
     let team_setup = setup_draft_for_team(&config, &agent_profiles);
+    let project_goal = if let Some(goal) = startup.goal.as_ref() {
+        repo.save_setting("project_goal", goal).await?;
+        Some(goal.clone())
+    } else if let Some(goal) = repo.setting("project_goal").await? {
+        Some(goal)
+    } else {
+        let recovered = recover_project_goal(&repo.tasks().await?);
+        if let Some(goal) = recovered.as_ref() {
+            repo.save_setting("project_goal", goal).await?;
+        }
+        recovered
+    };
     let edited = tui::run_configured(tui::ConfiguredRun {
         startup_terminal_handoff,
         team_setup,
         startup_notice,
         startup_scan_pending: startup.scan_pending,
+        startup_auto_start: startup.auto_start_pending,
         startup_task_id,
         awake,
         setup_prompts: startup.setup_prompts,
-        startup_goal: startup.goal,
+        startup_goal: project_goal,
         startup_popup_size: startup.popup_size,
         automatic_review: config.runtime.automatic_review,
         repo,
@@ -1420,6 +1452,18 @@ fn provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_formation_task_recovers_the_exact_project_goal() {
+        let goal = "Build a construction operations application.\n- Include daily reports.";
+        let task = Task::root(
+            AgentId::new(),
+            format!("Design a team.\n\nRequested outcome:\n{goal}"),
+            vec![],
+            TaskLimits::default(),
+        );
+        assert_eq!(recover_project_goal(&[task]).as_deref(), Some(goal));
+    }
 
     fn draft() -> SetupDraft {
         SetupDraft {

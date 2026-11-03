@@ -129,9 +129,9 @@ impl ModelProvider for CompletionRepair {
 
 fn plan() -> serde_json::Value {
     serde_json::json!({
-        "shared_contract":"Client and server must both use port=8000. Server owns server.txt; client owns client.txt. Integration verifies both together and preserves the app.",
+        "shared_contract":"Client and server must both use port=8000. The component implementation owns server.txt and client.txt. Integration verifies both together and preserves the app.",
         "proposals":[
-            {"target_agent":"Server","objective":"components","owned_paths":["server.txt"],"acceptance_criteria":["client and server components implemented"]}
+            {"target_agent":"Server","objective":"components","owned_paths":["server.txt","client.txt"],"acceptance_criteria":["client and server components implemented"]}
         ],
         "integration":{"target_agent":"Client","objective":"integrate","acceptance_criteria":["client and server use the same port"]}
     })

@@ -16,7 +16,7 @@ use voff_provider::*;
 use voff_storage::{Repository, RepositoryError};
 use voff_tools::{
     CommandSpec, ControlledExecutor, ExecutionGrant, ExecutorError, PatchProposal, ScopedWorkspace,
-    ToolError, validate_process_argv,
+    ToolError, is_long_running_server_command, normalize_workspace_scope, validate_process_argv,
 };
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -188,7 +188,34 @@ fn validate_patch_batch(patches: &PatchArguments) -> Result<(), EngineError> {
             "file.patch paths must be unique and cannot contain one another".into(),
         ));
     }
+    let unpinned_manifest = match patches {
+        PatchArguments::Single(patch) => {
+            patch.path == Path::new("package.json")
+                && package_manifest_uses_latest(&patch.replacement)
+        }
+        PatchArguments::Batch(batch) => batch.patches.iter().any(|patch| {
+            patch.path == Path::new("package.json")
+                && package_manifest_uses_latest(&patch.replacement)
+        }),
+    };
+    if unpinned_manifest {
+        return Err(EngineError::InvalidDelegationPlan(
+            "package.json dependencies must use explicit versions compatible with the detected runtime; the unbounded 'latest' tag is not allowed"
+                .into(),
+        ));
+    }
     Ok(())
+}
+
+fn package_manifest_uses_latest(replacement: &str) -> bool {
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(replacement) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .into_iter()
+        .filter_map(|name| manifest.get(name).and_then(serde_json::Value::as_object))
+        .flat_map(|section| section.values())
+        .any(|version| version.as_str() == Some("latest"))
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -582,11 +609,12 @@ impl<R: Repository + 'static> Engine<R> {
             .await?
             .and_then(|a| a.delegation_limits)
             .unwrap_or_default();
+        let root_contract = root_work_contract(&objective, &criteria);
         let mut t = Task::root(owner, objective, criteria, limits);
         t.requested_target = requested_target;
         if self.verified_workflow {
             t.work = Some(WorkProgress {
-                contract: String::new(),
+                contract: root_contract,
                 owned_paths: Vec::new(),
                 integration: false,
                 turns: 0,
@@ -2974,6 +3002,21 @@ impl<R: Repository + 'static> Engine<R> {
                 .iter()
                 .all(|child| child.status == TaskStatus::Completed)
             {
+                let has_verified_integration = children
+                    .iter()
+                    .any(|child| child.work.as_ref().is_some_and(|work| work.integration));
+                if parent.work.is_some() && !has_verified_integration {
+                    self.record(
+                        Some(parent.id),
+                        CanonicalEventKind::ProviderWarning(
+                            "All delegated tasks completed. The parent must now verify the immutable root request and submit its own task.complete evidence; child completion alone is not final acceptance."
+                                .into(),
+                        ),
+                    )
+                    .await?;
+                    self.transition(parent.id, TaskStatus::Ready).await?;
+                    continue;
+                }
                 let results = children
                     .iter()
                     .filter_map(|child| child.result.as_ref())
@@ -3080,6 +3123,14 @@ impl<R: Repository + 'static> Engine<R> {
                 return Err(EngineError::InvalidDelegationPlan(
                     "child objective cannot be empty".into(),
                 ));
+            }
+            for path in &proposal.owned_paths {
+                normalize_workspace_scope(path).map_err(|_| {
+                    EngineError::InvalidDelegationPlan(
+                        "owned_paths conflict with workspace safety policy; use safe relative paths and only a trailing /** directory shorthand"
+                            .into(),
+                    )
+                })?;
             }
             let target = self
                 .delegation_target(&proposal.target_agent)
@@ -3422,6 +3473,18 @@ impl<R: Repository + 'static> Engine<R> {
             .map_err(|_| EngineError::ChannelClosed)
     }
 }
+
+fn root_work_contract(objective: &str, criteria: &[String]) -> String {
+    let criteria = criteria
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| format!("AC-{}: {criterion}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "IMMUTABLE ROOT REQUEST — preserve this product domain and every acceptance requirement across delegation and recovery.\nObjective:\n{objective}\nRoot acceptance:\n{criteria}"
+    )
+}
 fn latest_attempt(tasks: &[Task], id: TaskId) -> Option<&Task> {
     let mut task = tasks.iter().find(|task| task.id == id)?;
     // Bounded even for malformed imported history.
@@ -3606,6 +3669,12 @@ fn command_spec(
 ) -> Result<(CommandSpec, String, bool), EngineError> {
     let (program, args, purpose, verification) = request.invocation()?;
     validate_process_argv(&program, &args)?;
+    if is_long_running_server_command(&program, &args) {
+        return Err(ExecutorError::InvalidInvocation(
+            "persistent development servers cannot be bounded verification; run build/tests or a finite smoke test that starts and stops its own server",
+        )
+        .into());
+    }
     Ok((
         CommandSpec {
             program,
@@ -4061,6 +4130,98 @@ mod tests {
         assert!(schema["properties"]["program"].is_object());
         assert!(schema["properties"]["args"]["items"]["type"].is_string());
         assert!(schema["properties"]["command"].is_null());
+
+        let persistent_server = TestArguments {
+            program: Some("npm".into()),
+            args: vec!["run".into(), "dev".into()],
+            purpose: Some("Check the development server".into()),
+            verification: Some(true),
+            command: None,
+        };
+        let error = command_spec(&persistent_server, Path::new(".")).unwrap_err();
+        assert!(error.to_string().contains("persistent development servers"));
+
+        let latest_manifest: PatchArguments = serde_json::from_value(serde_json::json!({
+            "path": "package.json",
+            "replacement": "{\"dependencies\":{\"react\":\"latest\"}}"
+        }))
+        .unwrap();
+        assert!(validate_patch_batch(&latest_manifest).is_err());
+        let pinned_manifest: PatchArguments = serde_json::from_value(serde_json::json!({
+            "path": "package.json",
+            "replacement": "{\"dependencies\":{\"react\":\"19.1.0\"}}"
+        }))
+        .unwrap();
+        assert!(validate_patch_batch(&pinned_manifest).is_ok());
+    }
+
+    #[tokio::test]
+    async fn verified_root_contract_preserves_objective_and_acceptance() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo,
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        )
+        .with_verified_workflow();
+        let task = engine
+            .create_task(
+                AgentId::new(),
+                "Build the Turkish construction operations application",
+                vec!["Daily reports persist locally".into()],
+            )
+            .await
+            .unwrap();
+        let contract = &task.work.unwrap().contract;
+        assert!(contract.contains("Build the Turkish construction operations application"));
+        assert!(contract.contains("Daily reports persist locally"));
+        assert!(contract.contains("IMMUTABLE ROOT REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn completed_children_return_verified_parent_for_final_acceptance() {
+        let repo = Arc::new(InMemoryRepository::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = Engine::new(
+            repo.clone(),
+            Arc::new(MockProvider::success("unused")),
+            SessionId::new(),
+            tx,
+        )
+        .with_verified_workflow();
+        let parent = engine
+            .create_task(AgentId::new(), "build product", vec!["works".into()])
+            .await
+            .unwrap();
+        engine.mark_ready(parent.id).await.unwrap();
+        engine
+            .transition(parent.id, TaskStatus::Running)
+            .await
+            .unwrap();
+        let mut child = engine
+            .delegate_task(
+                parent.id,
+                AgentId::new(),
+                "implement".into(),
+                vec!["done".into()],
+            )
+            .await
+            .unwrap();
+        child.status = TaskStatus::Completed;
+        child.result = Some(TaskResult {
+            summary: "implemented".into(),
+            evidence: vec![],
+        });
+        repo.save_task(child).await.unwrap();
+
+        engine.finalize_parent_tasks().await.unwrap();
+
+        assert_eq!(
+            repo.task(parent.id).await.unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
     }
 
     #[tokio::test]

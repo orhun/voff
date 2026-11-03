@@ -158,12 +158,58 @@ impl<R: Repository + 'static> Engine<R> {
                     continue;
                 }
                 let guidance = format!("{}{feedback}", prompts::REJECTED_PROPOSAL_RETRY_PREFIX);
-                self.schedule_repair(task, &guidance, None, None).await?;
+                self.schedule_repair(task, &guidance, None, None, None)
+                    .await?;
                 continue;
             }
             let Some(failure) = failure else {
                 continue;
             };
+            let duplicate_failures = events
+                .iter()
+                .filter(|event| event.task_id == Some(task.id))
+                .filter(|event| {
+                    matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason } if reason == failure)
+                })
+                .count();
+            if duplicate_failures >= 2 {
+                let already_stopped = events.iter().any(|event| {
+                    event.task_id == Some(task.id)
+                        && matches!(&event.kind, CanonicalEventKind::RevisionStopped(reason)
+                            if reason.contains("unchanged recovery failure"))
+                });
+                if !already_stopped {
+                    self.record(
+                        Some(task.id),
+                        CanonicalEventKind::RevisionStopped(
+                            "The unchanged recovery failure repeated without new workspace evidence. Voff stopped replaying the same action; this duplicate did not consume another recovery attempt."
+                                .into(),
+                        ),
+                    )
+                    .await?;
+                }
+                let mut ancestor = task.parent;
+                while let Some(parent_id) = ancestor {
+                    let Some(parent) = self.repo.task(parent_id).await? else {
+                        break;
+                    };
+                    ancestor = parent.parent;
+                    if parent.status == TaskStatus::Running {
+                        self.record(
+                            Some(parent.id),
+                            CanonicalEventKind::WorkRecoveryRequested {
+                                reason: format!(
+                                    "delegated task {} requires manual intervention after an unchanged recovery failure",
+                                    task.id
+                                ),
+                            },
+                        )
+                        .await?;
+                        self.transition(parent.id, TaskStatus::Blocked).await?;
+                    }
+                }
+                continue;
+            }
             if !children_have_settled_attempts(task.id, &tasks) {
                 continue;
             }
@@ -194,7 +240,8 @@ impl<R: Repository + 'static> Engine<R> {
                         // Older persisted sessions recorded approval before
                         // scheduling the in-place recovery. Finish that action
                         // after restart rather than leaving the task stranded.
-                        self.schedule_repair(task, reason, None, None).await?;
+                        self.schedule_repair(task, reason, None, None, Some(failure))
+                            .await?;
                         continue;
                     }
                     CanonicalEventKind::LeadReviewFinished { reason, .. }
@@ -409,8 +456,14 @@ impl<R: Repository + 'static> Engine<R> {
                 .await?;
                 continue;
             }
-            self.schedule_repair(task, &verdict.reason, reassignment, owned_paths)
-                .await?;
+            self.schedule_repair(
+                task,
+                &verdict.reason,
+                reassignment,
+                owned_paths,
+                Some(failure),
+            )
+            .await?;
             self.record(
                 Some(task.id),
                 CanonicalEventKind::LeadReviewFinished {
@@ -431,6 +484,7 @@ impl<R: Repository + 'static> Engine<R> {
         guidance: &str,
         new_owner: Option<AgentId>,
         owned_paths: Option<Vec<PathBuf>>,
+        failure: Option<&str>,
     ) -> Result<(), EngineError> {
         let _approval_guard = self.approval_lock.lock().await;
         if self.repo.events(self.session).await?.iter().any(|event| {
@@ -446,11 +500,26 @@ impl<R: Repository + 'static> Engine<R> {
             return Ok(());
         }
         let events = self.repo.events(self.session).await?;
-        let attempt = next_work_retry_attempt(&events, task.id);
+        let attempt = next_work_retry_attempt(&events, task.id, failure);
+        if attempt > 3 {
+            self.record(
+                Some(task.id),
+                CanonicalEventKind::ProviderFailed(
+                    "automatic recovery stopped after 3 attempts; manual review is required".into(),
+                ),
+            )
+            .await?;
+            self.transition(task.id, TaskStatus::Failed).await?;
+            return Ok(());
+        }
         let old_owner = current.owner;
         if let Some(new_owner) = new_owner {
             current.owner = new_owner;
         }
+        // A recovery must start a fresh provider turn. Reusing the failed
+        // continuation can replay the exact denied tool call before the model
+        // sees the corrective workflow feedback.
+        current.provider_session = None;
         let scope_note = owned_paths.as_ref().map(|paths| {
             if paths.is_empty() {
                 "all workspace paths".to_owned()
@@ -463,6 +532,18 @@ impl<R: Repository + 'static> Engine<R> {
             }
         });
         if let (Some(work), Some(owned_paths)) = (&mut current.work, owned_paths) {
+            if !work.owned_paths.is_empty()
+                && owned_paths.iter().any(|candidate| {
+                    !work
+                        .owned_paths
+                        .iter()
+                        .any(|scope| candidate == scope || candidate.starts_with(scope))
+                })
+            {
+                return Err(EngineError::InvalidDelegationPlan(
+                    "recovery cannot widen the task's persisted owned_paths".into(),
+                ));
+            }
             work.owned_paths = owned_paths;
         }
         self.repo.save_task(current.clone()).await?;
@@ -506,6 +587,25 @@ impl<R: Repository + 'static> Engine<R> {
             .await?;
         }
         self.transition(task.id, TaskStatus::Ready).await?;
+        let mut ancestor = current.parent;
+        while let Some(parent_id) = ancestor {
+            let Some(parent) = self.repo.task(parent_id).await? else {
+                break;
+            };
+            ancestor = parent.parent;
+            if parent.status == TaskStatus::Blocked {
+                self.transition(parent.id, TaskStatus::Ready).await?;
+                self.transition(parent.id, TaskStatus::Running).await?;
+                self.record(
+                    Some(parent.id),
+                    CanonicalEventKind::ProviderWarning(format!(
+                        "Delegated task {} recovered and is ready; the parent workflow resumed automatically.",
+                        task.id
+                    )),
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -808,7 +908,12 @@ impl<R: Repository + 'static> Engine<R> {
             EngineError::Tool(_)
                 | EngineError::InvalidDelegationPlan(_)
                 | EngineError::TeamLeadRequired
-                | EngineError::Executor(ExecutorError::Denied | ExecutorError::OutsideWorkspace)
+                | EngineError::Executor(
+                    ExecutorError::Denied
+                        | ExecutorError::OutsideWorkspace
+                        | ExecutorError::InvalidInvocation(_)
+                        | ExecutorError::Timeout
+                )
         ) || missing_test_program;
         let recovery_review = self.automatic_review && (recoverable || diagnosable);
         if recovery_review {
@@ -823,13 +928,20 @@ impl<R: Repository + 'static> Engine<R> {
                 CanonicalEventKind::WorkRecoveryRequested { reason },
             )
             .await?;
+        } else if matches!(error, EngineError::Executor(ExecutorError::Io(_))) {
+            self.record(
+                Some(id),
+                CanonicalEventKind::ApplicationIssue(format!(
+                    "{error}. The local verification process could not be started or read; provider login and model availability are unrelated."
+                )),
+            )
+            .await?;
         } else if matches!(
             error,
             EngineError::Provider(_)
                 | EngineError::ContinuationLimit
                 | EngineError::ProviderRouteNotFound(_)
                 | EngineError::InvalidOutputTokenLimit(_)
-                | EngineError::Executor(ExecutorError::Io(_) | ExecutorError::Timeout)
         ) {
             self.record(Some(id), CanonicalEventKind::ApplicationIssue(format!("{error}. Check provider login, availability, and application limits; no automatic permission or token increase was made."))).await?;
         }
@@ -912,15 +1024,50 @@ fn children_have_settled_attempts(task_id: TaskId, tasks: &[Task]) -> bool {
         })
 }
 
-fn next_work_retry_attempt(events: &[CanonicalEvent], task_id: TaskId) -> u32 {
+fn recovery_category(reason: &str) -> &'static str {
+    if reason.contains("sensitive path") {
+        "sensitive_path"
+    } else if reason.contains("outside the authorized root") {
+        "workspace_scope"
+    } else if reason.contains("invalid tool arguments") {
+        "tool_schema"
+    } else if reason.starts_with("provider:") {
+        "provider"
+    } else if reason.starts_with("verification command") {
+        "verification"
+    } else if reason.starts_with("worker-reported blocker") {
+        "worker_blocker"
+    } else {
+        "other"
+    }
+}
+
+fn next_work_retry_attempt(
+    events: &[CanonicalEvent],
+    task_id: TaskId,
+    failure: Option<&str>,
+) -> u32 {
+    let Some(failure) = failure else {
+        return events
+            .iter()
+            .filter(|event| {
+                event.task_id == Some(task_id)
+                    && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+            })
+            .count()
+            .saturating_add(1)
+            .min(u32::MAX as usize) as u32;
+    };
+    let category = recovery_category(failure);
     events
         .iter()
+        .filter(|event| event.task_id == Some(task_id))
         .filter(|event| {
-            event.task_id == Some(task_id)
-                && matches!(event.kind, CanonicalEventKind::WorkRetrying { .. })
+            matches!(&event.kind, CanonicalEventKind::WorkRecoveryRequested { reason }
+                if recovery_category(reason) == category)
         })
         .count()
-        .saturating_add(1)
+        .max(1)
         .min(u32::MAX as usize) as u32
 }
 
@@ -939,22 +1086,10 @@ fn invalid_verdict() -> Verdict {
 fn validate_recovery_paths(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut validated = Vec::with_capacity(paths.len());
     for path in paths {
-        let path = PathBuf::from(path);
-        if path.as_os_str().is_empty()
-            || path.is_absolute()
-            || path.components().any(|component| {
-                !matches!(component, std::path::Component::Normal(_))
-                    || matches!(component, std::path::Component::Normal(name)
-                        if [".voff", ".ssh", ".aws", ".codex", ".claude"]
-                            .iter()
-                            .any(|denied| name == std::ffi::OsStr::new(denied)))
-            })
-        {
-            return Err(
-                "Recovery scope rejected: owned_paths must contain only safe workspace-relative paths."
-                    .into(),
-            );
-        }
+        let path = normalize_workspace_scope(Path::new(path)).map_err(|_| {
+            "Recovery scope rejected: owned_paths must contain only safe workspace-relative paths; only a trailing /** directory shorthand is supported."
+                .to_owned()
+        })?;
         validated.push(path);
     }
     Ok(validated)
@@ -964,6 +1099,33 @@ fn validate_recovery_paths(paths: &[String]) -> Result<Vec<PathBuf>, String> {
 mod tests {
     use super::*;
     use voff_storage::InMemoryRepository;
+
+    #[test]
+    fn recovery_attempts_are_scoped_by_failure_category() {
+        let task_id = TaskId::new();
+        let event = |reason: &str| CanonicalEvent {
+            id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: Some(task_id),
+            created_at: chrono::Utc::now(),
+            kind: CanonicalEventKind::WorkRecoveryRequested {
+                reason: reason.into(),
+            },
+        };
+        let events = vec![
+            event("tool: sensitive path is denied"),
+            event("tool: sensitive path is denied for another file"),
+            event("provider: provider InvalidResponse"),
+        ];
+        assert_eq!(
+            next_work_retry_attempt(&events, task_id, Some("tool: sensitive path is denied")),
+            2
+        );
+        assert_eq!(
+            next_work_retry_attempt(&events, task_id, Some("provider: provider InvalidResponse")),
+            1
+        );
+    }
     #[test]
     fn review_policy_allows_app_config_but_not_security_changes() {
         assert!(REVIEW_POLICY.contains("Vite proxies"));
