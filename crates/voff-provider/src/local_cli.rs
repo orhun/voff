@@ -34,6 +34,26 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
     "SSL_CERT_DIR",
 ];
 
+// Native Windows CLIs need these for profile, routing and runtime discovery.
+// Keep the environment allowlist explicit; never inherit API keys implicitly.
+#[cfg(windows)]
+const WINDOWS_ENVIRONMENT: &[&str] = &[
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "TEMP",
+    "TMP",
+    "COMSPEC",
+    "PATHEXT",
+];
+#[cfg(not(windows))]
+const WINDOWS_ENVIRONMENT: &[&str] = &[];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalCliKind {
     Codex,
@@ -337,7 +357,7 @@ pub(super) fn configure_environment(command: &mut Command) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for key in ALLOWED_ENVIRONMENT {
+    for key in ALLOWED_ENVIRONMENT.iter().chain(WINDOWS_ENVIRONMENT) {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
         }
@@ -745,6 +765,27 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use voff_core::{MessageId, TaskId};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cli_preserves_runtime_environment_without_api_keys() {
+        let mut command = Command::new("codex");
+        configure_environment(&mut command);
+        let configured = command
+            .as_std()
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        for key in WINDOWS_ENVIRONMENT {
+            if let Some(value) = std::env::var_os(key) {
+                assert_eq!(
+                    configured.get(std::ffi::OsStr::new(key)),
+                    Some(&Some(value.as_os_str()))
+                );
+            }
+        }
+        assert!(!configured.contains_key(std::ffi::OsStr::new("OPENAI_API_KEY")));
+        assert!(!configured.contains_key(std::ffi::OsStr::new("ANTHROPIC_API_KEY")));
+    }
 
     fn request(choice: ToolChoice) -> CanonicalRequest {
         CanonicalRequest {
