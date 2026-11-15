@@ -3206,6 +3206,9 @@ async fn terminal_loop<R: Repository + 'static>(
             }
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
+                if let Some(editor) = model.setup_editor.as_mut() {
+                    editor.refresh_provider_metadata();
+                }
                 model.startup_scan_frame = model.startup_scan_frame.wrapping_add(1);
                 if model.startup_scan_pending
                     && let Some(result) = model.startup_scan_result.take()
@@ -5287,6 +5290,7 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
             runtime_models: &app.agent_runtime_models,
             estimated_costs: &app.agent_estimated_costs,
             provider_kinds: &app.agent_provider_kinds,
+            team_setup: app.team_setup.as_ref(),
             team_lead: app.team_lead,
         },
         app.selected_agent,
@@ -5347,6 +5351,7 @@ fn agent_usage_rows(app: &AppModel) -> Vec<AgentUsageRow> {
                 provider: match provider {
                     "codex_cli" => "Codex CLI",
                     "claude_cli" => "Claude CLI",
+                    "llamacpp" => "llama.cpp",
                     "ollama" => "Ollama",
                     "openai" => "OpenAI API",
                     "anthropic" => "Claude API",

@@ -58,7 +58,7 @@ Other installation methods:
 
 ## Features
 
-- Mix providers and models from **Codex**, **Claude**, and **Ollama** in one team.
+- Mix providers and models from **Codex**, **Claude**, **Ollama**, and **llama.cpp** in one team.
 - Delegate through nested teams and run independent tasks in parallel.
 - Track token usage and per-agent cost estimates.
 

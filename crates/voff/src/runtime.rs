@@ -30,11 +30,29 @@ pub struct RuntimeConfig {
 #[derive(Clone, Debug)]
 pub enum ProviderConfig {
     Mock,
-    Ollama { base_url: String, model: String },
-    Openai { model: String, api_key_env: String },
-    Anthropic { model: String, api_key_env: String },
-    CodexCli { model: String },
-    ClaudeCli { model: String },
+    LlamaCpp {
+        base_url: String,
+        model: String,
+        reasoning_effort: Option<voff_provider::ReasoningEffort>,
+    },
+    Ollama {
+        base_url: String,
+        model: String,
+    },
+    Openai {
+        model: String,
+        api_key_env: String,
+    },
+    Anthropic {
+        model: String,
+        api_key_env: String,
+    },
+    CodexCli {
+        model: String,
+    },
+    ClaudeCli {
+        model: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +222,19 @@ fn validate_agent(tools: &[String], max_output_tokens: u64) -> Result<(), Runtim
 fn validate_provider(provider: &ProviderConfig) -> Result<(), RuntimeError> {
     match provider {
         ProviderConfig::Mock => Ok(()),
+        ProviderConfig::LlamaCpp {
+            base_url, model, ..
+        } => {
+            if model.trim().is_empty()
+                || voff_provider::LlamaCppProvider::new(base_url.clone()).is_err()
+            {
+                Err(RuntimeError::Invalid(
+                    "invalid llama.cpp endpoint or empty model",
+                ))
+            } else {
+                Ok(())
+            }
+        }
         ProviderConfig::Ollama { base_url, model } => {
             if model.trim().is_empty()
                 || !(base_url.starts_with("http://localhost:")

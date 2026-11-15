@@ -7,7 +7,9 @@ mod openai_stream;
 mod response;
 pub use response::{collect_response, collect_response_with_preview};
 
-pub use adapters::{AnthropicProvider, MockProvider, MockStep, OllamaProvider, OpenAiProvider};
+pub use adapters::{
+    AnthropicProvider, LlamaCppProvider, MockProvider, MockStep, OllamaProvider, OpenAiProvider,
+};
 pub use local_cli::{LocalCliKind, LocalCliProvider};
 
 use async_trait::async_trait;
@@ -20,6 +22,20 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use voff_core::{MessageId, TaskId, ToolCallId};
+
+/// Requested inference effort; support depends on the selected model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Default,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderDescriptor {

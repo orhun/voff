@@ -163,6 +163,171 @@ impl ModelProvider for OllamaProvider {
     }
 }
 
+/// llama.cpp server using its OpenAI-compatible chat completions API.
+#[derive(Clone)]
+pub struct LlamaCppProvider {
+    client: openai::CompletionsClient,
+    http: reqwest::Client,
+    base_url: String,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+}
+
+impl LlamaCppProvider {
+    /// Read capabilities for exactly the requested model (also works through a router).
+    /// A router may load that model to report its template capabilities.
+    pub async fn reasoning_efforts(
+        &self,
+        model: &str,
+    ) -> Result<Option<Vec<crate::ReasoningEffort>>, ProviderError> {
+        let mut url = reqwest::Url::parse(&format!("{}/props", self.base_url))
+            .map_err(|_| llama_endpoint_error())?;
+        url.query_pairs_mut().append_pair("model", model);
+        let mut response = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|_| response::invalid("llama.cpp model properties are unavailable"))?;
+        if !response.status().is_success() {
+            return Err(response::invalid(
+                "llama.cpp model properties are unavailable",
+            ));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| response::invalid("llama.cpp model properties were interrupted"))?
+        {
+            if body.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
+                return Err(response::invalid(
+                    "llama.cpp model properties exceeded four MiB",
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let props: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| response::invalid("llama.cpp model properties were malformed"))?;
+        Ok(llama_reasoning_efforts(&props))
+    }
+
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<crate::ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    pub fn new(base_url: impl Into<String>) -> Result<Self, ProviderError> {
+        let base_url = base_url.into();
+        let url = reqwest::Url::parse(&base_url).map_err(|_| llama_endpoint_error())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(llama_endpoint_error());
+        }
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .no_proxy()
+            .build()
+            .map_err(client_configuration_error)?;
+        let base_url = url
+            .as_str()
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_owned();
+        let client = openai::CompletionsClient::builder()
+            .api_key("llama.cpp")
+            .base_url(format!("{base_url}/v1"))
+            .http_client(http.clone())
+            .build()
+            .map_err(client_configuration_error)?;
+        Ok(Self {
+            client,
+            http,
+            base_url,
+            reasoning_effort: None,
+        })
+    }
+}
+
+fn llama_reasoning_efforts(props: &serde_json::Value) -> Option<Vec<crate::ReasoningEffort>> {
+    let caps = props.get("chat_template_caps")?;
+    if caps
+        .get("supports_reasoning_effort")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return Some(Vec::new());
+    }
+    let levels = caps.get("reasoning_effort_levels")?.as_array()?;
+    let mut efforts = Vec::new();
+    for level in levels {
+        if let Ok(effort) = serde_json::from_value::<crate::ReasoningEffort>(level.clone())
+            && effort != crate::ReasoningEffort::Default
+            && !efforts.contains(&effort)
+        {
+            efforts.push(effort);
+        }
+    }
+    Some(efforts)
+}
+
+fn llama_endpoint_error() -> ProviderError {
+    ProviderError {
+        kind: ProviderErrorKind::Authorization,
+        message: "llama.cpp requires an HTTP(S) base URL without credentials, query, or fragment"
+            .into(),
+        retryable: false,
+    }
+}
+
+#[async_trait]
+impl ModelProvider for LlamaCppProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "llamacpp".into(),
+            display_name: "llama.cpp".into(),
+            capabilities: provider_capabilities(),
+        }
+    }
+
+    async fn models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+        self.client
+            .list_models()
+            .await
+            .map(model_descriptors)
+            .map_err(model_listing_error)
+    }
+
+    async fn start(
+        &self,
+        request: CanonicalRequest,
+        sink: ProviderEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderCompletion, ProviderError> {
+        let model = self.client.completion_model(&request.model);
+        stream_model_with_params(
+            &model,
+            request,
+            sink,
+            cancellation,
+            ToolNames::OpenAi,
+            Some(self.reasoning_effort.map_or_else(
+                || serde_json::json!({}),
+                |effort| serde_json::json!({"reasoning_effort": effort}),
+            )),
+        )
+        .await
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenAiProvider {
     base_url: String,
@@ -208,7 +373,7 @@ impl AnthropicProvider {
         Ok(Self {
             base_url,
             api_key: AnthropicApiKey::Static(api_key),
-            http: crate::anthropic_stream::client()?,
+            http: anthropic_stream::client()?,
         })
     }
 
@@ -228,7 +393,7 @@ impl AnthropicProvider {
         Ok(Self {
             base_url,
             api_key: AnthropicApiKey::Dynamic(api_key),
-            http: crate::anthropic_stream::client()?,
+            http: anthropic_stream::client()?,
         })
     }
 
@@ -309,7 +474,7 @@ impl OpenAiProvider {
         Ok(Self {
             base_url,
             api_key: OpenAiApiKey::Static(api_key),
-            http: crate::openai_stream::client()?,
+            http: openai_stream::client()?,
         })
     }
 
@@ -329,7 +494,7 @@ impl OpenAiProvider {
         Ok(Self {
             base_url,
             api_key: OpenAiApiKey::Dynamic(api_key),
-            http: crate::openai_stream::client()?,
+            http: openai_stream::client()?,
         })
     }
 
@@ -422,9 +587,24 @@ async fn stream_model<M: CompletionModel>(
     cancellation: CancellationToken,
     tool_names: ToolNames,
 ) -> Result<ProviderCompletion, ProviderError> {
+    stream_model_with_params(model, request, sink, cancellation, tool_names, None).await
+}
+
+async fn stream_model_with_params<M: CompletionModel>(
+    model: &M,
+    request: CanonicalRequest,
+    sink: ProviderEventSink,
+    cancellation: CancellationToken,
+    tool_names: ToolNames,
+    additional_params: Option<serde_json::Value>,
+) -> Result<ProviderCompletion, ProviderError> {
     let task_id = request.task_id;
     let canonical = request.clone();
-    let request = rig_request(request, tool_names)?;
+    let mut request = rig_request(request, tool_names)?;
+    if let Some(params) = additional_params {
+        // llama.cpp chat completions do not use Responses API storage settings.
+        request.additional_params = Some(params);
+    }
     request
         .validate_message_content()
         .map_err(completion_error)?;
@@ -746,6 +926,294 @@ mod tests {
         streaming::{RawStreamingChoice, RawStreamingToolCall, StreamFinal},
     };
     use voff_core::{MessageId, TaskId};
+
+    #[test]
+    fn llama_reasoning_uses_template_capabilities_without_inventing_levels() {
+        use crate::ReasoningEffort::{High, Low};
+        for (props, expected) in [
+            (
+                serde_json::json!({"chat_template_caps":{"supports_reasoning_effort":true,"reasoning_effort_levels":["low","high","high","future-level"]}}),
+                Some(vec![Low, High]),
+            ),
+            (
+                serde_json::json!({"chat_template_caps":{"supports_reasoning_effort":false,"reasoning_effort_levels":["high"]}}),
+                Some(vec![]),
+            ),
+            (
+                serde_json::json!({"chat_template_caps":{"reasoning_effort_levels":[]}}),
+                Some(vec![]),
+            ),
+            (
+                serde_json::json!({"chat_template_caps":{"reasoning_effort_levels":["default",1,null]}}),
+                Some(vec![]),
+            ),
+            (
+                serde_json::json!({"chat_template_caps":{"supports_reasoning_effort":true}}),
+                None,
+            ),
+            (
+                serde_json::json!({"chat_template_caps":{"reasoning_effort_levels":"high"}}),
+                None,
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            assert_eq!(llama_reasoning_efforts(&props), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn llama_reasoning_properties_are_scoped_to_the_selected_model() {
+        use std::io::{BufRead, Write};
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"chat_template_caps":{"reasoning_effort_levels":["low","high"]}}"#,
+                Some(Some(vec![
+                    crate::ReasoningEffort::Low,
+                    crate::ReasoningEffort::High,
+                ])),
+            ),
+            ("200 OK", "{}", Some(None)),
+            ("200 OK", "invalid-json", None),
+            ("503 Service Unavailable", "sensitive error body", None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/v1", listener.local_addr().unwrap());
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let model = "repo/Qwen:Q4_K_M & other";
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+                assert_eq!(url.path(), "/props");
+                assert_eq!(
+                    url.query_pairs().collect::<Vec<_>>(),
+                    vec![("model".into(), model.into())]
+                );
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            let result = LlamaCppProvider::new(base)
+                .unwrap()
+                .reasoning_efforts(model)
+                .await;
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected),
+                None => assert!(!result.unwrap_err().message.contains("sensitive")),
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn llama_cpp_validates_endpoints() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080/v1/",
+            "http://[::1]:8080",
+            "https://example.com",
+            "http://192.168.1.1:8080",
+            "https://example.com/llama/v1/",
+        ] {
+            assert!(LlamaCppProvider::new(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://localhost:8080@example.com",
+            "http://localhost:8080/?secret=value",
+            "http://localhost:8080/#fragment",
+            "http://user:password@localhost:8080",
+            "ftp://example.com",
+            "invalid",
+        ] {
+            let error = LlamaCppProvider::new(url).err().unwrap();
+            assert_eq!(error.kind, ProviderErrorKind::Authorization);
+            assert!(!error.retryable);
+            assert!(!error.message.contains(url));
+        }
+    }
+
+    #[test]
+    fn llama_cpp_preserves_proxy_prefix_and_normalizes_api_suffix() {
+        for url in [
+            "https://example.com/llama",
+            "https://example.com/llama/",
+            "https://example.com/llama/v1",
+            "https://example.com/llama/v1/",
+        ] {
+            let provider = LlamaCppProvider::new(url).unwrap();
+            assert_eq!(provider.base_url, "https://example.com/llama");
+        }
+    }
+
+    async fn llama_fixture(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (
+        Result<ProviderCompletion, ProviderError>,
+        Vec<ProviderEvent>,
+        String,
+    ) {
+        llama_fixture_with_effort(status, content_type, body, None).await
+    }
+
+    async fn llama_fixture_with_effort(
+        status: &str,
+        content_type: &str,
+        body: &str,
+        effort: Option<crate::ReasoningEffort>,
+    ) -> (
+        Result<ProviderCompletion, ProviderError>,
+        Vec<ProviderEvent>,
+        String,
+    ) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            socket.write_all(response.as_bytes()).unwrap();
+            body
+        });
+        let provider = LlamaCppProvider::new(base)
+            .unwrap()
+            .with_reasoning_effort(effort);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let mut request = crate::contract::request("local");
+        request.tools.push(ToolDefinition {
+            name: "file.read".into(),
+            description: "Read a workspace file".into(),
+            input_schema:
+                r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#
+                    .into(),
+        });
+        let result = provider.start(request, tx, CancellationToken::new()).await;
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        (result, events, server.join().unwrap())
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_streams_chat_completions_and_usage() {
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"local\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"local\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (result, events, request) = llama_fixture("200 OK", "text/event-stream", body).await;
+        let completion = result.unwrap();
+        assert_eq!(completion.usage.unwrap().input_tokens, 2);
+        assert!(events.contains(&ProviderEvent::TextDelta("hello".into())));
+        assert!(events.contains(&ProviderEvent::Completed));
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["model"], "local");
+        assert_eq!(request["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_maps_streamed_tools_to_canonical_names() {
+        let body = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"local\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"file__read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"local\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (result, events, request) = llama_fixture("200 OK", "text/event-stream", body).await;
+        result.unwrap();
+        assert!(events.iter().any(|event| matches!(event, ProviderEvent::ToolRequest(tool) if tool.name == "file.read" && tool.arguments_json.contains("README.md"))));
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["tools"][0]["function"]["name"], "file__read");
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_sends_only_the_configured_reasoning_effort() {
+        for effort in [
+            None,
+            Some(crate::ReasoningEffort::None),
+            Some(crate::ReasoningEffort::High),
+        ] {
+            let (_, _, body) = llama_fixture_with_effort(
+                "503 Service Unavailable",
+                "application/json",
+                "{}",
+                effort,
+            )
+            .await;
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match effort {
+                Some(effort) => assert_eq!(
+                    body["reasoning_effort"],
+                    serde_json::to_value(effort).unwrap()
+                ),
+                None => assert!(body.get("reasoning_effort").is_none()),
+            }
+            assert!(body.get("store").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_honors_cancellation_before_connecting() {
+        let provider = Arc::new(LlamaCppProvider::new("http://127.0.0.1:1").unwrap());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (events, result) =
+            crate::contract::run(provider, crate::contract::request("local"), cancellation).await;
+        assert_eq!(result.unwrap_err().kind, ProviderErrorKind::Cancelled);
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_rejects_http_failure_and_malformed_stream() {
+        for (status, content_type, body) in [
+            ("503 Service Unavailable", "application/json", "{}"),
+            ("200 OK", "text/event-stream", "data: invalid-json\n\n"),
+        ] {
+            let (result, events, _) = llama_fixture(status, content_type, body).await;
+            assert!(result.is_err());
+            assert!(!events.contains(&ProviderEvent::Completed));
+        }
+    }
 
     #[derive(Clone)]
     struct RigFixtureModel;

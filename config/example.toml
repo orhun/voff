@@ -27,3 +27,9 @@ reports_to = "Lead"
 [setup_prompts]
 scan_workspace = "Inspect this project and suggest a useful agent team."
 build_from_description = "Create a team for the user's project description."
+
+# For a local llama.cpp server on port 9931, use these agent settings:
+# provider = "llamacpp"
+# base_url = "http://127.0.0.1:9931" # Optional.
+# model = "ggml-org/your-model-GGUF:Q4_K_M" # The model must have been already downloaded via llama.cpp to be used here.
+# reasoning_effort = "high" # Optional.
