@@ -27,8 +27,8 @@ use voff_core::{
     SessionId, Task, TaskLimits, TaskStatus,
 };
 use voff_provider::{
-    AnthropicProvider, LocalCliKind, LocalCliProvider, MockProvider, MockStep, OllamaProvider,
-    OpenAiProvider,
+    AnthropicProvider, LlamaCppProvider, LocalCliKind, LocalCliProvider, MockProvider, MockStep,
+    OllamaProvider, OpenAiProvider,
 };
 use voff_provider::{ModelProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
@@ -74,11 +74,15 @@ struct SetupPromptsConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileAgent {
+    #[serde(default)]
+    base_url: Option<String>,
     name: String,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<voff_provider::ReasoningEffort>,
     #[serde(default, alias = "prompt")]
     system_prompt: String,
     #[serde(default)]
@@ -96,6 +100,10 @@ struct GeneratedFileConfig {
 
 #[derive(Serialize)]
 struct GeneratedFileAgent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<voff_provider::ReasoningEffort>,
     name: String,
     provider: String,
     model: String,
@@ -406,7 +414,11 @@ fn setup_from_file(config: FileConfig) -> Result<Option<SetupDraft>> {
                 .model
                 .unwrap_or_else(|| catalog.first_model(provider.id()));
             Ok(onboarding::DeveloperDraft {
+                base_url: agent
+                    .base_url
+                    .unwrap_or_else(onboarding::default_llama_base_url),
                 name: agent.name,
+                reasoning_effort: agent.reasoning_effort,
                 role,
                 reports_to,
                 system_prompt: agent.system_prompt,
@@ -489,6 +501,9 @@ fn save_workspace_team_config(
             .developers
             .iter()
             .map(|developer| GeneratedFileAgent {
+                base_url: (developer.provider == ProviderChoice::LlamaCpp)
+                    .then(|| developer.base_url.clone()),
+                reasoning_effort: developer.reasoning_effort,
                 name: developer.name.clone(),
                 provider: developer.provider.id().into(),
                 model: developer.model.clone(),
@@ -536,6 +551,10 @@ fn config_from_setup(setup: &SetupDraft) -> Result<RuntimeTeam> {
                 .take(index)
                 .all(|other| other.name != developer.name),
             "agent names must be unique"
+        );
+        anyhow::ensure!(
+            developer.reasoning_effort.is_none() || developer.provider == ProviderChoice::LlamaCpp,
+            "reasoning_effort is currently supported only for llama.cpp agents"
         );
         anyhow::ensure!(
             developer.system_prompt.len() <= 16_000,
@@ -648,6 +667,15 @@ fn setup_provider_route(developer: &onboarding::DeveloperDraft, index: usize) ->
 
 fn provider_from_developer(developer: &onboarding::DeveloperDraft) -> ProviderConfig {
     let mut provider = provider_from_choice(developer.provider, &developer.model);
+    if let ProviderConfig::LlamaCpp {
+        reasoning_effort,
+        base_url,
+        ..
+    } = &mut provider
+    {
+        *base_url = developer.base_url.clone();
+        *reasoning_effort = developer.reasoning_effort;
+    }
     if let ProviderConfig::Openai { api_key_env, .. }
     | ProviderConfig::Anthropic { api_key_env, .. } = &mut provider
     {
@@ -703,6 +731,7 @@ fn setup_draft_for_team(config: &RuntimeTeam, agents: &[AgentProfile]) -> Option
         .map(|(index, agent)| {
             let configured = provider_config(config, &agent.provider)?;
             let provider = match configured {
+                ProviderConfig::LlamaCpp { .. } => ProviderChoice::LlamaCpp,
                 ProviderConfig::Ollama { .. } => ProviderChoice::Ollama,
                 ProviderConfig::Openai { .. } => ProviderChoice::OpenAi,
                 ProviderConfig::Anthropic { .. } => ProviderChoice::ClaudeCloud,
@@ -721,6 +750,16 @@ fn setup_draft_for_team(config: &RuntimeTeam, agents: &[AgentProfile]) -> Option
             .find(|role| role.config_role() == agent.role)?;
             Some(onboarding::DeveloperDraft {
                 name: agent.name.clone(),
+                base_url: match configured {
+                    ProviderConfig::LlamaCpp { base_url, .. } => base_url.clone(),
+                    _ => onboarding::default_llama_base_url(),
+                },
+                reasoning_effort: match configured {
+                    ProviderConfig::LlamaCpp {
+                        reasoning_effort, ..
+                    } => *reasoning_effort,
+                    _ => None,
+                },
                 role,
                 reports_to: if index == 0 {
                     None
@@ -747,6 +786,11 @@ fn setup_draft_for_team(config: &RuntimeTeam, agents: &[AgentProfile]) -> Option
 
 fn provider_from_choice(provider: ProviderChoice, model: &str) -> ProviderConfig {
     match provider {
+        ProviderChoice::LlamaCpp => ProviderConfig::LlamaCpp {
+            reasoning_effort: None,
+            base_url: "http://127.0.0.1:9931".into(),
+            model: model.into(),
+        },
         ProviderChoice::Ollama => ProviderConfig::Ollama {
             base_url: "http://127.0.0.1:11434".into(),
             model: model.into(),
@@ -1324,6 +1368,7 @@ fn provider_api_key_env(value: &ProviderConfig) -> Option<&str> {
         ProviderConfig::Openai { api_key_env, .. }
         | ProviderConfig::Anthropic { api_key_env, .. } => Some(api_key_env),
         ProviderConfig::Mock
+        | ProviderConfig::LlamaCpp { .. }
         | ProviderConfig::Ollama { .. }
         | ProviderConfig::CodexCli { .. }
         | ProviderConfig::ClaudeCli { .. } => None,
@@ -1333,6 +1378,7 @@ fn provider_api_key_env(value: &ProviderConfig) -> Option<&str> {
 fn provider_name(value: &ProviderConfig) -> &'static str {
     match value {
         ProviderConfig::Mock => "mock",
+        ProviderConfig::LlamaCpp { .. } => "llamacpp",
         ProviderConfig::Ollama { .. } => "ollama",
         ProviderConfig::Openai { .. } => "openai",
         ProviderConfig::Anthropic { .. } => "anthropic",
@@ -1343,6 +1389,7 @@ fn provider_name(value: &ProviderConfig) -> &'static str {
 fn model_name(value: &ProviderConfig) -> String {
     match value {
         ProviderConfig::Mock => "mock-v1".into(),
+        ProviderConfig::LlamaCpp { model, .. } => model.clone(),
         ProviderConfig::Ollama { model, .. } => model.clone(),
         ProviderConfig::Openai { model, .. } => model.clone(),
         ProviderConfig::Anthropic { model, .. } => model.clone(),
@@ -1366,6 +1413,13 @@ fn provider(
             })),
             MockStep::Event(voff_provider::ProviderEvent::Completed),
         ])),
+        ProviderConfig::LlamaCpp {
+            base_url,
+            reasoning_effort,
+            ..
+        } => Arc::new(
+            LlamaCppProvider::new(base_url.clone())?.with_reasoning_effort(*reasoning_effort),
+        ),
         ProviderConfig::Ollama { base_url, .. } => Arc::new(OllamaProvider::new(base_url.clone())?),
         ProviderConfig::Openai { api_key_env, .. } => {
             let slot = credential_slots
@@ -1452,6 +1506,113 @@ mod tests {
                 "missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn llama_cpp_config_routes_without_credentials() {
+        let file: FileConfig =
+            toml::from_str("[[agent]]\nname = 'Lead'\nprovider = 'llamacpp'\nmodel = 'local'\n")
+                .unwrap();
+        let setup = setup_from_file(file).unwrap().unwrap();
+        let config = config_from_setup(&setup).unwrap();
+        assert!(
+            matches!(&config.provider, ProviderConfig::LlamaCpp { base_url, model, .. } if base_url == "http://127.0.0.1:9931" && model == "local")
+        );
+        assert_eq!(provider_name(&config.provider), "llamacpp");
+        assert_eq!(provider_api_key_env(&config.provider), None);
+        let serialized = serde_json::to_string(&setup).unwrap();
+        let reopened: SetupDraft = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reopened.developers[0].provider, ProviderChoice::LlamaCpp);
+        assert_eq!(reopened.developers[0].model, "local");
+    }
+
+    #[test]
+    fn llama_cpp_reasoning_is_validated_routed_and_preserved() {
+        let file: FileConfig = toml::from_str("[[agent]]\nname = 'Lead'\nprovider = 'llamacpp'\nmodel = 'cached-model'\nreasoning_effort = 'high'\n").unwrap();
+        let mut setup = setup_from_file(file).unwrap().unwrap();
+        let config = config_from_setup(&setup).unwrap();
+        assert!(matches!(
+            &config.provider,
+            ProviderConfig::LlamaCpp {
+                reasoning_effort: Some(voff_provider::ReasoningEffort::High),
+                ..
+            }
+        ));
+        let serialized = serde_json::to_string(&setup).unwrap();
+        let restored: SetupDraft = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            restored.developers[0].reasoning_effort,
+            Some(voff_provider::ReasoningEffort::High)
+        );
+        let directory = tempfile::tempdir().unwrap();
+        setup.working_directory = directory.path().to_path_buf();
+        let path =
+            save_workspace_team_config(&setup, &onboarding::SetupPrompts::default()).unwrap();
+        let generated: FileConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            generated.agent[0].reasoning_effort,
+            Some(voff_provider::ReasoningEffort::High)
+        );
+        let invalid = "[[agent]]\nname = 'Lead'\nreasoning_effort = 'typo'\n";
+        assert!(toml::from_str::<FileConfig>(invalid).is_err());
+        let mut unsupported = setup;
+        unsupported.developers[0].provider = ProviderChoice::Ollama;
+        assert!(config_from_setup(&unsupported).is_err());
+    }
+
+    #[test]
+    fn llama_cpp_custom_endpoint_survives_config_roundtrip() {
+        let file: FileConfig = toml::from_str(
+            "[[agent]]\nname = 'Lead'\nprovider = 'llamacpp'\nmodel = 'remote-model'\nbase_url = 'https://example.com/llama/v1'\n",
+        ).unwrap();
+        let mut setup = setup_from_file(file).unwrap().unwrap();
+        let team = config_from_setup(&setup).unwrap();
+        assert!(
+            matches!(&team.provider, ProviderConfig::LlamaCpp { base_url, .. } if base_url == "https://example.com/llama/v1")
+        );
+        let restored: SetupDraft =
+            serde_json::from_str(&serde_json::to_string(&setup).unwrap()).unwrap();
+        assert_eq!(
+            restored.developers[0].base_url,
+            setup.developers[0].base_url
+        );
+        let directory = tempfile::tempdir().unwrap();
+        setup.working_directory = directory.path().to_path_buf();
+        let path =
+            save_workspace_team_config(&setup, &onboarding::SetupPrompts::default()).unwrap();
+        let saved: FileConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            saved.agent[0].base_url.as_deref(),
+            Some("https://example.com/llama/v1")
+        );
+    }
+
+    #[test]
+    fn llama_cpp_agents_keep_independent_reasoning_levels() {
+        let mut setup = draft();
+        setup.developers[1].reports_to = Some(0);
+        for (developer, effort) in setup.developers.iter_mut().zip([
+            voff_provider::ReasoningEffort::Low,
+            voff_provider::ReasoningEffort::High,
+        ]) {
+            developer.provider = ProviderChoice::LlamaCpp;
+            developer.reasoning_effort = Some(effort);
+        }
+        let config = config_from_setup(&setup).unwrap();
+        assert!(matches!(
+            &config.providers[0].config,
+            ProviderConfig::LlamaCpp {
+                reasoning_effort: Some(voff_provider::ReasoningEffort::Low),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &config.providers[1].config,
+            ProviderConfig::LlamaCpp {
+                reasoning_effort: Some(voff_provider::ReasoningEffort::High),
+                ..
+            }
+        ));
     }
 
     #[test]

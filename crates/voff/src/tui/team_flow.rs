@@ -26,6 +26,7 @@ struct AgentCard {
     identity: String,
     provider: String,
     model: Option<String>,
+    reasoning: Option<&'static str>,
     task: Option<String>,
     focus: Option<String>,
     activity: Option<String>,
@@ -147,6 +148,12 @@ impl AgentCard {
                     Style::default().fg(theme::MUTED),
                 )));
             }
+            if let Some(reasoning) = self.reasoning {
+                lines.push(Line::from(Span::styled(
+                    format!("Reasoning · {reasoning}"),
+                    Style::default().fg(theme::MUTED),
+                )));
+            }
             let cost = self.estimated_cost.map_or_else(
                 || {
                     if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
@@ -240,6 +247,7 @@ pub(super) struct TeamSnapshot<'a> {
     pub runtime_models: &'a HashMap<AgentId, String>,
     pub estimated_costs: &'a HashMap<AgentId, Option<f64>>,
     pub provider_kinds: &'a HashMap<AgentId, String>,
+    pub team_setup: Option<&'a crate::onboarding::SetupDraft>,
     pub team_lead: Option<AgentId>,
 }
 
@@ -667,6 +675,7 @@ fn agent_card(agent: &AgentProfile, snapshot: &TeamSnapshot<'_>, agent_color: Co
         provider: match provider_kind {
             "codex_cli" => "Codex CLI",
             "claude_cli" => "Claude CLI",
+            "llamacpp" => "llama.cpp",
             "ollama" => "Ollama · local",
             "openai" => "OpenAI API",
             "anthropic" => "Claude API",
@@ -674,6 +683,18 @@ fn agent_card(agent: &AgentProfile, snapshot: &TeamSnapshot<'_>, agent_color: Co
         }
         .into(),
         model,
+        reasoning: (provider_kind == "llamacpp").then(|| {
+            let effort = snapshot
+                .team_setup
+                .and_then(|setup| {
+                    setup
+                        .developers
+                        .iter()
+                        .find(|developer| developer.name == agent.name)
+                })
+                .and_then(|developer| developer.reasoning_effort);
+            crate::onboarding::reasoning_effort_label(effort)
+        }),
         task,
         focus,
         activity: display_task.and_then(task_timing_label),
@@ -1538,12 +1559,81 @@ mod geometry_tests {
     }
 
     #[test]
+    fn llama_cards_show_configured_reasoning_below_model_only_when_applicable() {
+        use crate::onboarding::{DeveloperDraft, DeveloperRole, ProviderChoice, SetupDraft};
+        let mut agent = agent("Local Agent", Vec::new());
+        agent.provider = "llamacpp-developer-1".into();
+        agent.model = "cached-model".into();
+        let mut developer = DeveloperDraft::new(
+            "Local Agent",
+            DeveloperRole::Lead,
+            ProviderChoice::LlamaCpp,
+            "cached-model",
+            16384,
+        );
+        let providers = HashMap::from([(agent.id, "llamacpp".into())]);
+        for effort in [
+            None,
+            Some(voff_provider::ReasoningEffort::High),
+            Some(voff_provider::ReasoningEffort::None),
+        ] {
+            developer.reasoning_effort = effort;
+            let setup = SetupDraft {
+                developers: vec![developer.clone()],
+                working_directory: ".".into(),
+            };
+            let mut snapshot = TeamSnapshot {
+                agents: std::slice::from_ref(&agent),
+                tasks: &[],
+                approvals: &[],
+                reviews: &HashMap::new(),
+                responses: &HashMap::new(),
+                usage: &HashMap::new(),
+                runtime_models: &HashMap::new(),
+                estimated_costs: &HashMap::new(),
+                provider_kinds: &providers,
+                team_setup: Some(&setup),
+                team_lead: Some(agent.id),
+            };
+            let mut card = agent_card(&agent, &snapshot, theme::YELLOW);
+            let lines = card
+                .lines(0, 46)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>();
+            let model_row = lines
+                .iter()
+                .position(|line| line == "Model · cached-model")
+                .unwrap();
+            assert_eq!(
+                lines[model_row + 1],
+                format!(
+                    "Reasoning · {}",
+                    crate::onboarding::reasoning_effort_label(effort)
+                )
+            );
+            let full_height = card.desired_height(48);
+            card.reasoning = None;
+            assert_eq!(full_height, card.desired_height(48) + 1);
+            let other_providers = HashMap::from([(agent.id, "ollama".into())]);
+            snapshot.provider_kinds = &other_providers;
+            let card = agent_card(&agent, &snapshot, theme::YELLOW);
+            assert!(
+                card.lines(0, 46)
+                    .iter()
+                    .all(|line| !line.to_string().contains("Reasoning"))
+            );
+        }
+    }
+
+    #[test]
     fn card_height_tracks_wrapping_and_zoom_detail_level() {
         let mut card = AgentCard {
             max_width: 28.0,
             identity: "⬢ Backend Agent".into(),
             provider: "Codex · CLI".into(),
             model: None,
+            reasoning: None,
             task: Some("Implement calculator UI".into()),
             focus: None,
             activity: None,
@@ -1576,6 +1666,7 @@ mod geometry_tests {
             identity: "⬢ Backend Agent".into(),
             provider: "Codex CLI".into(),
             model: None,
+            reasoning: None,
             task: None,
             focus: None,
             activity: None,
@@ -1628,6 +1719,7 @@ mod geometry_tests {
             identity: "⬢ Backend Agent".into(),
             provider: "Codex · CLI".into(),
             model: None,
+            reasoning: None,
             task: Some("Implement task API".into()),
             focus: None,
             activity: None,

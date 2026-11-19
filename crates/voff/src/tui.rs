@@ -2610,12 +2610,16 @@ fn restore_initial_history(
     app.sort_tasks_for_browser();
     app.approvals = approvals;
     app.artifacts = artifacts;
+    // Replayed usage contributes to totals, but its resolved model belongs to
+    // an earlier run and may predate a provider or model configuration change.
+    let runtime_models = std::mem::take(&mut app.agent_runtime_models);
     for event in events {
         if let CanonicalEventKind::ApplicationIssue(message) = &event.kind {
             app.application_notice = Some(sanitize(message));
         }
         app.push_scoped_event(event.task_id, &event.kind);
     }
+    app.agent_runtime_models = runtime_models;
     if !app.tasks.is_empty() {
         app.selected = 0;
     }
@@ -3205,6 +3209,9 @@ async fn terminal_loop<R: Repository + 'static>(
             }
             Some(message)=event_rx.recv()=>model.apply_event(message),
             _=tick.tick()=>{
+                if let Some(editor) = model.setup_editor.as_mut() {
+                    editor.refresh_provider_metadata();
+                }
                 model.startup_scan_frame = model.startup_scan_frame.wrapping_add(1);
                 if model.startup_scan_pending
                     && let Some(result) = model.startup_scan_result.take()
@@ -5286,6 +5293,7 @@ fn render_team(frame: &mut ratatui::Frame<'_>, app: &mut AppModel, area: Rect) {
             runtime_models: &app.agent_runtime_models,
             estimated_costs: &app.agent_estimated_costs,
             provider_kinds: &app.agent_provider_kinds,
+            team_setup: app.team_setup.as_ref(),
             team_lead: app.team_lead,
         },
         app.selected_agent,
@@ -5346,6 +5354,7 @@ fn agent_usage_rows(app: &AppModel) -> Vec<AgentUsageRow> {
                 provider: match provider {
                     "codex_cli" => "Codex CLI",
                     "claude_cli" => "Claude CLI",
+                    "llamacpp" => "llama.cpp",
                     "ollama" => "Ollama",
                     "openai" => "OpenAI API",
                     "anthropic" => "Claude API",
@@ -7816,6 +7825,73 @@ mod tests {
         );
 
         assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn restored_usage_does_not_override_the_current_provider_model() {
+        for (provider, configured_model) in
+            [("llamacpp", "cached-local-model"), ("codex_cli", "default")]
+        {
+            let mut app = AppModel::new(SessionId::new());
+            let mut lead = agent("Team Lead", "technical_lead", vec![]);
+            lead.provider = provider.into();
+            lead.model = configured_model.into();
+            let owner = lead.id;
+            app.team_lead = Some(owner);
+            app.agent_provider_kinds.insert(owner, provider.into());
+            app.agents.push(lead);
+            let task = Task::root(owner, "previous run", vec![], Default::default());
+            let historical_usage = CanonicalEvent {
+                id: voff_core::EventId::new(),
+                session_id: app.session,
+                task_id: Some(task.id),
+                created_at: chrono::Utc::now(),
+                kind: CanonicalEventKind::Usage {
+                    input_tokens: 10,
+                    cached_input_tokens: 2,
+                    output_tokens: 5,
+                    model: Some("gpt-6.1-sol".into()),
+                },
+            };
+            restore_initial_history(
+                &mut app,
+                vec![task.clone()],
+                vec![historical_usage],
+                vec![],
+                vec![],
+            );
+            assert!(!app.agent_runtime_models.contains_key(&owner));
+            assert_eq!(app.agent_usage[&owner].input_tokens, 10);
+            assert_eq!(app.agent_usage[&owner].cached_input_tokens, 2);
+            assert_eq!(app.agent_usage[&owner].output_tokens, 5);
+
+            let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(!rendered.contains("Model · gpt-6.1-sol"), "{rendered}");
+            if provider == "llamacpp" {
+                assert!(
+                    rendered.contains("Model · cached-local-model"),
+                    "{rendered}"
+                );
+            }
+
+            // A response from the current run can still report a resolved model.
+            app.push_scoped_event(
+                Some(task.id),
+                &CanonicalEventKind::Usage {
+                    input_tokens: 3,
+                    cached_input_tokens: 0,
+                    output_tokens: 1,
+                    model: Some("current-resolved-model".into()),
+                },
+            );
+            assert_eq!(app.agent_runtime_models[&owner], "current-resolved-model");
+            assert_eq!(app.agent_usage[&owner].input_tokens, 13);
+        }
     }
 
     #[test]

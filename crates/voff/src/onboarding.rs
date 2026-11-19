@@ -78,6 +78,7 @@ struct WorkspaceAgentPlan {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProviderChoice {
+    LlamaCpp,
     Ollama,
     OpenAi,
     ClaudeCloud,
@@ -86,7 +87,8 @@ pub enum ProviderChoice {
 }
 
 impl ProviderChoice {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
+        Self::LlamaCpp,
         Self::Ollama,
         Self::OpenAi,
         Self::ClaudeCloud,
@@ -96,6 +98,7 @@ impl ProviderChoice {
 
     fn is_available(self) -> bool {
         match self {
+            Self::LlamaCpp => executable_available("llama") || executable_available("llama-server"),
             Self::Ollama => executable_available("ollama"),
             Self::OpenAi => {
                 std::env::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty())
@@ -112,6 +115,7 @@ impl ProviderChoice {
         [
             Self::CodexCli,
             Self::ClaudeCli,
+            Self::LlamaCpp,
             Self::Ollama,
             Self::OpenAi,
             Self::ClaudeCloud,
@@ -127,6 +131,7 @@ impl ProviderChoice {
 
     pub(crate) fn from_config_name(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
+            "llamacpp" | "llama_cpp" | "llama.cpp" => Ok(Self::LlamaCpp),
             "ollama" => Ok(Self::Ollama),
             "openai" | "open_ai" => Ok(Self::OpenAi),
             "anthropic" | "claude_api" | "claude_cloud" => Ok(Self::ClaudeCloud),
@@ -139,6 +144,7 @@ impl ProviderChoice {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::LlamaCpp => "llamacpp",
             Self::Ollama => "ollama",
             Self::OpenAi => "openai",
             Self::ClaudeCloud => "anthropic",
@@ -150,6 +156,7 @@ impl ProviderChoice {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::LlamaCpp => "llama.cpp",
             Self::Ollama => "Ollama · local",
             Self::OpenAi => "OpenAI · cloud",
             Self::ClaudeCloud => "Claude · cloud",
@@ -162,7 +169,7 @@ impl ProviderChoice {
         match self {
             Self::OpenAi => Some("OPENAI_API_KEY"),
             Self::ClaudeCloud => Some("ANTHROPIC_API_KEY"),
-            Self::Ollama | Self::CodexCli | Self::ClaudeCli => None,
+            Self::LlamaCpp | Self::Ollama | Self::CodexCli | Self::ClaudeCli => None,
         }
     }
 
@@ -288,12 +295,20 @@ pub struct DeveloperDraft {
     pub system_prompt: String,
     pub provider: ProviderChoice,
     pub model: String,
+    #[serde(default = "default_llama_base_url")]
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<voff_provider::ReasoningEffort>,
     pub max_output_tokens: u64,
     /// Optional replacement token; never serialized into project configuration.
     #[serde(skip)]
     pub api_token: String,
     /// Existing credential lookup to retain when no replacement is entered.
     pub credential_reference: Option<String>,
+}
+
+pub(crate) fn default_llama_base_url() -> String {
+    "http://127.0.0.1:9931".into()
 }
 
 impl std::fmt::Debug for DeveloperDraft {
@@ -329,6 +344,8 @@ impl DeveloperDraft {
             provider,
             model: model.into(),
             max_output_tokens,
+            base_url: default_llama_base_url(),
+            reasoning_effort: None,
             api_token: String::new(),
             credential_reference: None,
         }
@@ -350,6 +367,8 @@ impl DeveloperDraft {
             provider,
             model,
             max_output_tokens,
+            base_url: default_llama_base_url(),
+            reasoning_effort: None,
             api_token: String::new(),
             credential_reference: None,
         }
@@ -378,6 +397,8 @@ enum Field {
     ReportsTo,
     Provider,
     Model,
+    Reasoning,
+    BaseUrl,
     OutputLimit,
     Token,
     Prompt,
@@ -389,8 +410,10 @@ impl Field {
             Self::Role => Self::Name,
             Self::Name => Self::ReportsTo,
             Self::ReportsTo => Self::Provider,
-            Self::Provider => Self::Model,
-            Self::Model => Self::OutputLimit,
+            Self::Provider => Self::BaseUrl,
+            Self::BaseUrl => Self::Model,
+            Self::Model => Self::Reasoning,
+            Self::Reasoning => Self::OutputLimit,
             Self::OutputLimit => Self::Token,
             Self::Token => Self::Prompt,
             Self::Prompt => Self::Role,
@@ -403,9 +426,11 @@ impl Field {
             Self::Name => Self::Role,
             Self::ReportsTo => Self::Name,
             Self::Provider => Self::ReportsTo,
-            Self::Model => Self::Provider,
+            Self::Model => Self::BaseUrl,
+            Self::BaseUrl => Self::Provider,
             Self::Token => Self::OutputLimit,
-            Self::OutputLimit => Self::Model,
+            Self::OutputLimit => Self::Reasoning,
+            Self::Reasoning => Self::Model,
             Self::Prompt => Self::Token,
         }
     }
@@ -422,6 +447,18 @@ enum WizardMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BasicsField {
     WorkingDirectory,
+}
+
+struct ReasoningDiscovery {
+    model: String,
+    receiver: tokio::sync::oneshot::Receiver<Option<Vec<voff_provider::ReasoningEffort>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ReasoningDiscovery {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 pub(crate) struct Wizard {
@@ -441,6 +478,12 @@ pub(crate) struct Wizard {
     cancelled: bool,
     complete: bool,
     catalog: ModelCatalog,
+    reasoning_levels:
+        std::collections::HashMap<String, Option<Vec<voff_provider::ReasoningEffort>>>,
+    reasoning_discovery: Option<ReasoningDiscovery>,
+    discovery_endpoint: String,
+    endpoint_models: Option<crate::model_catalog::ModelDiscovery>,
+    next_endpoint_refresh: std::time::Instant,
     editing: bool,
     mode: WizardMode,
 }
@@ -678,6 +721,11 @@ impl Wizard {
             cancelled: false,
             complete: false,
             catalog,
+            reasoning_levels: std::collections::HashMap::new(),
+            reasoning_discovery: None,
+            discovery_endpoint: default_llama_base_url(),
+            endpoint_models: None,
+            next_endpoint_refresh: std::time::Instant::now(),
             editing: false,
             mode: WizardMode::Startup,
         }
@@ -756,6 +804,7 @@ impl Wizard {
             Event::Paste(value) => self.handle_paste(value),
             _ => {}
         }
+        self.refresh_provider_metadata();
     }
 
     fn shell(&self, area: Rect) -> Rect {
@@ -895,7 +944,7 @@ impl Wizard {
                                 self.open_model_browser(index);
                             } else if matches!(
                                 field,
-                                Field::Role | Field::Provider | Field::ReportsTo
+                                Field::Role | Field::Provider | Field::ReportsTo | Field::Reasoning
                             ) {
                                 self.cycle_choice(index, 1);
                             }
@@ -1167,7 +1216,10 @@ impl Wizard {
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && !matches!(self.field, Field::Name | Field::Model | Field::Token) =>
+                    && !matches!(
+                        self.field,
+                        Field::Name | Field::Model | Field::Token | Field::BaseUrl
+                    ) =>
             {
                 self.open_prompt_editor(index);
             }
@@ -1193,28 +1245,45 @@ impl Wizard {
             KeyCode::Tab | KeyCode::Down => self.move_field(index, true),
             KeyCode::BackTab | KeyCode::Up => self.move_field(index, false),
             KeyCode::Char('j')
-                if !matches!(self.field, Field::Name | Field::Model | Field::Token) =>
+                if !matches!(
+                    self.field,
+                    Field::Name | Field::Model | Field::Token | Field::BaseUrl
+                ) =>
             {
                 self.move_field(index, true)
             }
             KeyCode::Char('k')
-                if !matches!(self.field, Field::Name | Field::Model | Field::Token) =>
+                if !matches!(
+                    self.field,
+                    Field::Name | Field::Model | Field::Token | Field::BaseUrl
+                ) =>
             {
                 self.move_field(index, false)
             }
             KeyCode::Left => self.cycle_choice(index, -1),
             KeyCode::Right => self.cycle_choice(index, 1),
             KeyCode::Char('h')
-                if !matches!(self.field, Field::Name | Field::Model | Field::Token) =>
+                if !matches!(
+                    self.field,
+                    Field::Name | Field::Model | Field::Token | Field::BaseUrl
+                ) =>
             {
                 self.cycle_choice(index, -1)
             }
             KeyCode::Char('l')
-                if !matches!(self.field, Field::Name | Field::Model | Field::Token) =>
+                if !matches!(
+                    self.field,
+                    Field::Name | Field::Model | Field::Token | Field::BaseUrl
+                ) =>
             {
                 self.cycle_choice(index, 1)
             }
             KeyCode::Backspace => match self.field {
+                Field::BaseUrl => {
+                    self.developers[index].base_url.pop();
+                    self.reasoning_levels.clear();
+                    self.reasoning_discovery = None;
+                }
                 Field::Name => {
                     self.developers[index].name.pop();
                 }
@@ -1229,7 +1298,11 @@ impl Wizard {
                     self.limit_touched = true;
                     self.developers[index].max_output_tokens /= 10;
                 }
-                Field::Role | Field::ReportsTo | Field::Provider | Field::Prompt => {}
+                Field::Role
+                | Field::ReportsTo
+                | Field::Provider
+                | Field::Prompt
+                | Field::Reasoning => {}
             },
             KeyCode::Char(value)
                 if !key
@@ -1238,6 +1311,11 @@ impl Wizard {
                     && !value.is_control() =>
             {
                 match self.field {
+                    Field::BaseUrl => {
+                        self.developers[index].base_url.push(value);
+                        self.reasoning_levels.clear();
+                        self.reasoning_discovery = None;
+                    }
                     Field::Name => self.developers[index].name.push(value),
                     Field::Model => {
                         if !self.model_touched {
@@ -1261,7 +1339,11 @@ impl Wizard {
                             .saturating_add(digit)
                             .min(MAX_OUTPUT_TOKENS);
                     }
-                    Field::Role | Field::ReportsTo | Field::Provider | Field::Prompt => {}
+                    Field::Role
+                    | Field::ReportsTo
+                    | Field::Provider
+                    | Field::Prompt
+                    | Field::Reasoning => {}
                     Field::OutputLimit => {}
                 }
             }
@@ -1278,8 +1360,18 @@ impl Wizard {
                     self.error = Some("Agent names must be unique.".into());
                 } else if index > 0 && developer.reports_to.is_none() {
                     self.error = Some("Choose who this agent reports to.".into());
+                } else if developer.provider == ProviderChoice::LlamaCpp
+                    && voff_provider::LlamaCppProvider::new(&developer.base_url).is_err()
+                {
+                    self.error = Some(
+                        "Enter an HTTP(S) base URL without credentials, query, or fragment.".into(),
+                    );
+                    self.field = Field::BaseUrl;
                 } else if developer.model.trim().is_empty() {
                     self.error = Some("Model cannot be empty.".into());
+                } else if !self.reasoning_is_valid(index) {
+                    self.error = Some("Reasoning effort is unsupported or not yet verified for this model. Select an advertised level or default.".into());
+                    self.field = Field::Reasoning;
                 } else if self.mode == WizardMode::Configure && developer.max_output_tokens == 0 {
                     self.error = Some("Output limit must be at least 1 token.".into());
                 } else if self.mode != WizardMode::Startup {
@@ -1295,10 +1387,148 @@ impl Wizard {
         }
     }
 
+    /// Refresh metadata only for the llama.cpp agent currently being configured.
+    pub(crate) fn refresh_provider_metadata(&mut self) {
+        let Step::Developer(index) = self.step else {
+            self.endpoint_models = None;
+            self.reasoning_discovery = None;
+            self.next_endpoint_refresh = std::time::Instant::now();
+            return;
+        };
+        if self.complete
+            || self.cancelled
+            || self.developers[index].provider != ProviderChoice::LlamaCpp
+            || self.field == Field::BaseUrl
+        {
+            self.endpoint_models = None;
+            self.reasoning_discovery = None;
+            self.next_endpoint_refresh = std::time::Instant::now();
+            return;
+        }
+        let endpoint = self.developers[index].base_url.clone();
+        if endpoint != self.discovery_endpoint {
+            self.discovery_endpoint = endpoint.clone();
+            self.reasoning_levels.clear();
+            self.reasoning_discovery = None;
+            self.endpoint_models = None;
+            self.catalog.set_local_models(Vec::new());
+            self.next_endpoint_refresh = std::time::Instant::now();
+        }
+        if tokio::runtime::Handle::try_current().is_ok()
+            && std::time::Instant::now() >= self.next_endpoint_refresh
+        {
+            self.endpoint_models = Some(ModelCatalog::discover_llama_cpp(&endpoint));
+            self.next_endpoint_refresh = std::time::Instant::now() + Duration::from_secs(10);
+        }
+        if let Some(receiver) = self.endpoint_models.as_mut()
+            && let Ok(models) = receiver.receiver.try_recv()
+        {
+            self.endpoint_models = None;
+            self.apply_discovered_models(index, models);
+        }
+        let developer = &self.developers[index];
+        if developer.model.trim().is_empty()
+            || self.model_browser.is_some()
+            || (self.field == Field::Model && self.model_touched)
+        {
+            self.reasoning_discovery = None;
+            return;
+        }
+        let model = developer.model.clone();
+        if self
+            .reasoning_discovery
+            .as_ref()
+            .is_some_and(|pending| pending.model != model)
+        {
+            self.reasoning_discovery = None;
+        }
+        if let Some(pending) = self.reasoning_discovery.as_mut() {
+            let result = match pending.receiver.try_recv() {
+                Ok(levels) => Some(levels),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(None),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            };
+            if let Some(levels) = result {
+                self.reasoning_levels.insert(model.clone(), levels);
+                self.reasoning_discovery = None;
+            }
+        }
+        if self.reasoning_levels.contains_key(&model) || self.reasoning_discovery.is_some() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (tx, receiver) = tokio::sync::oneshot::channel();
+        let selected = model.clone();
+        let base_url = developer.base_url.clone();
+        let task = runtime.spawn(async move {
+            let levels = match voff_provider::LlamaCppProvider::new(base_url) {
+                Ok(provider) => provider.reasoning_efforts(&selected).await.ok().flatten(),
+                Err(_) => None,
+            };
+            let _ = tx.send(levels);
+        });
+        self.reasoning_discovery = Some(ReasoningDiscovery {
+            model,
+            receiver,
+            task,
+        });
+    }
+
+    fn reasoning_choices(&self, index: usize) -> Vec<Option<voff_provider::ReasoningEffort>> {
+        let mut choices = vec![None];
+        if let Some(Some(levels)) = self.reasoning_levels.get(&self.developers[index].model) {
+            choices.extend(levels.iter().copied().map(Some));
+        }
+        choices
+    }
+
+    fn reasoning_status(&self, index: usize) -> &'static str {
+        let model = &self.developers[index].model;
+        match self.reasoning_levels.get(model) {
+            Some(Some(_)) if !self.reasoning_is_valid(index) => " (unsupported)",
+            _ if self
+                .reasoning_discovery
+                .as_ref()
+                .is_some_and(|pending| pending.model == *model) =>
+            {
+                " (loading)"
+            }
+            Some(Some(levels)) if levels.is_empty() => " (not supported)",
+            Some(Some(_)) => "",
+            _ => " (unavailable)",
+        }
+    }
+
+    fn reasoning_is_valid(&self, index: usize) -> bool {
+        let developer = &self.developers[index];
+        developer.provider != ProviderChoice::LlamaCpp
+            || matches!(
+                developer.reasoning_effort,
+                None | Some(voff_provider::ReasoningEffort::Default)
+            )
+            || self
+                .reasoning_choices(index)
+                .contains(&developer.reasoning_effort)
+    }
+
+    fn apply_discovered_models(
+        &mut self,
+        index: usize,
+        models: Vec<voff_provider::ModelDescriptor>,
+    ) {
+        self.catalog.set_local_models(models);
+        let developer = &mut self.developers[index];
+        if developer.model.is_empty() && !(self.field == Field::Model && self.model_touched) {
+            developer.model = self.catalog.first_model("llamacpp");
+        }
+    }
+
     fn open_model_browser(&mut self, index: usize) {
         let developer = &self.developers[index];
         let models = self.catalog.models(developer.provider.id());
-        if models.len() < 2 {
+        if !self.catalog.has_picker(developer.provider.id()) {
             return;
         }
         let selected = models
@@ -1488,6 +1718,8 @@ impl Wizard {
             if !(self.field == Field::Role
                 || (self.field == Field::Prompt && self.mode != WizardMode::Configure)
                 || (index == 0 && self.field == Field::ReportsTo)
+                || (matches!(self.field, Field::Reasoning | Field::BaseUrl)
+                    && self.developers[index].provider != ProviderChoice::LlamaCpp)
                 || (self.field == Field::OutputLimit && self.mode != WizardMode::Configure)
                 || (self.field == Field::Token && !self.developers[index].provider.uses_api_key()))
             {
@@ -1530,6 +1762,15 @@ impl Wizard {
                     .filter(|c| !c.is_control())
                     .collect::<String>(),
             );
+            return;
+        }
+        if let Step::Developer(index) = self.step
+            && self.field == Field::BaseUrl
+        {
+            self.developers[index].base_url =
+                value.trim().chars().filter(|c| !c.is_control()).collect();
+            self.reasoning_levels.clear();
+            self.reasoning_discovery = None;
             return;
         }
         if let Step::Developer(index) = self.step
@@ -1587,17 +1828,32 @@ impl Wizard {
             }
             return;
         }
+        if self.field == Field::Reasoning {
+            if self.developers[index].provider == ProviderChoice::LlamaCpp {
+                let choices = self.reasoning_choices(index);
+                let current = self.developers[index].reasoning_effort;
+                let position = choices
+                    .iter()
+                    .position(|effort| *effort == current)
+                    .unwrap_or(0);
+                let next = (position as isize + delta).rem_euclid(choices.len() as isize) as usize;
+                self.developers[index].reasoning_effort = choices[next];
+            }
+            return;
+        }
         let developer = &mut self.developers[index];
         match self.field {
-            Field::Token | Field::OutputLimit | Field::Prompt | Field::Name => {}
+            Field::Token | Field::OutputLimit | Field::Prompt | Field::Name | Field::BaseUrl => {}
             Field::Role => unreachable!(),
             Field::Provider => {
                 developer.provider = developer.provider.cycle(delta);
+                developer.reasoning_effort = None;
                 developer.model = self.catalog.first_model(developer.provider.id());
                 developer.api_token.clear();
                 developer.credential_reference = None;
                 self.model_touched = false;
             }
+            Field::Reasoning => unreachable!("handled before borrowing developer"),
             Field::Model => {
                 developer.model =
                     self.catalog
@@ -1676,12 +1932,41 @@ fn unique_name(base: &str, developers: &[DeveloperDraft], exclude: Option<usize>
     unreachable!("one of the generated suffixes must be unused")
 }
 
+fn refresh_startup_models(
+    provider: ProviderChoice,
+    discovery: &mut Option<crate::model_catalog::ModelDiscovery>,
+    next_discovery: &mut std::time::Instant,
+    catalog: &mut ModelCatalog,
+    model: &mut String,
+) {
+    if provider != ProviderChoice::LlamaCpp {
+        *discovery = None;
+        *next_discovery = std::time::Instant::now();
+    } else {
+        if std::time::Instant::now() >= *next_discovery {
+            *discovery = Some(ModelCatalog::discover_llama_cpp(&default_llama_base_url()));
+            *next_discovery = std::time::Instant::now() + Duration::from_secs(10);
+        }
+        if let Some(pending) = discovery.as_mut()
+            && let Ok(models) = pending.receiver.try_recv()
+        {
+            catalog.set_local_models(models);
+            *discovery = None;
+            if model.is_empty() {
+                *model = catalog.first_model(provider.id());
+            }
+        }
+    }
+}
+
 /// Set up a project team from the workspace or a short user description.
 pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let choices = startup_provider_choices();
-    let catalog = ModelCatalog::default();
+    let mut catalog = ModelCatalog::default();
+    let mut discovery: Option<crate::model_catalog::ModelDiscovery> = None;
+    let mut next_discovery = std::time::Instant::now();
     let mut provider = ProviderChoice::default_provider();
     let mut model = catalog.first_model(provider.id());
     let mut workspace = workspace.to_path_buf();
@@ -1691,6 +1976,13 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
     let mut error: Option<String> = None;
     let popup_size = Cell::new(None);
     loop {
+        refresh_startup_models(
+            provider,
+            &mut discovery,
+            &mut next_discovery,
+            &mut catalog,
+            &mut model,
+        );
         terminal.draw(|frame| {
             if let Some(popup) = render_startup_splash_with_popup(
                 frame,
@@ -1699,7 +1991,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     show_setup: true,
                     selected_provider: provider,
                     model: &model,
-                    model_picker_available: catalog.models(provider.id()).len() > 1,
+                    model_picker_available: catalog.has_picker(provider.id()),
                     api_token: &api_token,
                     focused,
                     description: &description,
@@ -1721,7 +2013,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     show_setup: true,
                     selected_provider: provider,
                     model: &model,
-                    model_picker_available: catalog.models(provider.id()).len() > 1,
+                    model_picker_available: catalog.has_picker(provider.id()),
                     api_token: &api_token,
                     focused,
                     description: &description,
@@ -1750,7 +2042,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                             show_setup: true,
                             selected_provider: provider,
                             model: &model,
-                            model_picker_available: catalog.models(provider.id()).len() > 1,
+                            model_picker_available: catalog.has_picker(provider.id()),
                             api_token: &api_token,
                             focused,
                             description: &description,
@@ -1773,6 +2065,10 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                                 "OpenAI"
                             }
                         ));
+                    } else if model.trim().is_empty() {
+                        error = Some(
+                            "Select a model, or start llama serve to discover local models.".into(),
+                        );
                     } else if !description.trim().is_empty() {
                         return Ok(StartupChoice::Build {
                             workspace: workspace.clone(),
@@ -1805,28 +2101,28 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                 }
                 KeyCode::Tab => {
                     focused = focused.next(
-                        catalog.models(provider.id()).len() > 1,
+                        catalog.has_picker(provider.id()),
                         provider.uses_api_key() && !provider.is_available(),
                     );
                     error = None;
                 }
                 KeyCode::BackTab => {
                     focused = focused.previous(
-                        catalog.models(provider.id()).len() > 1,
+                        catalog.has_picker(provider.id()),
                         provider.uses_api_key() && !provider.is_available(),
                     );
                     error = None;
                 }
                 KeyCode::Up => {
                     focused = focused.previous(
-                        catalog.models(provider.id()).len() > 1,
+                        catalog.has_picker(provider.id()),
                         provider.uses_api_key() && !provider.is_available(),
                     );
                     error = None;
                 }
                 KeyCode::Down => {
                     focused = focused.next(
-                        catalog.models(provider.id()).len() > 1,
+                        catalog.has_picker(provider.id()),
                         provider.uses_api_key() && !provider.is_available(),
                     );
                     error = None;
@@ -1849,8 +2145,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                     error = None;
                 }
                 KeyCode::Char('f' | 'F')
-                    if focused == StartupField::Model
-                        && catalog.models(provider.id()).len() > 1 =>
+                    if focused == StartupField::Model && catalog.has_picker(provider.id()) =>
                 {
                     match browse_startup_model(
                         &mut terminal,
@@ -1859,7 +2154,7 @@ pub(crate) fn startup_choice(workspace: &Path) -> io::Result<StartupChoice> {
                             show_setup: true,
                             selected_provider: provider,
                             model: &model,
-                            model_picker_available: catalog.models(provider.id()).len() > 1,
+                            model_picker_available: catalog.has_picker(provider.id()),
                             api_token: &api_token,
                             focused: StartupField::Model,
                             description: &description,
@@ -2162,7 +2457,7 @@ pub(crate) fn show_splash() -> io::Result<()> {
                 show_setup: false,
                 selected_provider: provider,
                 model: &model,
-                model_picker_available: catalog.models(provider.id()).len() > 1,
+                model_picker_available: catalog.has_picker(provider.id()),
                 api_token: "",
                 focused: StartupField::Workspace,
                 description: "",
@@ -2840,6 +3135,7 @@ fn startup_provider_choices() -> Vec<ProviderChoice> {
     [
         ProviderChoice::CodexCli,
         ProviderChoice::ClaudeCli,
+        ProviderChoice::LlamaCpp,
         ProviderChoice::Ollama,
         ProviderChoice::OpenAi,
     ]
@@ -3946,7 +4242,21 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
     if !compact {
         form.push(Line::from(""));
     }
-    let model_choice = wizard.catalog.models(developer.provider.id()).len() > 1;
+    if developer.provider == ProviderChoice::LlamaCpp {
+        if wizard.field == Field::BaseUrl {
+            cursor = Some((form.len(), 15 + developer.base_url.len()));
+        }
+        form.push(form_line(
+            "Base URL",
+            &developer.base_url,
+            wizard.field == Field::BaseUrl,
+            false,
+        ));
+        if !compact {
+            form.push(Line::from(""));
+        }
+    }
+    let model_choice = wizard.catalog.has_picker(developer.provider.id());
     if wizard.field == Field::Model {
         cursor = Some((
             form.len(),
@@ -3970,6 +4280,21 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
     form.push(model_line);
     if !compact {
         form.push(Line::from(""));
+    }
+    if developer.provider == ProviderChoice::LlamaCpp {
+        form.push(form_line(
+            "Reasoning",
+            &format!(
+                "{}{}",
+                reasoning_effort_label(developer.reasoning_effort),
+                wizard.reasoning_status(index)
+            ),
+            wizard.field == Field::Reasoning,
+            wizard.reasoning_choices(index).len() > 1,
+        ));
+        if !compact {
+            form.push(Line::from(""));
+        }
     }
     if wizard.mode == WizardMode::Configure {
         if wizard.field == Field::OutputLimit {
@@ -4068,6 +4393,22 @@ fn render_developer(frame: &mut ratatui::Frame<'_>, wizard: &Wizard, index: usiz
     }
 }
 
+pub(crate) fn reasoning_effort_label(
+    effort: Option<voff_provider::ReasoningEffort>,
+) -> &'static str {
+    use voff_provider::ReasoningEffort;
+    match effort {
+        None | Some(ReasoningEffort::Default) => "default",
+        Some(ReasoningEffort::None) => "none",
+        Some(ReasoningEffort::Minimal) => "minimal",
+        Some(ReasoningEffort::Low) => "low",
+        Some(ReasoningEffort::Medium) => "medium",
+        Some(ReasoningEffort::High) => "high",
+        Some(ReasoningEffort::Xhigh) => "xhigh",
+        Some(ReasoningEffort::Max) => "max",
+    }
+}
+
 fn api_token_label(provider: ProviderChoice, entered: &str, env_available: bool) -> String {
     if !entered.is_empty() {
         "•".repeat(entered.chars().count().min(36))
@@ -4132,7 +4473,14 @@ fn developer_field_at_row(
     if !lead {
         fields.push(Field::ReportsTo);
     }
-    fields.extend([Field::Provider, Field::Model]);
+    fields.push(Field::Provider);
+    if provider == ProviderChoice::LlamaCpp {
+        fields.push(Field::BaseUrl);
+    }
+    fields.push(Field::Model);
+    if provider == ProviderChoice::LlamaCpp {
+        fields.push(Field::Reasoning);
+    }
     if show_output_limit {
         fields.push(Field::OutputLimit);
     }
@@ -4990,6 +5338,372 @@ mod tests {
         assert!(wizard.complete());
     }
 
+    fn llama_config_wizard() -> Wizard {
+        let mut initial = Wizard::startup(ModelCatalog::default(), Path::new("."));
+        initial.developers[0].provider = ProviderChoice::LlamaCpp;
+        initial.developers[0].model = "cached-model".into();
+        let mut wizard = Wizard::configure_agent(ModelCatalog::default(), initial.into_draft(), 0);
+        wizard.reasoning_levels.insert(
+            "cached-model".into(),
+            Some(vec![
+                voff_provider::ReasoningEffort::None,
+                voff_provider::ReasoningEffort::High,
+                voff_provider::ReasoningEffort::Max,
+            ]),
+        );
+        wizard
+    }
+
+    #[test]
+    fn llama_endpoint_is_editable_validated_and_retained() {
+        let mut wizard = llama_config_wizard();
+        wizard.field = Field::Provider;
+        wizard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard.field, Field::BaseUrl);
+        wizard.handle_paste("https://example.com/llama/v1");
+        assert!(wizard.reasoning_levels.is_empty());
+        wizard.handle_key(key(KeyCode::Backspace));
+        wizard.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(
+            wizard.developers[0].base_url,
+            "https://example.com/llama/v1"
+        );
+        wizard.handle_key(key(KeyCode::Enter));
+        assert!(wizard.complete());
+        let draft = wizard.into_draft();
+        let reopened = Wizard::configure_agent(ModelCatalog::default(), draft, 0);
+        assert_eq!(
+            reopened.developers[0].base_url,
+            "https://example.com/llama/v1"
+        );
+
+        let mut wizard = llama_config_wizard();
+        wizard.field = Field::BaseUrl;
+        wizard.handle_paste("ftp://example.com");
+        wizard.handle_key(key(KeyCode::Enter));
+        assert!(!wizard.complete());
+        assert_eq!(wizard.field, Field::BaseUrl);
+        assert!(wizard.error.as_deref().unwrap().contains("HTTP(S)"));
+    }
+
+    #[tokio::test]
+    async fn startup_discovers_only_for_selected_llama_provider() {
+        let mut discovery = None;
+        let mut next = std::time::Instant::now();
+        let mut catalog = ModelCatalog::default();
+        let mut model = String::new();
+        refresh_startup_models(
+            ProviderChoice::CodexCli,
+            &mut discovery,
+            &mut next,
+            &mut catalog,
+            &mut model,
+        );
+        assert!(discovery.is_none());
+        refresh_startup_models(
+            ProviderChoice::LlamaCpp,
+            &mut discovery,
+            &mut next,
+            &mut catalog,
+            &mut model,
+        );
+        assert!(discovery.is_some());
+        refresh_startup_models(
+            ProviderChoice::CodexCli,
+            &mut discovery,
+            &mut next,
+            &mut catalog,
+            &mut model,
+        );
+        assert!(discovery.is_none());
+        refresh_startup_models(
+            ProviderChoice::LlamaCpp,
+            &mut discovery,
+            &mut next,
+            &mut catalog,
+            &mut model,
+        );
+        assert!(discovery.is_some());
+    }
+
+    #[tokio::test]
+    async fn metadata_requests_follow_the_active_editor_and_endpoint() {
+        let mut wizard = llama_config_wizard();
+        wizard.developers[0].provider = ProviderChoice::CodexCli;
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_none());
+        assert!(wizard.reasoning_discovery.is_none());
+
+        wizard.developers[0].provider = ProviderChoice::LlamaCpp;
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_some());
+
+        // A changed endpoint invalidates capabilities even for the same model ID.
+        wizard.developers[0].base_url = "http://127.0.0.1:1/proxy/v1".into();
+        wizard.refresh_provider_metadata();
+        assert_eq!(wizard.discovery_endpoint, "http://127.0.0.1:1/proxy/v1");
+        assert!(wizard.reasoning_levels.is_empty());
+        assert!(wizard.endpoint_models.is_some());
+        assert_eq!(wizard.developers[0].model, "cached-model");
+
+        wizard.field = Field::BaseUrl;
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_none());
+        assert!(wizard.reasoning_discovery.is_none());
+        wizard.field = Field::Model;
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_some());
+
+        wizard.step = Step::Prompt(0);
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_none());
+        assert!(wizard.reasoning_discovery.is_none());
+        wizard.step = Step::Developer(0);
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_some());
+        wizard.cancelled = true;
+        wizard.refresh_provider_metadata();
+        assert!(wizard.endpoint_models.is_none());
+        assert!(wizard.reasoning_discovery.is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_discovery_discards_stale_model_results_and_polls_matching_results() {
+        use voff_provider::ReasoningEffort::{High, Low, Minimal};
+        let mut wizard = llama_config_wizard();
+        let (tx, receiver) = tokio::sync::oneshot::channel();
+        tx.send(Some(vec![Minimal])).unwrap();
+        wizard.reasoning_discovery = Some(ReasoningDiscovery {
+            model: "previous-model".into(),
+            receiver,
+            task: tokio::spawn(std::future::pending()),
+        });
+        wizard.refresh_provider_metadata();
+        assert!(wizard.reasoning_discovery.is_none());
+        assert!(!wizard.reasoning_choices(0).contains(&Some(Minimal)));
+        let (tx, receiver) = tokio::sync::oneshot::channel();
+        tx.send(Some(vec![Low, High])).unwrap();
+        wizard.reasoning_discovery = Some(ReasoningDiscovery {
+            model: "cached-model".into(),
+            receiver,
+            task: tokio::spawn(std::future::pending()),
+        });
+        wizard.refresh_provider_metadata();
+        assert!(wizard.reasoning_discovery.is_none());
+        assert_eq!(
+            wizard.reasoning_choices(0),
+            vec![None, Some(Low), Some(High)]
+        );
+        wizard.field = Field::Model;
+        wizard.model_touched = true;
+        wizard.developers[0].model = "partially-typed".into();
+        wizard.refresh_provider_metadata();
+        assert!(wizard.reasoning_discovery.is_none());
+    }
+
+    #[test]
+    fn reasoning_choices_follow_the_selected_models_advertised_levels() {
+        use voff_provider::ReasoningEffort::{High, Low, Minimal};
+        let mut wizard = llama_config_wizard();
+        wizard
+            .reasoning_levels
+            .insert("cached-model".into(), Some(vec![Low, High]));
+        wizard.field = Field::Reasoning;
+        assert_eq!(
+            wizard.reasoning_choices(0),
+            vec![None, Some(Low), Some(High)]
+        );
+        for expected in [Some(Low), Some(High), None, Some(Low)] {
+            wizard.handle_key(key(KeyCode::Right));
+            assert_eq!(wizard.developers[0].reasoning_effort, expected);
+        }
+        wizard.developers[0].reasoning_effort = Some(Minimal);
+        wizard.handle_key(key(KeyCode::Enter));
+        assert!(!wizard.complete());
+        assert!(wizard.error.as_deref().unwrap().contains("unsupported"));
+        assert_eq!(wizard.developers[0].reasoning_effort, Some(Minimal));
+        wizard.developers[0].model = "another-model".into();
+        wizard
+            .reasoning_levels
+            .insert("another-model".into(), Some(vec![High]));
+        assert_eq!(wizard.reasoning_choices(0), vec![None, Some(High)]);
+        wizard.handle_key(key(KeyCode::Right));
+        assert_eq!(wizard.developers[0].reasoning_effort, Some(High));
+        wizard.handle_key(key(KeyCode::Enter));
+        assert!(wizard.complete());
+    }
+
+    #[test]
+    fn unavailable_or_unsupported_reasoning_offers_only_the_model_default() {
+        use voff_provider::ReasoningEffort::High;
+        let mut wizard = llama_config_wizard();
+        for levels in [None, Some(vec![])] {
+            wizard
+                .reasoning_levels
+                .insert("cached-model".into(), levels);
+            wizard.developers[0].reasoning_effort = Some(High);
+            wizard.field = Field::Reasoning;
+            assert_eq!(wizard.reasoning_choices(0), vec![None]);
+            wizard.handle_key(key(KeyCode::Enter));
+            assert!(!wizard.complete());
+            assert_eq!(wizard.developers[0].reasoning_effort, Some(High));
+            wizard.handle_key(key(KeyCode::Left));
+            assert_eq!(wizard.developers[0].reasoning_effort, None);
+            wizard.handle_key(key(KeyCode::Right));
+            assert_eq!(wizard.developers[0].reasoning_effort, None);
+        }
+        wizard.developers[0].model = "unknown-custom-model".into();
+        assert_eq!(wizard.reasoning_choices(0), vec![None]);
+        wizard.handle_key(key(KeyCode::Enter));
+        assert!(wizard.complete());
+    }
+
+    #[test]
+    fn llama_reasoning_is_keyboard_accessible_and_saved_independently() {
+        use voff_provider::ReasoningEffort;
+        let mut wizard = llama_config_wizard();
+        wizard.field = Field::Model;
+        wizard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard.field, Field::Reasoning);
+        wizard.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            wizard.developers[0].reasoning_effort,
+            Some(ReasoningEffort::Max)
+        );
+        wizard.handle_key(key(KeyCode::Right));
+        assert_eq!(wizard.developers[0].reasoning_effort, None);
+        wizard.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            wizard.developers[0].reasoning_effort,
+            Some(ReasoningEffort::None)
+        );
+        wizard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard.field, Field::OutputLimit);
+        wizard.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(wizard.field, Field::Reasoning);
+        wizard.handle_key(key(KeyCode::Enter));
+        assert!(wizard.complete());
+        let draft = wizard.into_draft();
+        assert_eq!(
+            draft.developers[0].reasoning_effort,
+            Some(ReasoningEffort::None)
+        );
+        assert_eq!(draft.developers[0].model, "cached-model");
+        let reopened = Wizard::configure_agent(ModelCatalog::default(), draft, 0);
+        assert_eq!(
+            reopened.developers[0].reasoning_effort,
+            Some(ReasoningEffort::None)
+        );
+    }
+
+    #[test]
+    fn reasoning_row_is_visible_and_clickable_on_narrow_terminals() {
+        for (width, height) in [(80, 24), (60, 18), (100, 40)] {
+            let mut wizard = llama_config_wizard();
+            let area = Rect::new(0, 0, width, height);
+            let content = setup_rows(wizard.shell(area), wizard.step, wizard.mode)[1];
+            let column = developer_columns(content)[0];
+            let compact = column.height < 16;
+            let row = (0..column.height)
+                .find(|&row| {
+                    developer_field_at_row(row, ProviderChoice::LlamaCpp, compact, true, true)
+                        == Some(Field::Reasoning)
+                })
+                .unwrap();
+            wizard.handle_event(
+                &Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: column.x + 3,
+                    row: column.y + 1 + row,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                area,
+            );
+            assert_eq!(wizard.field, Field::Reasoning);
+            assert_eq!(
+                wizard.developers[0].reasoning_effort,
+                Some(voff_provider::ReasoningEffort::None)
+            );
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &wizard)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = (0..height)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            assert!(rendered.contains("Base URL"), "{width}x{height}");
+            assert!(rendered.contains("Reasoning"), "{width}x{height}");
+            assert!(rendered.contains("none"), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn other_providers_skip_reasoning_and_provider_changes_clear_it() {
+        let mut wizard = llama_config_wizard();
+        wizard.developers[0].reasoning_effort = Some(voff_provider::ReasoningEffort::High);
+        wizard.field = Field::Provider;
+        wizard.handle_key(key(KeyCode::Right));
+        assert_eq!(wizard.developers[0].provider, ProviderChoice::Ollama);
+        assert_eq!(wizard.developers[0].reasoning_effort, None);
+        wizard.field = Field::Model;
+        wizard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard.field, Field::OutputLimit);
+        assert!((0..20).all(|row| developer_field_at_row(
+            row,
+            ProviderChoice::Ollama,
+            true,
+            true,
+            true
+        ) != Some(Field::Reasoning)));
+    }
+
+    #[test]
+    fn discovered_local_models_fill_empty_defaults_and_preserve_manual_choices() {
+        let mut wizard = Wizard::startup(ModelCatalog::default(), Path::new("."));
+        wizard.developers[0].provider = ProviderChoice::LlamaCpp;
+        wizard.developers[0].model.clear();
+        wizard.apply_discovered_models(
+            0,
+            vec![voff_provider::ModelDescriptor {
+                id: "cached-model".into(),
+                display_name: "Cached model".into(),
+                context_limit: None,
+            }],
+        );
+        assert_eq!(wizard.developers[0].model, "cached-model");
+        wizard.open_model_browser(0);
+        assert!(wizard.model_browser.is_some());
+        wizard.model_browser = None;
+        wizard.developers[0].model = "custom-model".into();
+        wizard.apply_discovered_models(
+            0,
+            vec![voff_provider::ModelDescriptor {
+                id: "cached-model".into(),
+                display_name: "Cached model".into(),
+                context_limit: None,
+            }],
+        );
+        assert_eq!(wizard.developers[0].model, "custom-model");
+        wizard.step = Step::Developer(0);
+        wizard.model_touched = true;
+        wizard.developers[0].model.clear();
+        wizard.apply_discovered_models(0, vec![]);
+        assert!(wizard.developers[0].model.is_empty());
+    }
+
+    #[test]
+    fn llama_cpp_is_available_in_setup_and_config() {
+        for name in ["llamacpp", "llama_cpp", "llama.cpp"] {
+            assert_eq!(
+                ProviderChoice::from_config_name(name).unwrap(),
+                ProviderChoice::LlamaCpp
+            );
+        }
+        assert!(startup_provider_choices().contains(&ProviderChoice::LlamaCpp));
+        assert_eq!(ProviderChoice::LlamaCpp.credential_env(), None);
+        assert!(ModelCatalog::default().first_model("llamacpp").is_empty());
+    }
+
     #[test]
     fn installed_cli_is_the_enter_only_default() {
         assert_eq!(
@@ -5098,7 +5812,7 @@ mod tests {
                         show_setup: true,
                         selected_provider: provider,
                         model: &model,
-                        model_picker_available: catalog.models(provider.id()).len() > 1,
+                        model_picker_available: catalog.has_picker(provider.id()),
                         api_token: "",
                         focused: StartupField::Provider,
                         description: "",
