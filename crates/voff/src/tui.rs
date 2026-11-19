@@ -7,8 +7,7 @@ use crate::theme;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -6465,34 +6464,65 @@ fn panel(title: &str, active: bool) -> Block<'_> {
             Style::default().fg(theme::BORDER)
         })
 }
+// Crossterm 0.29 deliberately rejects keyboard enhancement commands on Windows,
+// including modern Windows Terminal. Its native console input already supplies
+// key modifiers; do not send Kitty protocol push/pop commands on that backend.
+fn set_keyboard_enhancement(writer: &mut impl io::Write, enabled: bool) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (writer, enabled);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use crossterm::event::{
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        };
+        if enabled {
+            execute!(
+                writer,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                )
+            )
+        } else {
+            execute!(writer, PopKeyboardEnhancementFlags)
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_keyboard_enhancement_is_a_noop() {
+    let mut output = Vec::new();
+    set_keyboard_enhancement(&mut output, true).unwrap();
+    set_keyboard_enhancement(&mut output, false).unwrap();
+    assert!(output.is_empty());
+}
+
 struct TerminalGuard;
 impl TerminalGuard {
     fn enter_with_handoff(
         startup_handoff: Option<crate::onboarding::TerminalHandoff>,
     ) -> io::Result<(Self, Option<Terminal<CrosstermBackend<io::Stdout>>>)> {
-        let key_flags = PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-        );
-        if startup_handoff.is_some() {
-            execute!(io::stdout(), key_flags)?;
-        } else {
+        if startup_handoff.is_none() {
             enable_raw_mode()?;
             execute!(
                 io::stdout(),
                 EnterAlternateScreen,
                 EnableMouseCapture,
-                EnableBracketedPaste,
-                key_flags
+                EnableBracketedPaste
             )?;
         }
+        set_keyboard_enhancement(&mut io::stdout(), true)?;
         let startup_terminal = startup_handoff.map(crate::onboarding::TerminalHandoff::adopt);
         let old = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
+            let _ = set_keyboard_enhancement(&mut io::stdout(), false);
             let _ = execute!(
                 io::stdout(),
-                PopKeyboardEnhancementFlags,
                 DisableBracketedPaste,
                 DisableMouseCapture,
                 LeaveAlternateScreen
@@ -6505,9 +6535,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        let _ = set_keyboard_enhancement(&mut io::stdout(), false);
         let _ = execute!(
             io::stdout(),
-            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
